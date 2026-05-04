@@ -1,0 +1,19 @@
+# Ignore everything
+*
+
+# Except the essentials
+!cisco_toolbelt.py
+!README.md
+!system_manifest.md
+!requirements.txt
+!.gitignore
+
+# Keep directories so git can traverse to find allowed files
+!*/
+
+# Ignore specific common junk and output
+__pycache__/
+*.pyc
+.DS_Store
+toolbelt-output/
+scratch/
