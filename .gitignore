@@ -2,8 +2,9 @@
 *
 
 # Except the essentials
-!cisco_toolbelt.py
+!network-toolbelt.py
 !README.md
+!CHANGELOG.md
 !system_manifest.md
 !requirements.txt
 !.gitignore
