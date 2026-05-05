@@ -1,7 +1,7 @@
 # Network Toolbelt System Manifest
 
-**Version:** 2.8  
-**Primary Application File:** `cisco_toolbelt.py`  
+**Version:** 2.85  
+**Primary Application File:** `network-toolbelt.py`  
 **Project Name:** Network Toolbelt  
 **Current Focus:** Cisco/Netmiko-optimized network operations utility  
 **Long-Term Direction:** Broader multi-vendor network operations toolkit  
@@ -99,7 +99,7 @@ Tkinter behavior and styling can vary slightly by OS. On macOS, system Tk warnin
 Network Toolbelt is intentionally implemented as a single primary Python file:
 
 ```text
-cisco_toolbelt.py
+network-toolbelt.py
 ```
 
 The app remains single-file for portability. This lets a network engineer copy, test, back up, and run the utility without packaging a Python module tree.
@@ -627,7 +627,7 @@ Expected repository context:
 
 ```text
 Primary branch: main
-Primary app file: cisco_toolbelt.py
+Primary app file: network-toolbelt.py
 ```
 
 If using a dedicated GitHub SSH alias, confirm the remote and identity before committing:
@@ -648,7 +648,7 @@ Do not commit output files containing raw logs or sensitive device output.
 Before a release or major commit:
 
 ```bash
-python -m py_compile cisco_toolbelt.py
+python -m py_compile network-toolbelt.py
 ```
 
 Then verify:
@@ -669,15 +669,11 @@ Then verify:
 
 ## 16. Current Version Summary
 
-Network Toolbelt v2.8 includes:
+Network Toolbelt v2.85 includes:
 
-- Embedded target/credential mapper page.
-- Single-IP credential mapping test.
-- Credential mapping stale-state handling.
-- ASA command-send fallback improvements.
-- Dashboard layout cleanup.
-- Session target auto-population.
-- Completed-run status/progress fixes.
-- Output ZIP export.
-- AI-readable merged text export.
-- Updated documentation and changelog.
+- Netmiko Execution Engine Overhaul.
+- Replaced hidden autodetect probes with explicit platform-aware session preparation.
+- Added automatic transport-error recovery for disconnected sockets.
+- Added malformed echo detection.
+- Expanded hidden execution self-tests.
+- (Plus all features from the v2.8 Network Toolbelt stabilization pass).
