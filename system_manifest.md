@@ -1,141 +1,683 @@
 # Network Toolbelt System Manifest
-**Version:** 2.1
-**Primary File:** `cisco_toolbelt.py`
-**Target Environment:** Python 3.14.2 (or compatible 3.x), Tkinter (System/OS native), Netmiko.
+
+**Version:** 2.8  
+**Primary Application File:** `cisco_toolbelt.py`  
+**Project Name:** Network Toolbelt  
+**Current Focus:** Cisco/Netmiko-optimized network operations utility  
+**Long-Term Direction:** Broader multi-vendor network operations toolkit  
+**Target Runtime:** Python 3.14.2 or compatible Python 3.x  
+**GUI Framework:** Tkinter  
+**Network Automation Library:** Netmiko  
+**Deployment Model:** Single-file desktop utility  
 
 ---
 
-## 1. Executive Summary & Purpose
-The Network Toolbelt is a locally deployed, single-file Python desktop utility explicitly designed for network operations and engineering. It provides an intuitive Graphical User Interface (GUI) via Tkinter to execute Secure Shell (SSH) driven workflows against Cisco network infrastructure. 
+## 1. Executive Summary
 
-**Key Capabilities:**
-- **Maintenance Pre/Post Runner:** Collects device state snapshots before and after a change window and performs automated diffs (e.g., config hashes, ARP/MAC counts, routing neighbors).
-- **Generic Command Runner:** Executes safe, ad-hoc `show` commands across bulk targets with parallel processing.
-- **Network Scanner Suite:** A framework for executing hardcoded, read-only operational checks (e.g., Interface Errors, Optics, BGP/OSPF states) and parsing the results into structured JSON/CSV reports.
+Network Toolbelt is a locally run Python/Tkinter desktop application for network operations and engineering workflows.
 
-This tool operates under a strict **Safe-by-Default** and **Redacted-by-Default** philosophy. It is designed to prevent destructive commands from being run accidentally and ensures credentials/secrets are scrubbed from local logs.
+It is currently optimized for Cisco network infrastructure through Netmiko, Cisco platform detection, and Cisco-oriented command bundles. The app is intentionally named **Network Toolbelt** because the long-term design goal is broader than Cisco-only operations. Future support can be added for additional vendors by extending platform detection, command bundles, parsers, and scanner definitions.
 
----
+The application is designed to help network engineers:
 
-## 2. Runtime Environment & Dependencies
-The application was designed to be as portable as possible, relying heavily on the Python standard library to ensure it can be dropped onto an engineer's workstation without a complex virtual environment setup.
+- Load temporary credentials once per session.
+- Save and reuse session target lists.
+- Map target IPs/hostnames to working credential sets.
+- Run safe ad-hoc commands.
+- Collect maintenance pre/post snapshots.
+- Compare maintenance results.
+- Run focused scanner workflows.
+- Export outputs for review, archiving, or AI-assisted analysis.
 
-### Core Dependencies
-1. **Python 3.x:** Specifically targeted for 3.14.2, but compatible with standard Python 3.9+ environments.
-2. **Tkinter:** The standard GUI library for Python. (Note: On macOS, system Tk deprecation warnings may appear, but the application remains fully functional).
-3. **Netmiko:** The *only* required third-party PIP package (`pip install netmiko`). Netmiko handles all SSH connection management, device type templating, and privilege escalation (Enable mode).
+Network Toolbelt follows two main safety principles:
 
-### Portability Constraint (The Single-File Rule)
-A critical architectural constraint of this application is its **Single-File Deployment**. The entire application—including data models, parsers, Tkinter UI elements, threading logic, and documentation—lives within `cisco_toolbelt.py`. 
-*Why?* To allow network engineers to easily share the tool via a simple script transfer without needing to package, build, or manage complex module hierarchies.
+1. **Safe by default:** read-only command behavior is preferred and enforced where practical.
+2. **Redacted by default:** sensitive output is scrubbed from logs/output where practical.
 
 ---
 
-## 3. Software Architecture & Structure
+## 2. Application Scope
 
-The codebase is structured sequentially to overcome the limitations of a single-file script. A junior engineer reading the file top-to-bottom will encounter the following logical layers:
+### In Scope
 
-### A. Data Models & Constants (`@dataclass`)
-The script begins with strictly typed data models using `dataclasses`.
-- `ConnectionStatus` / `CommandStatus`: Enums tracking the state of tasks.
-- `CommandPolicyMode`: Enum tracking the security context (`SAFE_READ_ONLY`, `EXPANDED_OPERATIONAL`, `UNSAFE_ALLOWED`).
-- `CommandDecision` / `CommandResult` / `ConnectionResult`: Objects passed between worker threads and the main UI thread.
-- `ScannerRunConfig` / `ScannerHostResult` / `ScannerDefinition`: The core models driving the Network Scanner Framework.
+Network Toolbelt currently supports:
 
-### B. Security & Safety Mechanisms
-- **`AppSettings`**: A global state manager holding the output directory, command timeouts, active theme, and security policies.
-- **`FilenameSafety`**: A utility class that aggressively strips path traversal characters (`../`, `\`) and invalid filesystem characters from run IDs and hostnames.
-- **`CommandPolicy`**: A strict regex-based engine. It compares proposed commands against `DANGEROUS_PREFIXES` (e.g., `configure`, `reload`, `clear`) and `EXPANDED_PREFIXES` (e.g., `ping`). *Scanner commands bypass the user-policy but are still forced through `validate_scanner_commands()`.*
-- **`Redactor`**: A regex-based scrubber. It intercepts Netmiko session logs and CLI outputs, blanking out passwords, SNMP strings, pre-shared keys, and crypto certificates before they ever touch the disk.
+- SSH-based device access through Netmiko.
+- Cisco IOS / IOS-XE, NX-OS, and ASA workflows.
+- Volatile credential management.
+- Target-to-credential mapping.
+- Generic command execution with policy controls.
+- Maintenance pre/post capture and comparison.
+- Scanner-based operational checks.
+- Local output generation in text, JSON, and CSV.
+- Output exports as ZIP or merged text.
 
-### C. Network & Connection Logic
-- **`DeviceDetector`**: Uses `show version` heuristics to map a generic SSH connection into a specific `LogicalPlatform` (e.g., `CATALYST_IOS_XE_SWITCH`, `NEXUS`, `ASA_FIREWALL`).
-- **`ConnectionManager`**: The core Netmiko wrapper. It handles the initial `ConnectHandler`, attempts `enable()`, invokes the `DeviceDetector`, and returns a populated `ConnectionResult` object.
+### Out of Scope
 
-### D. Parsers & Snapshot Builders
-- **`ParserHelpers`**: Static utilities (`safe_int()`, `normalize_interface_name()`) designed to prevent parser crashes when encountering unexpected device output.
-- **`ParserEngine`**: Contains basic, "best-effort" text-scraping logic. It relies on standard string matching and split operations to extract MAC counts, ARP tables, and config hashes.
-- **`SnapshotBuilder`**: Uses the `ParserEngine` to format the raw text output into a structured JSON dictionary.
-- **`CompareEngine`**: Takes a Pre-Snapshot and a Post-Snapshot JSON, iterating through their keys to generate `CompareFinding` objects (e.g., flagging if EIGRP neighbors dropped).
+The current application does not attempt to be:
 
-### E. The Threading & UI Queue Model (CRITICAL)
-Tkinter is notoriously unthread-safe. If a network SSH connection blocks the main thread, the GUI freezes.
-1. When a user clicks "Run", the UI disables inputs and fires a background `threading.Thread`.
-2. The background thread uses `concurrent.futures.ThreadPoolExecutor` to connect to multiple devices simultaneously.
-3. The background thread *cannot* touch Tkinter widgets. Instead, it places tuple messages into a `queue.Queue` (e.g., `("LOG", "Connecting to 10.0.0.1...")`).
-4. The main Tkinter `NetworkToolbeltApp` runs a `.after(100, self.process_queue)` loop, constantly polling the queue and safely updating the GUI.
-
-### F. The Graphical User Interface (Tkinter Classes)
-- **`CredentialPanel` & `TargetPanel`**: Reusable `tk.Frame` components embedded into the runner pages.
-- **`BaseRunnerPage`**: A foundational class providing the unified layout (Left config panel, Top-Right Status logs, Bottom-Right Live Session logs) and managing the `stop_event` cancellation logic.
-- **`MaintenanceRunnerPage` / `CommandRunnerPage`**: Implementations of the BaseRunner.
-- **`BaseScannerPage`**: An extension of the BaseRunner specifically wired to execute `ScannerDefinition` objects and write standardized CSV/JSON reports.
-- **`ScannerLandingPage`**: A grid of buttons acting as the router to specific scanner pages.
-- **`DocumentationWindow`**: A dynamic, split-pane `tk.Toplevel` window that parses the `DOCUMENTATION_SECTIONS` list.
-- **`NetworkToolbeltApp`**: The root `tk.Tk` application. It holds the `frames` dictionary and handles switching the visible page via `.tkraise()`.
+- A full network source of truth.
+- A persistent credential vault.
+- A telemetry platform.
+- A replacement for monitoring systems.
+- A configuration-management system.
+- A guaranteed parser for every Cisco OS/version/output format.
+- A multi-user web application.
+- A full multi-vendor automation framework yet.
 
 ---
 
-## 4. How Data Flows (The Lifecycle of a Task)
+## 3. Runtime Environment and Dependencies
 
-If a junior engineer needs to trace how a command executes, this is the lifecycle:
+### Required
 
-1. **User Input:** The user adds targets to the `TargetPanel` and clicks Run.
-2. **Validation:** The `Page` validates inputs (no empty targets, credentials exist). 
-3. **Queue Initialization:** The `Page` clears old logs, locks the UI, and creates `stop_event` (for global cancellation) and `tail_stop_event` (for log cancellation).
-4. **Thread Launch:** `threading.Thread(target=self._run_network_tasks).start()` is fired.
-5. **Connection:** Inside the thread, the `ThreadPoolExecutor` hands each IP to `ConnectionManager.connect()`.
-6. **Execution:** Netmiko sends the commands. Outputs are scrubbed by `Redactor`.
-7. **Parsing:** If it's a Scanner or Maintenance task, the raw text is fed into `ParserEngine` or custom parser callbacks.
-8. **File Writing:** The results are written to `toolbelt-output/` on the local disk.
-9. **UI Update:** Throughout steps 5-8, `self.ui_queue.put()` is used to send progress bars and log lines back to the Tkinter UI.
-10. **Completion:** The background thread finishes, sends a final `"DONE"` queue message, and the Tkinter UI unlocks.
+- Python 3.14.2 or compatible modern Python 3.x.
+- Tkinter.
+- Netmiko.
 
----
+### Typical Installation
 
-## 5. Developer Guide: Adding a New Feature
+```bash
+pip install -r requirements.txt
+python cisco_toolbelt.py
+```
 
-### How to Add a New Network Scanner
-Because of the generic `ScannerFramework`, adding a new scanner requires almost no UI code:
-1. Scroll to the `Network Scanner Suite` implementation area.
-2. Write a parser function: `def parse_my_new_feature(platform, outputs, options) -> Tuple[Dict, List, List]:`
-3. Define the scanner configuration: 
-   ```python
-   MY_SCANNER_DEF = ScannerDefinition(
-       name="My Custom Scanner",
-       description="Checks a specific thing.",
-       commands_by_command_set={"IOS": ["show my command"]},
-       parser_callback=parse_my_new_feature
-   )
-   ```
-4. Create the Page class: 
-   ```python
-   class MyScannerPage(BaseScannerPage):
-       def __init__(self, parent, controller):
-           super().__init__(parent, controller, MY_SCANNER_DEF)
-   ```
-5. Add `MyScannerPage` to the `ScannerLandingPage` grid buttons.
-6. Add `MyScannerPage` to the `NetworkToolbeltApp` frame initialization tuple.
+If no requirements file is present, the minimum third-party dependency is typically:
 
-### Troubleshooting Code Issues
-- **UI is Freezing:** You accidentally placed a blocking network call, `time.sleep()`, or heavy file I/O on the main Tkinter thread. Move it to the background thread and use `ui_queue`.
-- **"RuntimeError: main thread is not in main loop":** A background thread tried to directly modify a Tkinter widget (e.g., `self.log_text.insert()`). Always use the `ui_queue` for this.
-- **Parser is Crashing on Nexus:** The `ParserEngine` assumes IOS format by default. Ensure your parser gracefully handles empty strings or uses `outputs.get("show command", "")` to avoid `KeyError` exceptions when a command isn't supported on a specific platform. Use `ParserHelpers`.
-- **Command is Blocked:** Check `CommandPolicy.DANGEROUS_PREFIXES`. If the scanner is using an internal operational command, ensure it's not inadvertently blocked by the policy engine.
+```bash
+pip install netmiko
+```
+
+### Platform Notes
+
+Tkinter behavior and styling can vary slightly by OS. On macOS, system Tk warnings may appear depending on Python/Tk build, but the app should remain functional.
 
 ---
 
-## 6. Version Control & GitHub Configuration
+## 4. Deployment Model: Single-File Rule
 
-This project is tracked via Git and hosted on GitHub. The local environment is configured to use a specific SSH alias and author identity for commits.
+Network Toolbelt is intentionally implemented as a single primary Python file:
 
-**Repository Configuration:**
-- **Remote Origin:** `git@github-upstate:upstatedatasystems-llc/network-toolbelt.git`
-- **Primary Branch:** `main`
+```text
+cisco_toolbelt.py
+```
 
-**Git Config (Local):**
-- **User Name:** `Upstate Data Systems LLC`
-- **User Email:** `upstatedatasystems@gmail.com`
+The app remains single-file for portability. This lets a network engineer copy, test, back up, and run the utility without packaging a Python module tree.
 
-**SSH Alias Context:**
-The remote uses the `github-upstate` host alias, meaning SSH keys and connections should be configured in `~/.ssh/config` under the `Host github-upstate` block to ensure correct authentication.
+### Benefits
+
+- Easy to distribute internally.
+- Easy to back up before major edits.
+- Low packaging overhead.
+- Good fit for a small internal tool.
+
+### Tradeoffs
+
+- The file is large.
+- Shared classes affect many pages/tools.
+- Refactors require extra caution.
+- Documentation, UI, parser logic, and execution logic live together.
+- Strong internal organization is important to prevent the file from becoming hard to maintain.
+
+---
+
+## 5. High-Level Code Organization
+
+Although the app is one file, it is organized into logical layers.
+
+### 5.1 Imports
+
+Standard library imports, Tkinter imports, and Netmiko imports.
+
+If Netmiko is missing, the app shows a Tkinter dependency error and exits.
+
+### 5.2 Data Models
+
+Dataclasses and enums define the app’s shared structures.
+
+Important types include:
+
+- `ConnectionStatus`
+- `CommandStatus`
+- `LogicalPlatform`
+- `CommandPolicyMode`
+- `CommandDecision`
+- `CommandResult`
+- `ConnectionResult`
+- `CompareFinding`
+- `ScannerRunConfig`
+- `ScannerHostResult`
+- `ScannerDefinition`
+- `CredentialRecord`
+- `TargetCredentialMapping`
+
+### 5.3 Settings and Constants
+
+Important global settings include:
+
+- `APP_VERSION`
+- `AppSettings`
+- output directory
+- command timeout
+- command policy mode
+- capture mode
+- current theme
+
+### 5.4 Credential Storage
+
+`CredentialStore` manages credential records.
+
+Credentials are:
+
+- Stored in memory only.
+- Cleared when the app closes.
+- Not written to disk by the application.
+- Displayed only in safe form.
+
+### 5.5 Target/Credential Mapping
+
+`TargetCredentialMapStore` manages the current session’s target list and target-to-credential mappings.
+
+Mappings are:
+
+- Stored in memory only.
+- Based on stable credential IDs.
+- Marked stale when credentials are edited/deleted.
+- Used to reduce repeated failed authentication attempts.
+
+### 5.6 Command Policy and Command Bundles
+
+`CommandPolicy` controls ad-hoc user commands.
+
+`ToolCommandManager` manages configurable internal tool command bundles.
+
+Command overrides are saved locally as command strings only. They must never include credentials or credential mappings.
+
+### 5.7 Redaction
+
+`Redactor` applies regex-based redaction rules to output and session logs.
+
+Redaction targets common sensitive patterns such as:
+
+- Passwords.
+- Enable secrets.
+- SNMP communities.
+- TACACS/RADIUS keys.
+- IPSec pre-shared keys.
+- OSPF authentication keys.
+- Crypto/private keys.
+- Certificates.
+- Generic secret/key lines.
+
+### 5.8 Device Detection and Connection Management
+
+`DeviceDetector` classifies devices using `show version` output where possible.
+
+`ConnectionManager` wraps Netmiko connection behavior and handles:
+
+- Manual platform selection.
+- Auto detect platform.
+- Authentication and timeout errors.
+- Enable-mode attempts.
+- Safe command sending.
+- Mapped credential preference.
+- Global credential fallback.
+
+### 5.9 Parser and Analyzer Layer
+
+Parser logic is best-effort and platform-sensitive.
+
+Important classes include:
+
+- `ParserHelpers`
+- `ParserEngine`
+- `InterfaceAnalyzer`
+- `LogAnalyzer`
+- `RoutingAnalyzer`
+- `SnapshotBuilder`
+- `CompareEngine`
+
+### 5.10 UI Layer
+
+The UI is composed of Tkinter pages and shared components.
+
+Important classes include:
+
+- `DocumentationWindow`
+- `ToolCommandConfigWindow`
+- `CredentialManagerPage`
+- `CredentialStatusPanel`
+- `TargetPanel`
+- `BaseRunnerPage`
+- `MaintenanceRunnerPage`
+- `CommandRunnerPage`
+- `LandingPage`
+- `ScannerLandingPage`
+- `BaseScannerPage`
+- `TargetCredentialMapperPage`
+- `NetworkToolbeltApp`
+
+---
+
+## 6. Security Model
+
+### 6.1 Credential Safety
+
+Credentials are volatile.
+
+The app does not intentionally write the following to disk:
+
+- Passwords.
+- Enable secrets.
+- Raw credential dictionaries.
+- Persistent credential stores.
+
+Credential displays are safe-form only. Passwords and enable secrets are not shown after entry.
+
+### 6.2 Mapping Safety
+
+Target-to-credential mappings store:
+
+- Host/IP.
+- Credential ID.
+- Credential label.
+- Username.
+- Mapping status.
+- Last tested time.
+- Platform metadata where available.
+- Attempt result history.
+
+Mappings do not store:
+
+- Passwords.
+- Enable secrets.
+- Raw credential dictionaries.
+- Persistent credential material.
+
+Mappings are cleared when the app closes.
+
+### 6.3 Redacted Capture
+
+Redacted capture is the default mode.
+
+The redactor attempts to scrub sensitive values before output is written or displayed where applicable.
+
+Raw mode is available, but raw output should be treated as sensitive.
+
+### 6.4 Command Safety
+
+Generic Command Runner is controlled by command policy modes:
+
+- Safe Read-Only.
+- Expanded Operational.
+- Unsafe Allowed.
+
+Internal tool command bundles are also validated to prevent dangerous command overrides.
+
+### 6.5 Filename Safety
+
+`FilenameSafety` protects output paths by sanitizing:
+
+- Run IDs.
+- Host labels.
+- File names.
+
+This reduces accidental path traversal or invalid filesystem characters.
+
+---
+
+## 7. Threading and UI Queue Model
+
+Tkinter must not be updated directly from background threads.
+
+Network Toolbelt uses a queue-based UI update pattern:
+
+1. User clicks RUN.
+2. UI validates inputs.
+3. UI disables run controls.
+4. Worker thread starts.
+5. Worker thread performs SSH work and file output.
+6. Worker thread sends UI messages into a `queue.Queue`.
+7. Tkinter page polls the queue using `.after(...)`.
+8. Main thread updates logs, buttons, status, and progress safely.
+
+This pattern is used by runner pages, scanner pages, and mapper workflows.
+
+---
+
+## 8. Core Workflows
+
+### 8.1 Credential Setup
+
+1. Open Credential Manager.
+2. Add one or more credential sets.
+3. Return to Dashboard.
+4. Confirm loaded credential count.
+
+### 8.2 Target and Credential Mapping
+
+1. Open Set Target IPs & Credentials.
+2. Enter targets.
+3. Start credential mapping or test a single IP.
+4. Review mapping table and logs.
+5. Return to Dashboard.
+6. Open a tool; targets auto-populate when the tool target box is empty.
+
+### 8.3 Generic Command Run
+
+1. Open Generic Command Runner.
+2. Confirm targets and credentials.
+3. Enter commands.
+4. Confirm command policy.
+5. Run.
+6. Review output.
+
+### 8.4 Maintenance Pre/Post
+
+1. Open Maintenance Pre/Post Runner.
+2. Enter Run ID.
+3. Run Pre-Checks.
+4. Perform maintenance.
+5. Run Post-Checks using the same Run ID.
+6. Run Compare.
+7. Review summary and per-host reports.
+
+### 8.5 Scanner Run
+
+1. Open Network Scanners.
+2. Choose scanner.
+3. Enter Run ID.
+4. Confirm targets/options.
+5. Run.
+6. Review summary and per-host outputs.
+
+### 8.6 Output Export
+
+1. Open File menu.
+2. Choose ZIP export or merged TXT export.
+3. Review sensitivity warning.
+4. Choose destination.
+5. Share/store output carefully.
+
+---
+
+## 9. Output Structure
+
+Default output location:
+
+```text
+toolbelt-output/
+```
+
+Typical subfolders:
+
+```text
+toolbelt-output/
+├── Maintenance_Runner/
+├── Command_Runner/
+├── Scanners/
+└── tool_command_overrides.json
+```
+
+### Maintenance Runner
+
+```text
+Maintenance_Runner/<run_id>/
+├── pre/
+├── post/
+└── compare/
+```
+
+### Command Runner
+
+```text
+Command_Runner/CommandRunner-<timestamp>/
+```
+
+### Scanners
+
+```text
+Scanners/<scanner_name>/<run_id>/
+├── index.txt
+├── scanner_summary.txt
+├── scanner_summary.csv
+├── scanner_summary.json
+└── hosts/
+```
+
+### Exports
+
+Exports are user-selected save files and can include:
+
+- ZIP archive of output folder.
+- Merged text export containing text-based output files.
+
+---
+
+## 10. Implemented Tools
+
+### 10.1 Credential Manager
+
+Loads, edits, deletes, and clears volatile credential records.
+
+### 10.2 Set Target IPs & Credentials
+
+Embedded in-app page for:
+
+- Managing session targets.
+- Mapping targets to credentials.
+- Testing a single IP.
+- Viewing mapping status and logs.
+
+### 10.3 Generic Command Runner
+
+Runs ad-hoc command lists across targets under command policy control.
+
+### 10.4 Maintenance Pre/Post Runner
+
+Captures pre/post device snapshots and compares results.
+
+### 10.5 Network Scanner Suite
+
+Implemented scanner pages include:
+
+- Interface Error Scanner.
+- Port-Channel / LACP Scanner.
+- Optics Scanner.
+- Routing Neighbor Scanner.
+- Log Scanner.
+- Device Inventory Scanner.
+- Routes Advertised / Received Scanner.
+
+Future scanner stubs include:
+
+- Config Backup / Diff Tool.
+- Outage Snapshot Tool.
+- Reachability / Path Test Tool.
+- VLAN / Trunk Consistency Scanner.
+- STP Health Scanner.
+
+---
+
+## 11. Known Limitations
+
+- Parsers are best-effort.
+- Cisco output varies by platform, OS version, privilege level, feature set, and VRF.
+- Auto-detect can misclassify devices.
+- Some commands may be unsupported on some platforms.
+- Redaction may not catch every secret.
+- Raw mode may expose sensitive data.
+- Large route outputs can produce large files and slow UI responsiveness.
+- Stopping a run may wait for Netmiko timeout/disconnect behavior.
+- Routes Advertised / Received Scanner is not yet a full route-analysis tool.
+- Multi-vendor support is not fully implemented yet.
+
+---
+
+## 12. Developer Guide
+
+### 12.1 Adding a Scanner
+
+To add a scanner:
+
+1. Define a parser function:
+
+```python
+def parse_my_scanner(platform: str, outputs: dict, options: dict):
+    return parsed, findings, warnings
+```
+
+2. Define a `ScannerDefinition`.
+
+```python
+MY_SCANNER_DEF = ScannerDefinition(
+    name="My Scanner",
+    internal_key="my_scanner",
+    description="What it checks.",
+    commands_by_command_set={
+        "CATALYST_IOS_SWITCH": ["show example"],
+        "NEXUS": ["show example"]
+    },
+    parser_callback=parse_my_scanner,
+    report_callback=None
+)
+```
+
+3. Create a page class inheriting from `BaseScannerPage`.
+
+4. Add the page to the app frame registry.
+
+5. Add a button to `ScannerLandingPage`.
+
+6. Update documentation and changelog.
+
+### 12.2 Adding a Platform
+
+To add platform support:
+
+1. Add or update `LogicalPlatform`.
+2. Update `DeviceDetector`.
+3. Update `PLATFORM_COMMAND_SET_MAP`.
+4. Add command bundles.
+5. Update scanner command definitions.
+6. Add parser handling where output format differs.
+7. Test with one device first.
+
+### 12.3 Adding a Command Bundle
+
+To add or update command bundles:
+
+1. Keep commands read-only by default.
+2. Validate with `ToolCommandManager.validate_commands()`.
+3. Avoid disruptive commands.
+4. Test on one device.
+5. Document the change.
+
+---
+
+## 13. Troubleshooting for Developers
+
+### UI Freezes
+
+Likely cause:
+A blocking operation is running on the Tkinter main thread.
+
+Fix:
+Move network/file-heavy work into a worker thread and update UI through the queue.
+
+### Tkinter Runtime Errors from Threads
+
+Likely cause:
+Worker thread directly updated a widget.
+
+Fix:
+Use `enqueue(...)` and process UI updates on the main thread.
+
+### Parser Crashes
+
+Likely cause:
+Parser assumed a command existed or output matched one platform.
+
+Fix:
+Use `outputs.get("command", "")`, defensive parsing, and `ParserHelpers`.
+
+### Unsupported Commands
+
+Likely cause:
+Command is not valid on the platform or privilege level.
+
+Fix:
+Classify as `COMMAND_UNSUPPORTED`, adjust command bundle, or use platform-specific commands.
+
+### Credential Mappings Look Wrong
+
+Likely causes:
+Credential was edited/deleted, targets changed, or mapping is stale.
+
+Fix:
+Re-run mapping for the affected targets.
+
+---
+
+## 14. Repository and Git Notes
+
+The repository is expected to use the Network Toolbelt project identity.
+
+Expected repository context:
+
+```text
+Primary branch: main
+Primary app file: cisco_toolbelt.py
+```
+
+If using a dedicated GitHub SSH alias, confirm the remote and identity before committing:
+
+```bash
+git remote -v
+git config --local user.name
+git config --local user.email
+ssh -T git@github-upstate
+```
+
+Do not commit output files containing raw logs or sensitive device output.
+
+---
+
+## 15. Maintenance Checklist
+
+Before a release or major commit:
+
+```bash
+python -m py_compile cisco_toolbelt.py
+```
+
+Then verify:
+
+- App launches.
+- Dashboard opens.
+- Version/title are correct.
+- Credential Manager works.
+- Mapper page opens in-window.
+- Generic Command Runner works on one safe device.
+- Maintenance Pre/Post works on one safe device.
+- At least one scanner runs on one safe device.
+- Output export works.
+- No `.tmp_` files are left behind after runs.
+- README, CHANGELOG, and system manifest are updated.
+
+---
+
+## 16. Current Version Summary
+
+Network Toolbelt v2.8 includes:
+
+- Embedded target/credential mapper page.
+- Single-IP credential mapping test.
+- Credential mapping stale-state handling.
+- ASA command-send fallback improvements.
+- Dashboard layout cleanup.
+- Session target auto-population.
+- Completed-run status/progress fixes.
+- Output ZIP export.
+- AI-readable merged text export.
+- Updated documentation and changelog.

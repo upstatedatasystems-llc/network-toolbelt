@@ -172,7 +172,7 @@ class ScannerDefinition:
 # Constants and Settings
 # ============================================================
 
-APP_VERSION = "2.1"
+APP_VERSION = "2.8"
 
 @dataclass
 class DocumentationSection:
@@ -758,6 +758,20 @@ class DeviceDetector:
 # ============================================================
 class ConnectionManager:
     @staticmethod
+    def safe_send_command(conn, cmd, read_timeout=None, platform_hint=""):
+        timeout_val = read_timeout or settings.command_timeout
+        try:
+            return conn.send_command(cmd, read_timeout=timeout_val, cmd_verify=False)
+        except Exception as e:
+            err_str = str(e).lower()
+            if "pattern not detected" in err_str or "search pattern" in err_str or "command echo" in err_str or "prompt" in err_str or "read_channel_timing" in err_str:
+                try:
+                    return conn.send_command_timing(cmd, read_timeout=timeout_val)
+                except Exception as inner_e:
+                    raise inner_e
+            raise e
+
+    @staticmethod
     def connect(ip: str, creds: dict, platform_choice: str, temp_session_log: str):
         try:
             device_type = "cisco_ios"
@@ -817,10 +831,17 @@ class ConnectionManager:
                 pass
 
             try:
-                ver_out = conn.send_command("show version", read_timeout=15)
+                ver_out = ConnectionManager.safe_send_command(conn, "show version", read_timeout=15)
                 logical = DeviceDetector.classify(ver_out)
             except Exception:
-                logical = LogicalPlatform.UNKNOWN_CISCO
+                if platform_choice == "Cisco ASA" or device_type == "cisco_asa":
+                    logical = LogicalPlatform.ASA
+                elif platform_choice == "Cisco NX-OS" or device_type == "cisco_nxos":
+                    logical = LogicalPlatform.NXOS
+                elif platform_choice == "Cisco IOS / IOS-XE":
+                    logical = LogicalPlatform.IOS
+                else:
+                    logical = LogicalPlatform.UNKNOWN_CISCO
 
             return ConnectionResult(
                 host=ip,
@@ -1429,7 +1450,7 @@ class CompareEngine:
 # Documentation Content
 # ============================================================
 DOCUMENTATION_SECTIONS = [
-    DocumentationSection("General Information", """Network Toolbelt is a local desktop utility for Cisco network operations work.
+    DocumentationSection("General Information", """Network Toolbelt is a local desktop utility for network operations work.
 
 It is designed to help network engineers run repeatable read-only checks, collect troubleshooting output, compare pre/post maintenance snapshots, and run focused scanner workflows across many devices from one GUI.
 
@@ -1492,8 +1513,8 @@ The left column contains tools:
 - Network Scanners
 
 The right column contains session and help features:
-- Set Target IPs & Credentials
 - Credential Manager
+- Set Target IPs & Credentials
 - Help & Documentation
 
 Dashboard status indicators:
@@ -1575,12 +1596,12 @@ Mapping statuses:
 
 Dashboard mapping workflow:
 1. Load credentials in Credential Manager.
-2. Open Set Target IPs & Credentials from the dashboard.
+2. Open Set Target IPs & Credentials from the dashboard (opens as an in-app page).
 3. Enter or update target IPs.
-4. Start credential mapping.
+4. Test a Single IP or Start credential mapping for all targets.
 5. Watch the table, execution log, and redacted session log.
 6. Confirm each target maps to the expected credential.
-7. Open a tool and load the session targets.
+7. Return to Dashboard and open a tool. Targets will auto-populate if the tool's target list is empty.
 
 Per-tool mapping workflow:
 When running a tool with multiple credentials and unmapped/stale targets, the app may ask:
@@ -1609,7 +1630,8 @@ TargetPanel buttons:
 - Load Session Targets: Loads the session target list into the current tool.
 
 Safe behavior:
-- Loading session targets should not overwrite existing tool targets without confirmation.
+- Loading session targets manually will not overwrite existing tool targets without confirmation.
+- Opening a tool with an empty target box will automatically populate your session targets.
 - Session targets are not permanent.
 - Closing the app clears them.
 
@@ -2184,6 +2206,9 @@ Possible causes:
 - Account lacks privilege.
 - Device ACL blocks management access.
 
+Platform detection failed (ASA note):
+- On some ASA devices, `show version` may fail pattern matching. The app will fall back to a safe timing mode. If you manually selected Cisco ASA and the version check fails, the app will continue using the ASA logical platform and its specific command bundle.
+
 Credential mapping failed:
 Possible causes:
 - No credential works for that target.
@@ -2228,7 +2253,7 @@ If raw output was enabled, treat files as sensitive and move them to a secure lo
 
     DocumentationSection("Limitations and Best Practices", """Known limitations:
 - Parsers are best-effort.
-- Cisco output varies by platform, version, feature set, privilege level, and VRF.
+- Device output varies by platform, version, feature set, privilege level, and VRF.
 - Unsupported commands are expected in mixed environments.
 - Autodetect may misclassify some devices.
 - Redaction is not guaranteed to catch every secret.
@@ -2248,10 +2273,10 @@ Best practices:
 - Reset command overrides if a tool starts producing unexpected results.
 - Keep backups of known-good script versions."""),
 
-    DocumentationSection("About Network Toolbelt", """Network Toolbelt is a local Python/Tkinter utility for Cisco network operations tasks.
+    DocumentationSection("About Network Toolbelt", """Network Toolbelt is a local Python/Tkinter utility for network operations tasks.
 
 Version:
-Network Toolbelt v2.1
+Network Toolbelt v2.8
 
 Primary design goals:
 - Portable single-file utility.
@@ -2262,7 +2287,88 @@ Primary design goals:
 - Focused scanner workflows.
 - Practical reporting for network engineers.
 
-This application is intended for internal operational use by someone who understands the network environment. It should be tested carefully before broad use.""")
+This application is intended for internal operational use by someone who understands the network environment. It should be tested carefully before broad use."""),
+
+    DocumentationSection("Export Output", """Network Toolbelt allows you to easily export your run data.
+
+From the File menu, you can choose:
+
+1. Export Output Folder as ZIP...
+   - Zips the entire base output directory.
+   - Preserves folder structure.
+   - Ignores temporary logs and cache files.
+   - Useful for sharing a complete snapshot of a run.
+
+2. Export Text Outputs as Merged TXT...
+   - Finds all text-based outputs (.txt, .log, .csv, .json, .md) and merges them into one single text file.
+   - Adds clear BEGIN and END delimiters with timestamps before each file.
+   - Perfect for feeding a set of scanner outputs or command logs into an AI analysis tool for rapid summarization.
+
+Security Note: 
+If you used Raw Capture mode, these exports may contain sensitive data (passwords, secrets). Review exported files before sharing."""),
+
+    DocumentationSection("Version Changelog", """Network Toolbelt Version History
+
+## v2.8 - Network Toolbelt Punch / Stabilization Pass
+- Updated app versioning from v2.1 to v2.8.
+- Improved ASA command execution compatibility.
+- Converted Target IP & Credential Mapper from popup window to in-app page.
+- Added single-target credential mapping test.
+- Improved dashboard layout and status display.
+- Added target auto-population from session targets.
+- Fixed completed-run status/progress behavior.
+- Added output export options for ZIP and merged AI-readable text.
+- Added/updated version changelog.
+
+## v2.7 - Credential Mapping Evaluation Build
+- Added volatile target IP to credential mapping.
+- Added dashboard mapping workflow.
+- Added per-tool pre-run mapping prompt.
+- Added mapped credential preference during tool execution.
+- Added stale mapping behavior when credentials are edited or deleted.
+- Added session target sharing across tools.
+
+## v2.6 - Network Toolbelt Rename / Documentation Expansion
+- Renamed user-facing app language from Cisco Toolbelt to Network Toolbelt.
+- Expanded in-app documentation sections.
+- Improved README language to position the app as Cisco-optimized but not Cisco-only.
+
+## v2.5 - Command Bundle Configuration
+- Added Settings -> View/Configure tool commands.
+- Added local command override JSON.
+- Added validation for saved tool command bundles.
+- Added reset group and reset tool behavior.
+
+## v2.4 - Navigation and UI Stabilization
+- Added active-run navigation protection.
+- Added Clear Current Session behavior.
+- Added status/progress UI across runner pages.
+- Cleaned up duplicated buttons and session log labels.
+
+## v2.3 - Scanner Suite Buildout
+- Added Network Scanner Suite.
+- Added Interface Error Scanner.
+- Added Port-Channel / LACP Scanner.
+- Added Optics Scanner.
+- Added Routing Neighbor Scanner.
+- Added Log Scanner.
+- Added Device Inventory Scanner.
+- Added Routes Advertised / Received Scanner.
+
+## v2.2 - Security and Execution Foundation
+- Added redacted capture behavior.
+- Added command policy modes.
+- Added command output validation.
+- Added unsupported command handling.
+- Added safer credential attempt logging.
+
+## v2.1 - Initial GUI Toolbelt Foundation
+- Added Tkinter desktop app shell.
+- Added Maintenance Pre/Post Runner.
+- Added Generic Command Runner.
+- Added output folder structure.
+- Added initial Netmiko connection handling.
+""")
 ]
 
 class DocumentationWindow(tk.Toplevel):
@@ -2393,6 +2499,8 @@ class ToolCommandConfigWindow(tk.Toplevel):
         self.geometry("1000x700")
         self.transient(parent)
         self.grab_set()
+        if hasattr(controller, "apply_theme_to_widget"):
+            controller.apply_theme_to_widget(self)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         
         self.current_tool_key = None
@@ -2537,7 +2645,7 @@ class ToolCommandConfigWindow(tk.Toplevel):
             cmds = default_cmds
             
         self.text_area.delete("1.0", tk.END)
-        self.text_area.insert("1.0", "\\n".join(cmds))
+        self.text_area.insert("1.0", "\n".join(cmds))
         self.has_unsaved_changes = False
         self.text_area.edit_modified(False)
         
@@ -2552,7 +2660,7 @@ class ToolCommandConfigWindow(tk.Toplevel):
         tcm = self.controller.tool_command_manager
         blocked = tcm.validate_commands(cmds)
         if blocked:
-            messagebox.showerror("Validation Error", f"The following commands are blocked for safety:\\n{', '.join(blocked)}")
+            messagebox.showerror("Validation Error", f"The following commands are blocked for safety:\n{', '.join(blocked)}")
             return
             
         if not cmds:
@@ -2660,6 +2768,8 @@ class CredentialManagerPage(tk.Frame):
         dlg.geometry("400x300")
         dlg.transient(self)
         dlg.grab_set()
+        if hasattr(self.controller, "apply_theme_to_widget"):
+            self.controller.apply_theme_to_widget(dlg)
         
         tk.Label(dlg, text="Label:").pack(pady=(10,0))
         lbl_var = tk.StringVar(value=record.label if record else "")
@@ -2809,6 +2919,8 @@ class RunningNavigationDialog(tk.Toplevel):
         self.geometry("350x200")
         self.transient(parent)
         self.grab_set()
+        if hasattr(parent, "apply_theme_to_widget"):
+            parent.apply_theme_to_widget(self)
         
         self.retain_creds = tk.BooleanVar(value=True)
         self.retain_targets = tk.BooleanVar(value=True)
@@ -2840,6 +2952,8 @@ class ClearSessionDialog(tk.Toplevel):
         self.geometry("300x160")
         self.transient(parent)
         self.grab_set()
+        if hasattr(parent, "apply_theme_to_widget"):
+            parent.apply_theme_to_widget(self)
         
         self.retain_creds = tk.BooleanVar(value=True)
         self.retain_targets = tk.BooleanVar(value=True)
@@ -2958,6 +3072,13 @@ class BaseRunnerPage(tk.Frame):
         if hasattr(self, 'cred_panel') and hasattr(self.cred_panel, 'refresh'):
             self.cred_panel.refresh()
         self.update_session_log_label()
+        
+        if hasattr(self, 'target_panel') and hasattr(self.controller, 'target_credential_store'):
+            self.target_panel.refresh_session_counts()
+            current_text = self.target_panel.targets_text.get("1.0", "end-1c").strip()
+            session_targets = self.controller.target_credential_store.targets
+            if not current_text and session_targets:
+                self.target_panel.targets_text.insert("1.0", "\n".join(session_targets))
 
     def update_session_log_label(self):
         if hasattr(self, 'session_frame'):
@@ -2973,8 +3094,13 @@ class BaseRunnerPage(tk.Frame):
         self.enqueue("PROGRESS_UPDATE", value)
 
     def _setup_base_ui(self):
+        nav_frame = tk.Frame(self)
+        nav_frame.pack(fill=tk.X, padx=10, pady=(5,0))
+        tk.Button(nav_frame, text="← Back to Dashboard", command=lambda: self.controller.show_frame("LandingPage")).pack(side=tk.LEFT)
+        tk.Button(nav_frame, text="[Help]", command=self.open_page_help).pack(side=tk.RIGHT)
+        
         title = tk.Label(self, text=self.title_text, font=("Arial", 18, "bold"))
-        title.pack(pady=(10,5))
+        title.pack(pady=(5,5))
         
         self.status_var = tk.StringVar(value="Status: Idle")
         self.progress_var = tk.DoubleVar(value=0)
@@ -3073,6 +3199,13 @@ class BaseRunnerPage(tk.Frame):
                 if not messagebox.askyesno("Confirm", "This will clear all credentials from the global Credential Manager. Continue?"):
                     return
                 self.controller.credential_store.clear()
+                if hasattr(self.controller, "target_credential_store"):
+                    for m in self.controller.target_credential_store.mappings.values():
+                        m.status = "STALE"
+                        m.last_tested = ""
+                        m.error_message = "Credential store was cleared"
+                if hasattr(self.controller, "frames") and "LandingPage" in self.controller.frames:
+                    self.controller.frames["LandingPage"].refresh_credential_status()
             
             self.stop_execution()
             self.enqueue("CLEAR_LOGS")
@@ -3195,7 +3328,10 @@ class MaintenanceRunnerPage(BaseRunnerPage):
                 sum_txt = CompareEngine.run_comparison(run_id, base_dir)
                 self.enqueue("LOG_EXEC", f"\n{sum_txt}")
                 self.enqueue("MODE_LABEL", "compare", f"Compare (ran {datetime.now().strftime('%m/%d %H:%M')})")
+                self.set_progress(100)
+                self.set_status("Done")
         except Exception as e:
+            self.set_status("Error")
             self.enqueue("LOG_EXEC", f"\nERROR: {str(e)}")
         finally:
             self.active_conn = None
@@ -3240,6 +3376,12 @@ class MaintenanceRunnerPage(BaseRunnerPage):
                 # Need to stop tailing
                 tail_stop_event.set()
                 tail_t.join(1)
+                if settings.capture_mode == "redacted":
+                    redactor.redact_file(Path(temp_session_log), out_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
+                else:
+                    Path(temp_session_log).rename(out_dir / f"{safe_host}_{run_ts}_session_RAW.log")
+                try: Path(temp_session_log).unlink(missing_ok=True)
+                except Exception: pass
                 continue
 
             logical_plat = conn_result.logical_platform
@@ -3269,7 +3411,7 @@ class MaintenanceRunnerPage(BaseRunnerPage):
                         nonlocal raw_text, features_detected
                         self.enqueue("LOG_EXEC", f"  -> {cmd}")
                         try:
-                            cmd_out = self.active_conn.send_command(cmd, read_timeout=settings.command_timeout)
+                            cmd_out = ConnectionManager.safe_send_command(self.active_conn, cmd, read_timeout=settings.command_timeout)
                             status, err_msg = CommandOutputAnalyzer.analyze(cmd_out)
                             
                             if status == CommandStatus.COMMAND_UNSUPPORTED:
@@ -3349,7 +3491,15 @@ class MaintenanceRunnerPage(BaseRunnerPage):
             except Exception: pass
 
             if not self.stop_event.is_set():
+                self.set_progress(idx / total_hosts * 100)
                 self.enqueue("LOG_EXEC", "  ✓ completed")
+
+        if self.stop_event.is_set():
+            self.set_status("Stopped by user")
+        else:
+            self.set_progress(100)
+            self.set_status("Done")
+            self.enqueue("LOG_EXEC", f"\n=== ALL DONE ===")
 
 
 class CommandRunnerPage(BaseRunnerPage):
@@ -3430,7 +3580,7 @@ class CommandRunnerPage(BaseRunnerPage):
         try:
             self.enqueue("LOG_EXEC", f"=== COMMAND RUNNER ===")
             run_ts = self.get_run_ts()
-            log_dir = settings.base_output_dir / "Command_Runner" / f"CiscoLogs-{run_ts}"
+            log_dir = settings.base_output_dir / "Command_Runner" / f"CommandRunner-{run_ts}"
             log_dir.mkdir(parents=True, exist_ok=True)
             self.enqueue("LOG_EXEC", f"Logs will be saved to: {log_dir}")
             
@@ -3460,6 +3610,12 @@ class CommandRunnerPage(BaseRunnerPage):
                         pass # generic failure already logged by helper
                     tail_stop_event.set()
                     tail_t.join(1)
+                    if settings.capture_mode == "redacted":
+                        redactor.redact_file(Path(temp_session_log), log_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
+                    else:
+                        Path(temp_session_log).rename(log_dir / f"{safe_host}_{run_ts}_session_RAW.log")
+                    try: Path(temp_session_log).unlink(missing_ok=True)
+                    except Exception: pass
                     continue
 
                 output_log = [f"===== Session started: {datetime.now()} =====\nHost: {host}\nCapture Mode: {settings.capture_mode.upper()}\n\n"]
@@ -3467,7 +3623,7 @@ class CommandRunnerPage(BaseRunnerPage):
                     if self.stop_event.is_set(): break
                     self.enqueue("LOG_EXEC", f"  -> {cmd}")
                     try:
-                        cmd_out = self.active_conn.send_command(cmd, read_timeout=settings.command_timeout)
+                        cmd_out = ConnectionManager.safe_send_command(self.active_conn, cmd, read_timeout=settings.command_timeout)
                         if settings.capture_mode == "redacted":
                             cmd_out = redactor.redact_text(cmd_out)
                         output_log.append(f"##### {cmd} #####\n{cmd_out}\n\n")
@@ -3481,6 +3637,7 @@ class CommandRunnerPage(BaseRunnerPage):
                 if not self.stop_event.is_set():
                     fname = f"{safe_host}_{datetime.now().strftime('%H%M%S')}{'_RAW' if settings.capture_mode == 'raw' else ''}.txt"
                     (log_dir / fname).write_text("".join(output_log), encoding="utf-8")
+                    self.set_progress(idx / total_hosts * 100)
                     self.enqueue("LOG_EXEC", "  ✓ completed")
 
                 try: self.active_conn.disconnect()
@@ -3497,9 +3654,14 @@ class CommandRunnerPage(BaseRunnerPage):
                 try: Path(temp_session_log).unlink(missing_ok=True)
                 except Exception: pass
 
-            if not self.stop_event.is_set():
+            if self.stop_event.is_set():
+                self.set_status("Stopped by user")
+            else:
+                self.set_progress(100)
+                self.set_status("Done")
                 self.enqueue("LOG_EXEC", f"\n=== ALL DONE ===")
         except Exception as e:
+            self.set_status("Error")
             self.enqueue("LOG_EXEC", f"\nERROR: {str(e)}")
         finally:
             self.active_conn = None
@@ -3533,9 +3695,9 @@ class LandingPage(tk.Frame):
         tk.Button(col1, text="Network Scanners", font=("Arial", 14), width=30, height=3, command=lambda: controller.show_frame("ScannerLandingPage")).pack(pady=20, padx=20)
 
         self.cred_status_lbl = tk.Label(col2, text="Credentials loaded: 0", font=("Arial", 12))
-        self.cred_status_lbl.pack(pady=(40, 10))
-        tk.Button(col2, text="Set Target IPs & Credentials", width=30, height=2, font=("Arial", 14), command=lambda: controller.open_target_credential_mapper()).pack(pady=10, padx=20)
+        self.cred_status_lbl.pack(pady=(20, 10))
         tk.Button(col2, text="Credential Manager", width=30, height=2, font=("Arial", 14), command=lambda: controller.show_frame("CredentialManagerPage")).pack(pady=10, padx=20)
+        tk.Button(col2, text="Set Target IPs & Credentials", width=30, height=2, font=("Arial", 14), command=lambda: controller.open_target_credential_mapper()).pack(pady=10, padx=20)
         tk.Button(col2, text="Help & Documentation", width=30, height=2, font=("Arial", 14), command=lambda: controller.open_documentation()).pack(pady=10, padx=20)
 
     def tkraise(self, *args, **kwargs):
@@ -3547,7 +3709,7 @@ class LandingPage(tk.Frame):
         if hasattr(self.controller, "target_credential_store"):
             t_count = len(self.controller.target_credential_store.targets)
             m_count = self.controller.target_credential_store.mapped_count_for_current_targets()
-            self.cred_status_lbl.config(text=f"Credentials loaded: {count}\\nSession targets: {t_count}\\nMapped targets: {m_count}/{t_count}")
+            self.cred_status_lbl.config(text=f"Credentials loaded: {count}   Session targets: {t_count}   Mapped targets: {m_count}/{t_count}")
         else:
             self.cred_status_lbl.config(text=f"Credentials loaded: {count}")
 
@@ -3757,6 +3919,12 @@ class BaseScannerPage(BaseRunnerPage):
                 if conn_result.status != ConnectionStatus.SUCCESS:
                     tail_stop_event.set()
                     tail_t.join(1)
+                    if settings.capture_mode == "redacted":
+                        redactor.redact_file(Path(temp_session_log), host_out_dir / f"{safe_host}_{config.timestamp}_session_REDACTED.log")
+                    else:
+                        Path(temp_session_log).rename(host_out_dir / f"{safe_host}_{config.timestamp}_session_RAW.log")
+                    try: Path(temp_session_log).unlink(missing_ok=True)
+                    except Exception: pass
                     host_results.append(ScannerHostResult(host, safe_host, conn_result.status.name if conn_result else "FAIL", "", "", {}, {}, [], [conn_result.error_message if conn_result else "Connection Failed"], []))
                     continue
                     
@@ -3782,7 +3950,7 @@ class BaseScannerPage(BaseRunnerPage):
                         if self.stop_event.is_set(): break
                         self.enqueue("LOG_EXEC", f"  -> {cmd}")
                         try:
-                            cmd_out = conn_result.connection.send_command(cmd, read_timeout=settings.command_timeout)
+                            cmd_out = ConnectionManager.safe_send_command(conn_result.connection, cmd, read_timeout=settings.command_timeout)
                             status, err_msg = CommandOutputAnalyzer.analyze(cmd_out)
                             if status == CommandStatus.COMMAND_UNSUPPORTED:
                                 self.enqueue("LOG_EXEC", f"  ! Command unsupported: {cmd}")
@@ -3849,12 +4017,18 @@ class BaseScannerPage(BaseRunnerPage):
                     for cmd, out in outputs.items(): out_txt.append(f"\n## {cmd}\n{out}")
                     (host_out_dir / f"{safe_host}_report.txt").write_text("\n".join(out_txt), encoding="utf-8")
                     
+                    self.set_progress(idx / total_hosts * 100)
                     self.enqueue("LOG_EXEC", "  ✓ completed")
             
-            if not self.stop_event.is_set():
+            if self.stop_event.is_set():
+                self.set_status("Stopped by user")
+            else:
                 ScannerEngine.write_scanner_summary(config, host_results)
+                self.set_progress(100)
+                self.set_status("Done")
                 self.enqueue("LOG_EXEC", f"\n=== ALL DONE ===")
         except Exception as e:
+            self.set_status("Error")
             self.enqueue("LOG_EXEC", f"\nFATAL ERROR: {str(e)}")
         finally:
             self.enqueue("SET_BUTTONS", tk.NORMAL, tk.DISABLED)
@@ -4202,8 +4376,11 @@ class StubPage(tk.Frame):
         self.title_text = title
         self.controller = controller
         super().__init__(parent)
-        tk.Button(self, text="← Back to Scanners", command=lambda: controller.show_frame("ScannerLandingPage")).pack(anchor="w", pady=10, padx=10)
-        tk.Button(self, text="[Help]", command=lambda: self.controller.open_documentation(self.title_text)).place(x=10, y=10)
+        nav_frame = tk.Frame(self)
+        nav_frame.pack(fill=tk.X, padx=10, pady=(5,0))
+        tk.Button(nav_frame, text="← Back to Dashboard", command=lambda: controller.show_frame("LandingPage")).pack(side=tk.LEFT, padx=(0,5))
+        tk.Button(nav_frame, text="← Back to Scanners", command=lambda: controller.show_frame("ScannerLandingPage")).pack(side=tk.LEFT)
+        tk.Button(nav_frame, text="[Help]", command=lambda: self.controller.open_documentation(self.title_text)).pack(side=tk.RIGHT)
         tk.Label(self, text=title, font=("Arial", 18, "bold")).pack(pady=20)
         tk.Label(self, text="COMING SOON", font=("Arial", 24, "bold"), fg="#d9534f").pack(pady=10)
         tk.Label(self, text=desc, font=("Arial", 12), justify="center", wraplength=400).pack(pady=20)
@@ -4334,6 +4511,10 @@ class CredentialMappingRunner:
                 mapping.error_message = "No credentials loaded"
                 mapping_store.upsert_mapping(host, mapping)
                 status_cb(mapping.host, mapping.status, mapping.credential_label, mapping.username, mapping.detected_platform, mapping.last_tested, mapping.error_message)
+                tail_stop_event.set()
+                tail_t.join(1.0)
+                try: Path(temp_session_log).unlink(missing_ok=True)
+                except: pass
                 continue
                 
             success = False
@@ -4374,7 +4555,10 @@ class CredentialMappingRunner:
                 else:
                     log_cb(f"  → Credential set {i} failed for user {cred_record.username}: {res.status.name}")
                     
-            if not success and not stop_event.is_set():
+            if stop_event.is_set() and not success:
+                mapping.status = "STOPPED"
+                mapping.error_message = "Mapping stopped by user"
+            elif not success:
                 mapping.status = "FAILED"
                 mapping.error_message = "All credentials failed"
                 log_cb(f"  ✗ {host} mapping failed.")
@@ -4393,14 +4577,11 @@ class CredentialMappingRunner:
             log_cb("\n[Mapping Session Complete]")
 
 
-class TargetCredentialMapperWindow(tk.Toplevel):
-    def __init__(self, parent):
+class TargetCredentialMapperPage(tk.Frame):
+    def __init__(self, parent, controller):
         super().__init__(parent)
-        self.controller = parent
-        self.title("Set Target IPs & Credentials")
-        self.geometry("1100x750")
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-        
+        self.title_text = "Set Target IPs & Credentials"
+        self.controller = controller
         self.mapping_store = self.controller.target_credential_store
         self.credential_store = self.controller.credential_store
         
@@ -4410,9 +4591,12 @@ class TargetCredentialMapperWindow(tk.Toplevel):
         
         self._setup_ui()
         self.after(100, self.process_queue)
-        self.refresh_table_from_store()
         
     def _setup_ui(self):
+        nav_frame = tk.Frame(self)
+        nav_frame.pack(fill=tk.X, pady=5, padx=10)
+        tk.Button(nav_frame, text="← Back to Dashboard", command=lambda: self.controller.show_frame("LandingPage")).pack(side=tk.LEFT)
+        
         top_frame = tk.Frame(self)
         top_frame.pack(fill=tk.X, padx=10, pady=5)
         
@@ -4425,7 +4609,6 @@ class TargetCredentialMapperWindow(tk.Toplevel):
         main_pane = tk.PanedWindow(self, orient=tk.VERTICAL)
         main_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
-        # Upper section
         upper_frame = tk.Frame(main_pane)
         main_pane.add(upper_frame, minsize=300)
         
@@ -4435,8 +4618,15 @@ class TargetCredentialMapperWindow(tk.Toplevel):
         tk.Button(control_frame, text="Enter / Update Targets", command=self.enter_targets, width=25).pack(pady=5)
         self.start_btn = tk.Button(control_frame, text="Start Credential Mapping", command=self.start_mapping, width=25)
         self.start_btn.pack(pady=5)
+        
+        tk.Label(control_frame, text="Single target test:").pack(pady=(10, 0))
+        self.single_ip_var = tk.StringVar()
+        tk.Entry(control_frame, textvariable=self.single_ip_var, width=25).pack(pady=2)
+        self.test_single_btn = tk.Button(control_frame, text="Test Single IP", command=self.test_single_ip, width=25)
+        self.test_single_btn.pack(pady=2)
+        
         self.stop_btn = tk.Button(control_frame, text="STOP", command=self.stop_mapping, width=25, state=tk.DISABLED, fg="red")
-        self.stop_btn.pack(pady=5)
+        self.stop_btn.pack(pady=(10, 5))
         tk.Button(control_frame, text="Clear Mapping Session", command=self.clear_session, width=25).pack(pady=5)
         
         self.retest_var = tk.BooleanVar(value=False)
@@ -4446,7 +4636,6 @@ class TargetCredentialMapperWindow(tk.Toplevel):
         self.stats_lbl.pack(anchor=tk.W, pady=10)
         self.update_stats()
         
-        # Table
         table_frame = tk.Frame(upper_frame)
         table_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
@@ -4464,7 +4653,6 @@ class TargetCredentialMapperWindow(tk.Toplevel):
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         yscroll.pack(side=tk.RIGHT, fill=tk.Y)
         
-        # Lower section (Logs)
         log_frame = tk.Frame(main_pane)
         main_pane.add(log_frame, minsize=200)
         
@@ -4484,11 +4672,39 @@ class TargetCredentialMapperWindow(tk.Toplevel):
         self.sess_log = tk.Text(sess_frame, height=10)
         self.sess_log.pack(fill=tk.BOTH, expand=True)
         
+    def tkraise(self, *args, **kwargs):
+        super().tkraise(*args, **kwargs)
+        self.refresh_table_from_store()
+        self.update_stats()
+        
+    def has_active_run(self):
+        return self.is_running
+        
+    def stop_and_clear_for_navigation(self, retain_targets=True, retain_credentials=True):
+        if self.is_running:
+            self.stop_event.set()
+        self.is_running = False
+        self.start_btn.config(state=tk.NORMAL)
+        self.test_single_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
+        self.status_lbl.config(text="Idle")
+        self.progress["value"] = 0
+        if not retain_targets:
+            self.mapping_store.clear_targets()
+            self.mapping_store.clear_mappings()
+        if not retain_credentials:
+            for m in self.mapping_store.mappings.values():
+                m.status = "STALE"
+                m.last_tested = ""
+                m.error_message = "Credential store was cleared"
+        self.refresh_table_from_store()
+        self.update_stats()
+            
     def update_stats(self):
         c_count = len(self.credential_store.records)
         t_count = len(self.mapping_store.targets)
         m_count = self.mapping_store.mapped_count_for_current_targets()
-        self.stats_lbl.config(text=f"Credentials loaded: {c_count}\nTargets loaded: {t_count}\nMapped targets: {m_count}/{t_count}")
+        self.stats_lbl.config(text=f"Credentials loaded: {c_count}   Targets loaded: {t_count}   Mapped targets: {m_count}/{t_count}")
         
     def enter_targets(self):
         d = tk.Toplevel(self)
@@ -4496,6 +4712,8 @@ class TargetCredentialMapperWindow(tk.Toplevel):
         d.geometry("400x400")
         d.transient(self)
         d.grab_set()
+        if hasattr(self.controller, "apply_theme_to_widget"):
+            self.controller.apply_theme_to_widget(d)
         
         tk.Label(d, text="Paste Target IPs/Hostnames (one per line):").pack(pady=5)
         text = tk.Text(d, width=40, height=15)
@@ -4561,8 +4779,13 @@ class TargetCredentialMapperWindow(tk.Toplevel):
                 elif msg_type == "DONE":
                     self.is_running = False
                     self.start_btn.config(state=tk.NORMAL)
+                    self.test_single_btn.config(state=tk.NORMAL)
                     self.stop_btn.config(state=tk.DISABLED)
-                    self.status_lbl.config(text="Idle")
+                    if self.stop_event.is_set():
+                        self.status_lbl.config(text="Stopped by user")
+                    else:
+                        self.status_lbl.config(text="Done")
+                        self.progress["value"] = self.progress["maximum"]
                     self.update_stats()
                     self.controller.frames["LandingPage"].refresh_credential_status()
         except queue.Empty:
@@ -4571,24 +4794,25 @@ class TargetCredentialMapperWindow(tk.Toplevel):
             if self.winfo_exists():
                 self.after(100, self.process_queue)
                 
-    def start_mapping(self):
+    def _run_mapping(self, targets):
         if not self.credential_store.records:
             messagebox.showerror("Error", "No credentials loaded. Add credentials in Credential Manager first.", parent=self)
             return
-        if not self.mapping_store.targets:
-            messagebox.showerror("Error", "No target IPs loaded.", parent=self)
+        if not targets:
+            messagebox.showerror("Error", "No target IPs to test.", parent=self)
             return
             
         self.is_running = True
         self.stop_event.clear()
         self.start_btn.config(state=tk.DISABLED)
+        self.test_single_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         self.status_lbl.config(text="Mapping...")
         self.progress["value"] = 0
         
-        # Exploratory mapping is always redacted for safety
-        self.sess_lbl.config(text="Session Log (creds etc redacted)", fg="black")
+        self.sess_lbl.config(text="Session Log (creds etc redacted)", fg=THEMES[settings.current_theme]["fg"])
         self.sess_log.delete("1.0", tk.END)
+        self.exec_log.delete("1.0", tk.END)
 
         def _log(msg): self.ui_queue.put(("LOG", msg))
         def _stat(h, s, c, u, p, l, e): self.ui_queue.put(("STATUS_ROW", (h, s, c, u, p, l, e)))
@@ -4596,7 +4820,6 @@ class TargetCredentialMapperWindow(tk.Toplevel):
         def _sess_log(msg): self.ui_queue.put(("SESS_LOG", msg))
         
         callbacks = {"log_cb": _log, "status_cb": _stat, "progress_cb": _prog, "sess_log_cb": _sess_log}
-        targets = self.mapping_store.targets
         
         def run():
             CredentialMappingRunner.map_targets(
@@ -4606,17 +4829,29 @@ class TargetCredentialMapperWindow(tk.Toplevel):
             self.ui_queue.put(("DONE", None))
             
         threading.Thread(target=run, daemon=True).start()
+
+    def start_mapping(self):
+        self._run_mapping(self.mapping_store.targets)
+        
+    def test_single_ip(self):
+        ip = self.single_ip_var.get().strip()
+        if not ip:
+            messagebox.showerror("Error", "Please enter a single IP.", parent=self)
+            return
+        
+        # Add to targets if not present
+        if ip not in self.mapping_store.targets:
+            if messagebox.askyesno("Add Target", f"'{ip}' is not in the session targets list. Add it?", parent=self):
+                self.mapping_store.targets.append(ip)
+                self.refresh_table_from_store()
+                self.update_stats()
+            else:
+                return
+
+        self._run_mapping([ip])
         
     def stop_mapping(self):
         self.stop_event.set()
-        
-    def on_close(self):
-        if self.is_running:
-            if messagebox.askyesno("Mapping Running", "Mapping is currently running. Stop and close?", parent=self):
-                self.stop_event.set()
-                self.destroy()
-        else:
-            self.destroy()
 
 
 class MappingPromptDialog(tk.Toplevel):
@@ -4628,6 +4863,8 @@ class MappingPromptDialog(tk.Toplevel):
         self.geometry("450x250")
         self.transient(parent)
         self.grab_set()
+        if hasattr(self.controller, "apply_theme_to_widget"):
+            self.controller.apply_theme_to_widget(self)
         
         self.result = "CANCEL"
         self.fallback = False
@@ -4659,6 +4896,7 @@ class MappingPromptDialog(tk.Toplevel):
         self.result = "CANCEL"
         self.destroy()
 
+# Small popup used only for per-tool pre-run mapping, not the main TargetCredentialMapperPage.
 class SmallMappingProgressDialog(tk.Toplevel):
     def __init__(self, parent, controller, targets):
         super().__init__(parent)
@@ -4668,6 +4906,8 @@ class SmallMappingProgressDialog(tk.Toplevel):
         self.geometry("500x350")
         self.transient(parent)
         self.grab_set()
+        if hasattr(self.controller, "apply_theme_to_widget"):
+            self.controller.apply_theme_to_widget(self)
         
         self.ui_queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -4729,7 +4969,7 @@ class SmallMappingProgressDialog(tk.Toplevel):
                     self.progress["value"] = idx
                 elif msg_type == "DONE":
                     self.is_running = False
-                    self.stop_btn.config(text="Close", command=self.destroy, fg="black", state=tk.NORMAL)
+                    self.stop_btn.config(text="Close", command=self.destroy, state=tk.NORMAL)
         except queue.Empty:
             pass
         finally:
@@ -4758,7 +4998,7 @@ class NetworkToolbeltApp(tk.Tk):
 
         self.frames = {}
         
-        for F in (LandingPage, CredentialManagerPage, MaintenanceRunnerPage, CommandRunnerPage, ScannerLandingPage, InterfaceErrorScannerPage, PortChannelScannerPage, RoutingNeighborScannerPage, LogScannerPage, DeviceInventoryScannerPage, OpticsScannerPage, RoutesAdvertisedReceivedScannerPage, ConfigBackupStubPage, OutageSnapshotStubPage, ReachabilityStubPage, VlanTrunkStubPage, StpHealthStubPage):
+        for F in (LandingPage, CredentialManagerPage, MaintenanceRunnerPage, CommandRunnerPage, ScannerLandingPage, InterfaceErrorScannerPage, PortChannelScannerPage, RoutingNeighborScannerPage, LogScannerPage, DeviceInventoryScannerPage, OpticsScannerPage, RoutesAdvertisedReceivedScannerPage, ConfigBackupStubPage, OutageSnapshotStubPage, ReachabilityStubPage, VlanTrunkStubPage, StpHealthStubPage, TargetCredentialMapperPage):
 
             page_name = F.__name__
             frame = F(parent=self.container, controller=self)
@@ -4770,10 +5010,7 @@ class NetworkToolbeltApp(tk.Tk):
 
 
     def open_target_credential_mapper(self):
-        if hasattr(self, 'mapper_window') and self.mapper_window and self.mapper_window.winfo_exists():
-            self.mapper_window.lift()
-            return
-        self.mapper_window = TargetCredentialMapperWindow(self)
+        self.show_frame("TargetCredentialMapperPage")
     def setup_menu(self):
         menubar = tk.Menu(self)
         
@@ -4781,6 +5018,9 @@ class NetworkToolbeltApp(tk.Tk):
         file_menu.add_command(label="Home (Dashboard)", command=lambda: self.show_frame("LandingPage"))
         file_menu.add_command(label="Network Scanners", command=lambda: self.show_frame("ScannerLandingPage"))
 
+        file_menu.add_separator()
+        file_menu.add_command(label="Export Output Folder as ZIP...", command=self.export_zip)
+        file_menu.add_command(label="Export Text Outputs as Merged TXT...", command=self.export_merged_txt)
         file_menu.add_separator()
         file_menu.add_command(label="Toggle Dark/Light Mode", command=self.toggle_theme)
         file_menu.add_separator()
@@ -4840,11 +5080,96 @@ class NetworkToolbeltApp(tk.Tk):
             if hasattr(self, 'tool_command_manager'):
                 self.tool_command_manager.override_file = settings.base_output_dir / "tool_command_overrides.json"
                 self.tool_command_manager.load_overrides()
-            messagebox.showinfo("Directory Updated", f"Output directory set to:\\n{settings.base_output_dir}")
+            messagebox.showinfo("Directory Updated", f"Output directory set to:\n{settings.base_output_dir}")
 
     def set_timeout(self):
         val = simpledialog.askinteger("Command Timeout", "Enter max command timeout in seconds:", initialvalue=settings.command_timeout, minvalue=10, maxvalue=3600)
         if val: settings.command_timeout = val
+
+    def export_zip(self):
+        if not settings.base_output_dir.exists() or not any(settings.base_output_dir.iterdir()):
+            messagebox.showinfo("Export ZIP", "Output directory is empty or missing.")
+            return
+            
+        warn = "Security Warning: The output folder may contain sensitive data, including passwords, secrets, or device configurations, especially if you ran commands in RAW Capture Mode.\n\nAre you sure you want to export this folder to a ZIP?"
+        if not messagebox.askyesno("Export Warning", warn):
+            return
+            
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".zip",
+            filetypes=[("ZIP files", "*.zip")],
+            title="Save Output as ZIP",
+            initialfile=f"NetworkToolbelt_Export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        )
+        
+        if not save_path: return
+        
+        import zipfile
+        try:
+            target_save_path = Path(save_path).resolve()
+            with zipfile.ZipFile(save_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for root, dirs, files in os.walk(settings.base_output_dir):
+                    if '__pycache__' in dirs: dirs.remove('__pycache__')
+                    for f in files:
+                        if f == '.DS_Store' or f.startswith('.tmp_'): continue
+                        fpath = Path(root) / f
+                        if fpath.resolve() == target_save_path: continue
+                        arcname = fpath.relative_to(settings.base_output_dir)
+                        zf.write(fpath, arcname)
+            messagebox.showinfo("Success", f"Output folder exported successfully to:\n{save_path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create ZIP:\n{str(e)}")
+
+    def export_merged_txt(self):
+        if not settings.base_output_dir.exists() or not any(settings.base_output_dir.iterdir()):
+            messagebox.showinfo("Export Merged TXT", "Output directory is empty or missing.")
+            return
+            
+        warn = "Security Warning: The output folder may contain sensitive data.\n\nAre you sure you want to export to a merged text file?"
+        if not messagebox.askyesno("Export Warning", warn):
+            return
+            
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt")],
+            title="Save Merged TXT",
+            initialfile=f"NetworkToolbelt_Merged_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        )
+        
+        if not save_path: return
+        
+        ext_to_include = {".txt", ".log", ".csv", ".json", ".md"}
+        
+        try:
+            target_save_path = Path(save_path).resolve()
+            with open(save_path, 'w', encoding="utf-8", errors="replace") as out:
+                out.write("===== NETWORK TOOLBELT MERGED OUTPUT =====\n")
+                out.write(f"Exported At: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                
+                for root, dirs, files in os.walk(settings.base_output_dir):
+                    if '__pycache__' in dirs: dirs.remove('__pycache__')
+                    for f in files:
+                        if f == '.DS_Store' or f.startswith('.tmp_'): continue
+                        fpath = Path(root) / f
+                        if fpath.resolve() == target_save_path: continue
+                        if fpath.suffix.lower() not in ext_to_include: continue
+                        
+                        mtime = datetime.fromtimestamp(fpath.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+                        rel_path = fpath.relative_to(settings.base_output_dir)
+                        
+                        out.write(f"##### BEGIN {rel_path} | file timestamp {mtime} #####\n")
+                        try:
+                            content = fpath.read_text(encoding="utf-8", errors="replace")
+                            out.write(content)
+                            if not content.endswith('\n'):
+                                out.write('\n')
+                        except Exception as e:
+                            out.write(f"[Error reading file: {str(e)}]\n")
+                        out.write(f"##### END {rel_path} | file timestamp {mtime} #####\n\n")
+                        
+            messagebox.showinfo("Success", f"Merged TXT exported successfully to:\n{save_path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create Merged TXT:\n{str(e)}")
 
     def show_general_info(self):
         self.open_documentation("General Information")
@@ -4880,6 +5205,16 @@ class NetworkToolbeltApp(tk.Tk):
         colors = THEMES[settings.current_theme]
         try: parent_widget.configure(bg=colors["bg"])
         except tk.TclError: pass
+        
+        try:
+            style = ttk.Style(parent_widget)
+            style.theme_use('default')
+            style.configure("Treeview", background=colors["list_bg"], foreground=colors["list_fg"], fieldbackground=colors["list_bg"])
+            style.configure("Treeview.Heading", background=colors["btn_bg"], foreground=colors["fg"])
+            style.configure("TCombobox", fieldbackground=colors["entry_bg"], background=colors["btn_bg"], foreground=colors["entry_fg"])
+            style.map("TCombobox", fieldbackground=[('readonly', colors["entry_bg"])], selectbackground=[('readonly', colors["btn_bg"])], selectforeground=[('readonly', colors["entry_fg"])])
+        except Exception:
+            pass
         
         def style_widget(widget):
             try:
@@ -4918,6 +5253,12 @@ class NetworkToolbeltApp(tk.Tk):
                     if not messagebox.askyesno("Confirm", "This will clear all credentials from the global Credential Manager. Continue?"):
                         return
                     self.credential_store.clear()
+                    for m in self.target_credential_store.mappings.values():
+                        m.status = "STALE"
+                        m.last_tested = ""
+                        m.error_message = "Credential store was cleared"
+                    if "LandingPage" in self.frames:
+                        self.frames["LandingPage"].refresh_credential_status()
                 current_frame.stop_and_clear_for_navigation(retain_targets=dlg.result["retain_targets"], retain_credentials=dlg.result["retain_credentials"])
 
         self.current_frame_name = page_name
