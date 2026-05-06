@@ -240,7 +240,7 @@ From the File menu, export output in two ways:
    - Useful for archiving or sharing a complete run folder.
 
 2. **Export Text Outputs as Merged TXT**
-   - Merges `.txt`, `.log`, `.csv`, `.json`, and `.md` files.
+   - Merges `.txt`, `.csv`, and `.md` files. Intentionally excludes `.json`, `.log`, and `.tmp_*` files to reduce noise and prevent inclusion of sensitive raw session artifacts.
    - Adds clear BEGIN/END delimiters per file.
    - Designed to be readable by humans and easy for AI tools to analyze.
 

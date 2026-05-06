@@ -730,6 +730,65 @@ class CommandPolicy:
                 unsafe.append(cmd)
         return unsafe
 
+class LineBufferedRedactor:
+    def __init__(self, redact_fn):
+        self.redact_fn = redact_fn
+        self.pending = ""
+
+    def feed(self, text: str) -> str:
+        if not text: return ""
+        combined = self.pending + text
+        lines = combined.splitlines(True)
+        if not lines: return ""
+        if combined.endswith("\n") or combined.endswith("\r"):
+            self.pending = ""
+            return "".join(self.redact_fn(line) for line in lines)
+        else:
+            self.pending = lines[-1]
+            return "".join(self.redact_fn(line) for line in lines[:-1])
+
+    def flush(self) -> str:
+        if self.pending:
+            res = self.redact_fn(self.pending)
+            self.pending = ""
+            return res
+        return ""
+
+class SecureTempSessionLogManager:
+    @staticmethod
+    def ensure_secure_temp_session_dir(base_output_dir, run_id: str):
+        temp_dir = base_output_dir / ".temp_sessions" / run_id
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        try: temp_dir.chmod(0o700)
+        except Exception: pass
+        return temp_dir
+
+    @staticmethod
+    def create_secure_session_log_path(temp_dir, safe_host: str):
+        import uuid
+        p = temp_dir / f"{safe_host}_{uuid.uuid4().hex[:8]}.log"
+        p.touch()
+        try: p.chmod(0o600)
+        except Exception: pass
+        return p
+
+    @staticmethod
+    def cleanup_secure_session_log(path):
+        try:
+            if path and path.exists(): path.unlink(missing_ok=True)
+        except Exception: pass
+
+    @staticmethod
+    def cleanup_stale_temp_session_dirs(base_output_dir):
+        import shutil
+        temp_base = base_output_dir / ".temp_sessions"
+        if not temp_base.exists(): return
+        for d in temp_base.iterdir():
+            if d.is_dir():
+                try: shutil.rmtree(d)
+                except Exception: pass
+
+# ============================================================
 # ============================================================
 # Redaction
 # ============================================================
@@ -759,7 +818,11 @@ class Redactor:
             RedactionRule("pem_private_key", re.compile(r"(?s)-----BEGIN (?:RSA )?PRIVATE KEY-----.*?-----END (?:RSA )?PRIVATE KEY-----"), r"-----BEGIN PRIVATE KEY-----\n<REDACTED>\n-----END PRIVATE KEY-----"),
             RedactionRule("pem_certificate", re.compile(r"(?s)-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----"), r"-----BEGIN CERTIFICATE-----\n<REDACTED>\n-----END CERTIFICATE-----"),
             RedactionRule("wireless_psk", re.compile(r"(?im)^(\s*wpa-psk\s+(?:ascii\s+)?(?:\d\s+)?)(.*)$"), r"\1<REDACTED>"),
-            RedactionRule("generic_catchall", re.compile(r"(?im)^.*(?:password|secret|community|key-string|pre-shared-key|server-key).*$"), lambda m: re.sub(r"(\s+(?:password|secret|community|key-string|pre-shared-key|server-key|key)\s+(?:\d\s+)?)(?![\s\n])(\S+)", r"\1<REDACTED>", m.group(0)))
+            RedactionRule("generic_catchall", re.compile(r"(?im)^.*(?:password|secret|community|key-string|pre-shared-key|server-key).*$"), lambda m: re.sub(r"(\s+(?:password|secret|community|key-string|pre-shared-key|server-key|key)\s+(?:\d\s+)?)(?![\s\n])(\S+)", r"\1<REDACTED>", m.group(0))),
+            RedactionRule("tacacs_radius_nested", re.compile(r"(?im)^(\s*(?:key(?:word)?)\s+(?:\d\s+)?)(?![\s\n])(\S+)(.*)$"), r"<REDACTED>"),
+            RedactionRule("snmpv3_auth_priv", re.compile(r"(?im)^(\s*snmp-server\s+user\s+\S+\s+\S+\s+v3\s+auth\s+(?:md5|sha|sha-256)\s+)(\S+)(\s+priv\s+(?:des|3des|aes|aes\s+\d+)\s+)(\S+)(.*)$"), r"<REDACTED><REDACTED>"),
+            RedactionRule("snmpv3_auth_only", re.compile(r"(?im)^(\s*snmp-server\s+user\s+\S+\s+\S+\s+v3\s+auth\s+(?:md5|sha|sha-256)\s+)(\S+)(\s*)$"), r"<REDACTED>"),
+            RedactionRule("password_colon", re.compile(r"(?im)^((?:.*[pP]assword|.*[pP]asscode)\s*:\s*)(.*)$"), lambda m: m.group(1) + "<REDACTED>" if m.group(2).strip() else m.group(0))
         ]
 
     def redact_text(self, text: str) -> str:
@@ -860,10 +923,22 @@ class ConnectionManager:
         lines = [line.strip() for line in output.splitlines() if line.strip()]
         if not lines:
             return False
-        first_line = lines[0]
-        if first_line == cmd.strip():
+        first_line = lines[0].lower()
+        cmd_lower = cmd.strip().lower()
+        if first_line == cmd_lower:
             return False
-        if cmd.strip().startswith(first_line) and len(first_line) < len(cmd.strip()):
+        if cmd_lower.startswith(first_line) and len(first_line) < len(cmd_lower):
+            return True
+        cmd_tokens = cmd_lower.split()
+        out_tokens = first_line.split()
+        if not out_tokens or len(out_tokens) > len(cmd_tokens):
+            return False
+        for i, token in enumerate(out_tokens):
+            if not cmd_tokens[i].startswith(token):
+                return False
+        if len(out_tokens) < len(cmd_tokens):
+            return True
+        if any(len(out_tokens[i]) < len(cmd_tokens[i]) for i in range(len(out_tokens))):
             return True
         return False
 
@@ -947,9 +1022,9 @@ class ConnectionManager:
                 retry_reason = "unknown_error"
         
         if not needs_retry and status == CommandStatus.SUCCESS:
-            out_lower = out.lower()
-            if "% invalid input" in out_lower or "% incomplete command" in out_lower or "% ambiguous command" in out_lower or "% unrecognized command" in out_lower:
-                status = CommandStatus.COMMAND_UNSUPPORTED
+            status, analyze_err = CommandOutputAnalyzer.analyze(out)
+            if status != CommandStatus.SUCCESS:
+                err = analyze_err or "Device error"
                 
         def finalize_result(out_f, err_f, status_f, attempts_f, method_f, recon_perf, abort_h, elaps_1, elaps_retry, r_reason, d_reason):
             elaps = time.perf_counter() - total_t0
@@ -1005,9 +1080,9 @@ class ConnectionManager:
             reconnect_performed = False
 
         if status == CommandStatus.SUCCESS:
-            out_lower = out.lower()
-            if "% invalid input" in out_lower or "% incomplete command" in out_lower or "% ambiguous command" in out_lower or "% unrecognized command" in out_lower:
-                status = CommandStatus.COMMAND_UNSUPPORTED
+            status, analyze_err = CommandOutputAnalyzer.analyze(out)
+            if status != CommandStatus.SUCCESS:
+                err = analyze_err or "Device error"
 
         if (status != CommandStatus.SUCCESS and ConnectionManager.is_transport_error(err, out)) or (status == CommandStatus.SUCCESS and ConnectionManager.is_transport_error("", out)):
             return finalize_result(out, err or "Transport error during retry", status if status != CommandStatus.SUCCESS else CommandStatus.UNKNOWN_ERROR, 2, method_used, reconnect_performed, True, elapsed_1, elapsed_2, retry_reason, "Transport error persisted")
@@ -1032,15 +1107,25 @@ class ConnectionManager:
                 if run_platform_probe:
                     try:
                         guesser = SSHDetect(
+                            device_type="autodetect",
                             host=ip,
                             username=creds["username"],
                             password=creds["password"],
+                            secret=creds.get("secret", ""),
                             timeout=10
                         )
                         best_match = guesser.autodetect()
-                        device_type = best_match if best_match else "cisco_ios"
-                    except Exception:
+                    except Exception as exc:
+                        if log_callback:
+                            log_callback(f"autodetect failed ({exc.__class__.__name__}); falling back to cisco_ios")
+                        best_match = None
+
+                    if not best_match:
+                        if log_callback:
+                            log_callback("autodetect unavailable; falling back to cisco_ios")
                         device_type = "cisco_ios"
+                    else:
+                        device_type = best_match
                 else:
                     device_type = "cisco_ios"
 
@@ -1090,8 +1175,9 @@ class ConnectionManager:
                 conn.enable()
             except ValueError:
                 pass
-            except Exception:
-                pass
+            except Exception as e:
+                if log_callback:
+                    log_callback("Warning: enable mode failed (session will continue without privilege escalation).")
 
             logical = LogicalPlatform.UNKNOWN_CISCO
             ver_out_saved = ""
@@ -1318,6 +1404,13 @@ class CommandOutputAnalyzer:
 
 class ParserHelpers:
     @staticmethod
+    def normalize_parser_platform(logical_platform) -> str:
+        if logical_platform == LogicalPlatform.NXOS: return "NEXUS"
+        if logical_platform in (LogicalPlatform.IOS_XE_SWITCH, LogicalPlatform.IOS_XE_ROUTER): return "IOSXE"
+        if logical_platform == LogicalPlatform.ASA: return "ASA"
+        return "IOS"
+
+    @staticmethod
     def safe_int(value, default=0):
         try: return int(value)
         except (ValueError, TypeError): return default
@@ -1416,8 +1509,9 @@ class ParserEngine:
     @staticmethod
     def extract_section(section_header: str, lines: List[str]) -> List[str]:
         result, grab = [], False
+        expected_header = f"## {section_header}".strip()
         for line in lines:
-            if line.startswith(f"## {section_header}"):
+            if line.strip() == expected_header:
                 grab = True
                 continue
             if grab and line.startswith("## "):
@@ -1551,7 +1645,7 @@ class SnapshotBuilder:
             "command_results": command_results or [],
             "config": {"hash_redacted": ParserEngine.cfg_hash(ParserEngine.extract_section("show running-config", lines))},
             "neighbors": {
-                "arp_count": ParserEngine.arp_count(ParserEngine.extract_section("show arp", lines) + ParserEngine.extract_section("show ip arp summary", lines)),
+                "arp_count": ParserEngine.arp_count(ParserEngine.extract_section("show arp", lines) + ParserEngine.extract_section("show ip arp summary", lines) + ParserEngine.extract_section("show ip arp", lines) + ParserEngine.extract_section("show ip arp vrf all", lines)),
                 "eigrp": ParserEngine.eigrp_neighbors(ParserEngine.extract_section("show ip eigrp neighbors", lines) + ParserEngine.extract_section("show eigrp neighbors", lines)),
                 "ospf": ParserEngine.ospf_neighbors(ParserEngine.extract_section("show ip ospf neighbor", lines) + ParserEngine.extract_section("show ospf neighbor", lines)),
                 "bgp": ParserEngine.bgp_summary(ParserEngine.extract_section("show ip bgp summary", lines) + ParserEngine.extract_section("show bgp summary", lines) + ParserEngine.extract_section("show bgp ipv4 unicast summary", lines))
@@ -2074,7 +2168,7 @@ Command edits apply to future runs only. They do not change a run that is alread
 
     DocumentationSection("Output Files and Folder Structure", """Network Toolbelt writes output under the Base Output Directory configured in Settings.
 
-v2.9 Lean Output Profile:
+v2.91 Lean Output Profile:
 By default, the tool writes TXT-first outputs. JSON is disabled by default to save space, meaning scanner_summary.json, compare summary.json, and per-host JSON snapshots are skipped. Session logs are saved only for errors or diagnostics (like slow commands/timeouts) unless you explicitly change settings.
 
 Typical base path:
@@ -2254,7 +2348,7 @@ Implemented scanners:
 - Routing Neighbor Scanner
 - Log Scanner
 - Device Inventory Scanner
-- Routes Advertised / Received Scanner
+- BGP/Route Summary Scanner
 
 Common scanner statuses:
 - PASS: No notable issue found.
@@ -2425,7 +2519,7 @@ Inventory output is usually less about PASS/WARN/FAIL and more about structured 
 Limitations:
 Cisco inventory formats differ by platform. Some virtual devices or older platforms may not report serial/model data consistently."""),
 
-    DocumentationSection("Routes Advertised / Received Scanner", """Purpose:
+    DocumentationSection("BGP/Route Summary Scanner", """Purpose:
 Collect BGP route information for selected neighbors.
 
 Checks may include:
@@ -2589,7 +2683,7 @@ Best practices:
     DocumentationSection("About Network Toolbelt", """Network Toolbelt is a local Python/Tkinter utility for network operations tasks.
 
 Version:
-Network Toolbelt v2.9
+Network Toolbelt v2.91
 
 Primary design goals:
 - Portable single-file utility.
@@ -2623,7 +2717,7 @@ If you used Raw Capture mode, these exports may contain sensitive data (password
 
     DocumentationSection("Version Changelog", """Network Toolbelt Version History
 
-## v2.9 - Diagnostics, Performance, and Lean Output
+## v2.91 - Diagnostics, Performance, and Lean Output
 - Command timeout default is now 20 seconds.
 - Timing last_read default is 0.75 seconds.
 - Slow command threshold is 5 seconds.
@@ -2687,7 +2781,9 @@ If you used Raw Capture mode, these exports may contain sensitive data (password
 - Added Routing Neighbor Scanner.
 - Added Log Scanner.
 - Added Device Inventory Scanner.
-- Added Routes Advertised / Received Scanner.
+- Added BGP/Route Summary Scanner.
+  v2.91 collects and reports route/BGP summary information only.
+  It does not collect per-neighbor advertised-routes or received-routes output yet.
 
 ## v2.2 - Security and Execution Foundation
 - Added redacted capture behavior.
@@ -3586,18 +3682,28 @@ class BaseRunnerPage(tk.Frame):
             msg += f" - {detail}"
         self.set_status(msg)
 
-    def sync_tail(self, temp_path: str, tail_stop_event: threading.Event = None):
-        with open(temp_path, "r", encoding="utf-8") as f:
-            while not self.stop_event.is_set():
-                if tail_stop_event and tail_stop_event.is_set():
-                    break
-                line = f.read(1024)
-                if line:
-                    if settings.capture_mode == "redacted":
-                        line = redactor.redact_text(line)
-                    self.enqueue("LOG_SESSION", line)
-                else:
-                    time.sleep(0.1)
+    def sync_tail(self, temp_path: str, tail_stop_event=None):
+        try:
+            buf_redactor = LineBufferedRedactor(redactor.redact_text)
+            with open(temp_path, "r", encoding="utf-8", errors="replace") as f:
+                while not self.stop_event.is_set():
+                    if tail_stop_event and tail_stop_event.is_set():
+                        break
+                    chunk = f.read(1024)
+                    if chunk:
+                        out = buf_redactor.feed(chunk) if settings.capture_mode == "redacted" else chunk
+                        if out: self.enqueue("LOG_SESSION", out)
+                    else:
+                        import time
+                        time.sleep(0.1)
+                chunk = f.read()
+                if chunk:
+                    out = buf_redactor.feed(chunk) if settings.capture_mode == "redacted" else chunk
+                    if out: self.enqueue("LOG_SESSION", out)
+                out = buf_redactor.flush() if settings.capture_mode == "redacted" else ""
+                if out: self.enqueue("LOG_SESSION", out)
+        except Exception:
+            pass
 
 
 class MaintenanceRunnerPage(BaseRunnerPage):
@@ -3723,8 +3829,9 @@ class MaintenanceRunnerPage(BaseRunnerPage):
             self.enqueue("LOG_EXEC", f"\n[{idx}/{len(targets)}] {host}")
             self.active_conn = None
             
-            temp_session_log = str(out_dir / f".tmp_{safe_host}_{run_ts}_session.log")
-            Path(temp_session_log).touch()
+            temp_dir = SecureTempSessionLogManager.ensure_secure_temp_session_dir(settings.base_output_dir, run_id)
+            temp_session_log_path = SecureTempSessionLogManager.create_secure_session_log_path(temp_dir, safe_host)
+            temp_session_log = str(temp_session_log_path)
             tail_stop_event = threading.Event()
             tail_t = threading.Thread(target=self.sync_tail, args=(temp_session_log, tail_stop_event), daemon=True)
             tail_t.start()
@@ -3749,8 +3856,7 @@ class MaintenanceRunnerPage(BaseRunnerPage):
                     redactor.redact_file(Path(temp_session_log), out_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
                 else:
                     Path(temp_session_log).rename(out_dir / f"{safe_host}_{run_ts}_session_RAW.log")
-                try: Path(temp_session_log).unlink(missing_ok=True)
-                except Exception: pass
+                SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
                 continue
                 
             context = DeviceSessionContext(
@@ -3909,13 +4015,11 @@ class MaintenanceRunnerPage(BaseRunnerPage):
             has_errors = any(c.get("status") != "SUCCESS" or "method=retry" in c.get("method_used","") or "method=reconnect" in c.get("method_used","") for c in command_results)
             
             if settings.save_session_logs == "never" or (settings.save_session_logs == "errors_only" and not (has_errors or host_had_diagnostics) and conn_result.status == ConnectionStatus.SUCCESS):
-                try: Path(temp_session_log).unlink(missing_ok=True)
-                except Exception: pass
+                SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
             else:
                 if settings.capture_mode == "redacted":
                     redactor.redact_file(Path(temp_session_log), out_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
-                    try: Path(temp_session_log).unlink(missing_ok=True)
-                    except Exception: pass
+                    SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
                 else:
                     Path(temp_session_log).rename(out_dir / f"{safe_host}_{run_ts}_session_RAW.log")
 
@@ -4023,8 +4127,9 @@ class CommandRunnerPage(BaseRunnerPage):
                 self.enqueue("LOG_EXEC", f"\n[{idx}/{len(targets)}] {host}")
                 self.active_conn = None
                 
-                temp_session_log = str(log_dir / f".tmp_{safe_host}_{run_ts}_session.log")
-                Path(temp_session_log).touch()
+                temp_dir = SecureTempSessionLogManager.ensure_secure_temp_session_dir(settings.base_output_dir, run_id)
+                temp_session_log_path = SecureTempSessionLogManager.create_secure_session_log_path(temp_dir, safe_host)
+                temp_session_log = str(temp_session_log_path)
                 tail_stop_event = threading.Event()
                 tail_t = threading.Thread(target=self.sync_tail, args=(temp_session_log, tail_stop_event), daemon=True)
                 tail_t.start()
@@ -4049,8 +4154,7 @@ class CommandRunnerPage(BaseRunnerPage):
                         redactor.redact_file(Path(temp_session_log), log_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
                     else:
                         Path(temp_session_log).rename(log_dir / f"{safe_host}_{run_ts}_session_RAW.log")
-                    try: Path(temp_session_log).unlink(missing_ok=True)
-                    except Exception: pass
+                    SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
                     continue
 
                 self.enqueue("LOG_EXEC", "  Generic Runner platform probe skipped.")
@@ -4122,13 +4226,11 @@ class CommandRunnerPage(BaseRunnerPage):
                 tail_t.join(1)
                 
                 if settings.save_session_logs == "never" or (settings.save_session_logs == "errors_only" and not (has_errors or host_had_diagnostics) and conn_result.status == ConnectionStatus.SUCCESS):
-                    try: Path(temp_session_log).unlink(missing_ok=True)
-                    except Exception: pass
+                    SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
                 else:
                     if settings.capture_mode == "redacted":
                         redactor.redact_file(Path(temp_session_log), log_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
-                        try: Path(temp_session_log).unlink(missing_ok=True)
-                        except Exception: pass
+                        SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
                     else:
                         Path(temp_session_log).rename(log_dir / f"{safe_host}_{run_ts}_session_RAW.log")
 
@@ -4373,20 +4475,31 @@ class BaseScannerPage(BaseRunnerPage):
                 
                 host_out_dir = config.output_dir / "hosts"
                 host_out_dir.mkdir(exist_ok=True)
-                temp_session_log = str(host_out_dir / f".tmp_{safe_host}_session.log")
-                Path(temp_session_log).touch()
+                temp_dir = SecureTempSessionLogManager.ensure_secure_temp_session_dir(settings.base_output_dir, "generic")
+                temp_session_log_path = SecureTempSessionLogManager.create_secure_session_log_path(temp_dir, safe_host)
+                temp_session_log = str(temp_session_log_path)
                 
                 tail_stop_event = threading.Event()
                 def sync_tail():
-                    with open(temp_session_log, "r", encoding="utf-8") as f:
-                        while not tail_stop_event.is_set() and not self.stop_event.is_set():
-                            line = f.read(1024)
-                            if line:
-                                if settings.capture_mode == "redacted":
-                                    line = redactor.redact_text(line)
-                                self.enqueue("LOG_SESSION", line)
-                            else:
-                                time.sleep(0.1)
+                    try:
+                        buf_redactor = LineBufferedRedactor(redactor.redact_text)
+                        with open(temp_session_log, "r", encoding="utf-8", errors="replace") as f:
+                            while not tail_stop_event.is_set() and not self.stop_event.is_set():
+                                chunk = f.read(1024)
+                                if chunk:
+                                    out = buf_redactor.feed(chunk) if settings.capture_mode == "redacted" else chunk
+                                    if out: self.enqueue("LOG_SESSION", out)
+                                else:
+                                    import time
+                                    time.sleep(0.1)
+                            chunk = f.read()
+                            if chunk:
+                                out = buf_redactor.feed(chunk) if settings.capture_mode == "redacted" else chunk
+                                if out: self.enqueue("LOG_SESSION", out)
+                            out = buf_redactor.flush() if settings.capture_mode == "redacted" else ""
+                            if out: self.enqueue("LOG_SESSION", out)
+                    except Exception:
+                        pass
                 
                 tail_t = threading.Thread(target=sync_tail, daemon=True)
                 tail_t.start()
@@ -4409,8 +4522,7 @@ class BaseScannerPage(BaseRunnerPage):
                         redactor.redact_file(Path(temp_session_log), host_out_dir / f"{safe_host}_{config.timestamp}_session_REDACTED.log")
                     else:
                         Path(temp_session_log).rename(host_out_dir / f"{safe_host}_{config.timestamp}_session_RAW.log")
-                    try: Path(temp_session_log).unlink(missing_ok=True)
-                    except Exception: pass
+                    SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
                     host_results.append(ScannerHostResult(host, safe_host, conn_result.status.name if conn_result else "FAIL", "", "", {}, {}, [], [conn_result.error_message if conn_result else "Connection Failed"], []))
                     continue
                     
@@ -4511,7 +4623,7 @@ class BaseScannerPage(BaseRunnerPage):
                 warnings = []
                 try:
                     if outputs and not self.stop_event.is_set():
-                        parsed_data, findings, warnings = self.scanner_def.parser_callback(logical_plat.name, outputs, config.options)
+                        parsed_data, findings, warnings = self.scanner_def.parser_callback(ParserHelpers.normalize_parser_platform(logical_plat), outputs, config.options)
                 except Exception as e:
                     errors.append(f"Parser crash: {str(e)}")
                     
@@ -4519,13 +4631,11 @@ class BaseScannerPage(BaseRunnerPage):
                 self.set_host_status(host, idx, total_hosts, "Success" if not has_errors else "Completed with errors", "moving to next target")
                 
                 if settings.save_session_logs == "never" or (settings.save_session_logs == "errors_only" and not (has_errors or host_had_diagnostics) and conn_result.status == ConnectionStatus.SUCCESS):
-                    try: Path(temp_session_log).unlink(missing_ok=True)
-                    except Exception: pass
+                    SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
                 else:
                     if settings.capture_mode == "redacted":
                         redactor.redact_file(Path(temp_session_log), host_out_dir / f"{safe_host}_{config.timestamp}_session_REDACTED.log")
-                        try: Path(temp_session_log).unlink(missing_ok=True)
-                        except Exception: pass
+                        SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
                     else:
                         Path(temp_session_log).rename(host_out_dir / f"{safe_host}_{config.timestamp}_session_RAW.log")
                 
@@ -4878,7 +4988,7 @@ def parse_bgp_routes(platform: str, outputs: Dict[str, str], options: Dict[str, 
     return parsed, findings, warnings
 
 BGP_ROUTES_DEF = ScannerDefinition(
-    name="Routes Advertised / Received Scanner",
+    name="BGP/Route Summary Scanner",
     internal_key="routes_advertised_received_scanner",
     description="Inspect BGP routes advertised to and received from specific neighbors.\n\nWARNING: Route output can be large. Received-routes may require soft-reconfiguration inbound.",
     commands_by_command_set={
@@ -4964,7 +5074,7 @@ class ScannerLandingPage(tk.Frame):
         tk.Button(grid_frame, text="Log Scanner", width=30, height=2, command=lambda: controller.show_frame("LogScannerPage")).grid(row=1, column=1, padx=10, pady=10)
         tk.Button(grid_frame, text="Device Inventory Scanner", width=30, height=2, command=lambda: controller.show_frame("DeviceInventoryScannerPage")).grid(row=2, column=0, padx=10, pady=10)
         tk.Button(grid_frame, text="Optics Scanner", width=30, height=2, command=lambda: controller.show_frame("OpticsScannerPage")).grid(row=2, column=1, padx=10, pady=10)
-        tk.Button(grid_frame, text="Routes Advertised/Received", width=30, height=2, command=lambda: controller.show_frame("RoutesAdvertisedReceivedScannerPage")).grid(row=3, column=0, padx=10, pady=10)
+        tk.Button(grid_frame, text="BGP/Route Summary", width=30, height=2, command=lambda: controller.show_frame("RoutesAdvertisedReceivedScannerPage")).grid(row=3, column=0, padx=10, pady=10)
         tk.Button(grid_frame, text="Config Backup / Diff Tool (Soon)", width=30, height=2, command=lambda: controller.show_frame("ConfigBackupStubPage")).grid(row=3, column=1, padx=10, pady=10)
         tk.Button(grid_frame, text="Outage Snapshot Tool (Soon)", width=30, height=2, command=lambda: controller.show_frame("OutageSnapshotStubPage")).grid(row=4, column=0, padx=10, pady=10)
         tk.Button(grid_frame, text="Reachability / Path Test (Soon)", width=30, height=2, command=lambda: controller.show_frame("ReachabilityStubPage")).grid(row=4, column=1, padx=10, pady=10)
@@ -5054,8 +5164,7 @@ class CredentialMappingRunner:
                 status_cb(mapping.host, mapping.status, mapping.credential_label, mapping.username, mapping.detected_platform, mapping.last_tested, mapping.error_message)
                 tail_stop_event.set()
                 tail_t.join(1.0)
-                try: Path(temp_session_log).unlink(missing_ok=True)
-                except: pass
+                SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
                 continue
                 
             success = False
@@ -5110,8 +5219,7 @@ class CredentialMappingRunner:
             # Clean up temp session log
             tail_stop_event.set()
             tail_t.join(1.0)
-            try: Path(temp_session_log).unlink(missing_ok=True)
-            except: pass
+            SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
             
         progress_cb(total, total)
         if not stop_event.is_set():
@@ -5866,6 +5974,48 @@ def _run_execution_self_tests():
     assert res.status == CommandStatus.COMMAND_UNSUPPORTED
     assert ConnectionManager.is_transport_error("", "% Invalid input") == False
     
+
+    # 7. Privilege / Auth Failure test
+    ctx.conn.send_command_timing = lambda cmd, **kw: "% Authorization failed"
+    res = ConnectionManager.execute_command_with_recovery(ctx, "show fake")
+    assert res.status == CommandStatus.PRIVILEGE_DENIED
+    
+    # 8. Parser Exact Matching test
+    from typing import List
+    lines = ["## show interfaces description", "desc", "## show interfaces", "intf", "## end"]
+    res_exact = ParserEngine.extract_section("show interfaces", lines)
+    assert res_exact == ["intf"]
+    
+    # 9. NXOS Normalization test
+    assert ParserHelpers.normalize_parser_platform(LogicalPlatform.NXOS) == "NEXUS"
+
+    # 10. Redaction tests
+    redact_test_tacacs = "tacacs-server key 7 030752180500"
+    assert redactor.redact_text(redact_test_tacacs) == "tacacs-server key 7 <REDACTED>"
+
+    redact_test_radius = "radius-server key MySharedSecret"
+    assert redactor.redact_text(redact_test_radius) == "radius-server key <REDACTED>"
+
+    redact_test_snmp_priv = "snmp-server user nmsuser NMSGROUP v3 auth sha AuthSecret123 priv aes 128 PrivSecret456"
+    assert "AuthSecret123" not in redactor.redact_text(redact_test_snmp_priv)
+    assert "PrivSecret456" not in redactor.redact_text(redact_test_snmp_priv)
+    
+    redact_test_password = "Password: mypass"
+    assert redactor.redact_text(redact_test_password) == "Password: <REDACTED>"
+
+    # 11. Buffered Redaction test
+    buf_red = LineBufferedRedactor(redactor.redact_text)
+    out1 = buf_red.feed("tacacs-server ke")
+    out2 = buf_red.feed("y 7 030752180500\n")
+    assert out1 == ""
+    assert out2 == "tacacs-server key 7 <REDACTED>\n"
+
+    # 12. SnapshotBuilder ARP parsing test
+    arp_lines = ["## show ip arp", "Protocol  Address  Age (min)  Hardware Addr  Type  Interface", "Internet  1.1.1.1  0          0000.0000.0000 ARPA  Vlan1"]
+    arp_res = ParserEngine.arp_count(ParserEngine.extract_section("show ip arp", arp_lines))
+    assert arp_res == 1
+
+
     # 6. Generic Runner / ConnectionManager platform probe toggle
     guesser_called = [False]
     class MockGuesser:

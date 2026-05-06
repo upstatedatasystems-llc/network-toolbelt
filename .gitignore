@@ -1,16 +1,9 @@
-# Ignore everything
-*
-
-# Except the essentials
-!network-toolbelt.py
-!README.md
-!CHANGELOG.md
-!system_manifest.md
-!requirements.txt
-!.gitignore
-
-# Keep directories so git can traverse to find allowed files
-!*/
+# Ignore common junk and output
+__pycache__/
+*.pyc
+.DS_Store
+toolbelt-output/
+scratch/
 
 # Ignore specific common junk and output
 __pycache__/

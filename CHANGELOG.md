@@ -287,3 +287,16 @@ v2.8 is a usability, stabilization, documentation, and workflow-polish release. 
 ## Versioning Notes
 
 The application started as a practical internal operations tool and evolved rapidly. Some early changes were implemented before formal version tracking was introduced. The changelog above is therefore a best-effort reconstruction from the development history and current application behavior.
+
+## v2.91 - Correctness and Security Patch
+- Fixed SSHDetect fallback logic to properly handle autodetect failures without crashing and securely pass credentials.
+- Improved command output analysis to correctly identify authorization and syntax errors.
+- Enhanced parser engine to use exact section header matching, preventing cross-section data bleed.
+- Updated ARP snapshot parser to correctly capture `show ip arp` outputs.
+- Standardized scanner platform normalization, fixing issues where Nexus-specific parsing was ignored.
+- Fixed malformed echo detection logic to properly identify token-prefix truncation.
+- Improved redaction engine to use line-buffered streaming, preventing secrets from leaking across chunk boundaries.
+- Added targeted redaction patterns for TACACS/RADIUS nested keys, SNMPv3 secrets, and varied password prompts.
+- Hardened temp session logging with strict directory permissions and robust cleanup handlers to ensure no raw artifacts persist.
+- Gracefully handle privilege escalation (enable) failures, logging the warning instead of aborting the connection.
+- Renamed "Routes Advertised / Received Scanner" to "BGP/Route Summary Scanner" to clarify its summary-only capabilities.
