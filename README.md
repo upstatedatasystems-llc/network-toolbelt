@@ -15,13 +15,13 @@ Use Network Toolbelt to:
 - Run focused network scanner workflows.
 - Export output for review, archiving, or AI-assisted analysis.
 
-The app is intentionally maintained as a single-file utility, `cisco_toolbelt.py`, for simple internal deployment and portability.
+The app is intentionally maintained as a single-file utility, `network-toolbelt.py`, for simple internal deployment and portability.
 
 ---
 
 ## Status
 
-Current version: **v2.8**
+Current version: **v2.9**
 
 Current focus:
 
@@ -63,13 +63,13 @@ pip install netmiko
 Run the app:
 
 ```bash
-python cisco_toolbelt.py
+python network-toolbelt.py
 ```
 
 or:
 
 ```bash
-python3 cisco_toolbelt.py
+python3 network-toolbelt.py
 ```
 
 ---
@@ -397,7 +397,7 @@ show version
 Run a syntax check after edits:
 
 ```bash
-python -m py_compile cisco_toolbelt.py
+python -m py_compile network-toolbelt.py
 ```
 
 Before committing a release:
@@ -422,7 +422,7 @@ Do not commit raw output files or sensitive device logs.
 Important files:
 
 ```text
-cisco_toolbelt.py
+network-toolbelt.py
 README.md
 CHANGELOG.md
 system_manifest.md
@@ -432,7 +432,7 @@ requirements.txt
 The application itself currently lives in:
 
 ```text
-cisco_toolbelt.py
+network-toolbelt.py
 ```
 
 The user-facing project name is:

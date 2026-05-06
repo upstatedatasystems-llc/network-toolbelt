@@ -5954,6 +5954,7 @@ Cisco IOS Software
 def main():
     if os.environ.get("NETWORK_TOOLBELT_TEST") == "1":
         _run_execution_self_tests()
+        return
         
     app = NetworkToolbeltApp()
     app.mainloop()

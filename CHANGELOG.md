@@ -29,6 +29,11 @@ v2.9 addresses performance bottlenecks introduced by v2.85 execution improvement
 - Increased default app window size to 1400x850.
 - Replaced basic progress states with explicit status messaging (e.g., "Connecting", "Running commands", "Slow command").
 
+### Fixed
+- Fixed Maintenance Runner crash caused by missing execution result when using cached platform probes.
+- Fixed unnecessary command retries triggered by empty valid output.
+- Fixed self-test mode hanging GUI on exit by returning immediately after tests.
+
 ---
 
 ## v2.85 - Netmiko Execution Engine Overhaul

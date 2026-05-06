@@ -676,4 +676,5 @@ Network Toolbelt v2.9 includes:
 - CompareEngine memory building from TXT files.
 - UI enhancements (target list scrollbars, larger default geometry).
 - Improved granular status bar messages.
+- Self-test mode exit fix.
 - (Plus all execution engine improvements from v2.85).
