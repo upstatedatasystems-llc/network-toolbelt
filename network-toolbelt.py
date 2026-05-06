@@ -208,7 +208,7 @@ class ScannerDefinition:
 # Constants and Settings
 # ============================================================
 
-APP_VERSION = "2.9"
+APP_VERSION = "2.91"
 
 @dataclass
 class DocumentationSection:
@@ -1173,8 +1173,6 @@ class ConnectionManager:
 
             try:
                 conn.enable()
-            except ValueError:
-                pass
             except Exception as e:
                 if log_callback:
                     log_callback("Warning: enable mode failed (session will continue without privilege escalation).")
@@ -1396,7 +1394,7 @@ class CommandOutputAnalyzer:
         lower_out = output.lower()
         if "% invalid input" in lower_out or "% incomplete command" in lower_out or "% ambiguous command" in lower_out or "% unrecognized command" in lower_out:
             return CommandStatus.COMMAND_UNSUPPORTED, "Command syntax invalid or unsupported on this platform."
-        if "authorization failed" in lower_out or "command authorization failed" in lower_out or "privilege" in lower_out or "permission denied" in lower_out:
+        if any(phrase in lower_out for phrase in ["authorization failed", "% authorization failed", "command authorization failed", "permission denied", "insufficient privileges", "insufficient privilege", "not authorized", "requires privilege", "privilege denied", "access denied"]):
             return CommandStatus.PRIVILEGE_DENIED, "Account lacks privilege for this command."
         if "% error" in lower_out or "%error" in lower_out or "% failed" in lower_out or "%failed" in lower_out:
             return CommandStatus.DEVICE_ERROR, "Device returned an error."
@@ -2108,6 +2106,13 @@ Session log labels:
 
 Mapping sessions:
 Credential mapping should display session logs in redacted form for safety.
+
+Temporary Session Logs:
+- During active Netmiko sessions, raw session data may temporarily reside in a restricted dedicated temp folder.
+- On normal completion, Network Toolbelt redacts the session output into final logs and removes the raw temp file.
+- On startup, Network Toolbelt attempts to remove stale temp session artifacts left by abnormal exits.
+- Operators should still treat output folders as sensitive.
+- Merged TXT export intentionally excludes .json, .log, session logs, .tmp_* files, and the temp session folder.
 
 Recommendation:
 Leave capture mode set to Redacted unless you have a specific reason to collect raw output."""),
@@ -4990,7 +4995,7 @@ def parse_bgp_routes(platform: str, outputs: Dict[str, str], options: Dict[str, 
 BGP_ROUTES_DEF = ScannerDefinition(
     name="BGP/Route Summary Scanner",
     internal_key="routes_advertised_received_scanner",
-    description="Inspect BGP routes advertised to and received from specific neighbors.\n\nWARNING: Route output can be large. Received-routes may require soft-reconfiguration inbound.",
+    description="Collect and report route and BGP summary information.\n\nWARNING: Advertised/received route collection is not implemented in v2.91; summary commands only.",
     commands_by_command_set={
         "CATALYST_IOS_SWITCH": ["show ip bgp summary"],
         "CATALYST_IOS_XE_SWITCH": ["show ip bgp summary"],
@@ -5014,8 +5019,8 @@ class RoutesAdvertisedReceivedScannerPage(BaseScannerPage):
         
         self.adv_var = tk.BooleanVar(value=True)
         self.rec_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(self.options_frame, text="Collect Advertised Routes", variable=self.adv_var).pack(anchor="w")
-        tk.Checkbutton(self.options_frame, text="Collect Received Routes", variable=self.rec_var).pack(anchor="w")
+        # tk.Checkbutton(self.options_frame, text="Collect Advertised Routes", variable=self.adv_var, state=tk.DISABLED).pack(anchor="w")
+        # tk.Checkbutton(self.options_frame, text="Collect Received Routes", variable=self.rec_var, state=tk.DISABLED).pack(anchor="w")
         
     def get_options(self) -> dict:
         nbrs = [n.strip() for n in self.nbr_text.get("1.0", tk.END).splitlines() if n.strip()]
@@ -5132,7 +5137,9 @@ class CredentialMappingRunner:
             
             # Temporary session log
             settings.base_output_dir.mkdir(parents=True, exist_ok=True)
-            temp_session_log = str(settings.base_output_dir / f".tmp_mapping_{mapping.safe_host}_{idx}.log")
+            temp_dir = SecureTempSessionLogManager.ensure_secure_temp_session_dir(settings.base_output_dir, "mapping")
+            temp_session_log_path = SecureTempSessionLogManager.create_secure_session_log_path(temp_dir, f"{mapping.safe_host}_{idx}")
+            temp_session_log = str(temp_session_log_path)
             
             # Try to connect
             log_callback_for_connect = lambda msg: log_cb("  " + msg)
@@ -5141,16 +5148,24 @@ class CredentialMappingRunner:
             tail_stop_event = threading.Event()
             def tail_file(filepath, stop_evt):
                 import time
-                with open(filepath, 'w') as f: f.write("") # create it
-                with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-                    while not stop_evt.is_set():
-                        line = f.readline()
-                        if line:
-                            if capture_mode == "redacted":
-                                line = redactor.redact_text(line)
-                            sess_log_cb(line)
-                        else:
-                            time.sleep(0.1)
+                try:
+                    buf_redactor = LineBufferedRedactor(redactor.redact_text)
+                    with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+                        while not stop_evt.is_set():
+                            chunk = f.read(1024)
+                            if chunk:
+                                out = buf_redactor.feed(chunk) if capture_mode == "redacted" else chunk
+                                if out: sess_log_cb(out)
+                            else:
+                                time.sleep(0.1)
+                        chunk = f.read()
+                        if chunk:
+                            out = buf_redactor.feed(chunk) if capture_mode == "redacted" else chunk
+                            if out: sess_log_cb(out)
+                        out = buf_redactor.flush() if capture_mode == "redacted" else ""
+                        if out: sess_log_cb(out)
+                except Exception:
+                    pass
                             
             tail_t = threading.Thread(target=tail_file, args=(temp_session_log, tail_stop_event), daemon=True)
             tail_t.start()
@@ -5760,6 +5775,7 @@ class NetworkToolbeltApp(tk.Tk):
             with zipfile.ZipFile(save_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                 for root, dirs, files in os.walk(settings.base_output_dir):
                     if '__pycache__' in dirs: dirs.remove('__pycache__')
+                    if '.temp_sessions' in dirs: dirs.remove('.temp_sessions')
                     for f in files:
                         if f == '.DS_Store' or f.startswith('.tmp_'): continue
                         fpath = Path(root) / f
@@ -5798,6 +5814,7 @@ class NetworkToolbeltApp(tk.Tk):
                 
                 for root, dirs, files in os.walk(settings.base_output_dir):
                     if '__pycache__' in dirs: dirs.remove('__pycache__')
+                    if '.temp_sessions' in dirs: dirs.remove('.temp_sessions')
                     for f in files:
                         if f == '.DS_Store' or f.startswith('.tmp_'): continue
                         fpath = Path(root) / f
@@ -6014,6 +6031,49 @@ def _run_execution_self_tests():
     arp_lines = ["## show ip arp", "Protocol  Address  Age (min)  Hardware Addr  Type  Interface", "Internet  1.1.1.1  0          0000.0000.0000 ARPA  Vlan1"]
     arp_res = ParserEngine.arp_count(ParserEngine.extract_section("show ip arp", arp_lines))
     assert arp_res == 1
+    
+    # 13. Redaction backreference correctness
+    assert "\x01" not in redactor.redact_text("tacacs-server key 7 030752180500")
+    assert "\x03" not in redactor.redact_text("tacacs-server key 7 030752180500")
+
+    # 14. CommandOutputAnalyzer Privilege Checks
+    # % Authorization failed should fail
+    ctx.conn.send_command_timing = lambda cmd, **kw: "% Authorization failed"
+    res_auth = ConnectionManager.execute_command_with_recovery(ctx, "show fake")
+    assert res_auth.status == CommandStatus.PRIVILEGE_DENIED
+    
+    # Current privilege level is 15 should pass
+    ctx.conn.send_command_timing = lambda cmd, **kw: "Current privilege level is 15"
+    res_priv = ConnectionManager.execute_command_with_recovery(ctx, "show fake")
+    assert res_priv.status == CommandStatus.SUCCESS
+
+    # username admin privilege 15 should pass
+    ctx.conn.send_command_timing = lambda cmd, **kw: "username admin privilege 15 secret 9 hash"
+    res_usr = ConnectionManager.execute_command_with_recovery(ctx, "show fake")
+    assert res_usr.status == CommandStatus.SUCCESS
+    
+    # 15. Enable Failure ValueError test
+    class MockConnEnable:
+        def __init__(self):
+            self.logged = False
+        def enable(self):
+            raise ValueError("Mock ValueError")
+        def send_command(self, *a, **k):
+            return ""
+        def disconnect(self): pass
+    
+    def enable_log_cb(msg):
+        if "Warning: enable mode failed" in msg:
+            mock_enable_conn.logged = True
+
+    mock_enable_conn = MockConnEnable()
+    original_connect = globals().get('ConnectHandler')
+    globals()['ConnectHandler'] = lambda *a, **k: mock_enable_conn
+    try:
+        ConnectionManager.connect("1.1.1.1", {"username": "u", "password": "p", "secret": "s"}, "Auto Detect", "", log_callback=enable_log_cb, run_platform_probe=False)
+        assert mock_enable_conn.logged, "ValueError during enable should trigger a warning log"
+    finally:
+        globals()['ConnectHandler'] = original_connect
 
 
     # 6. Generic Runner / ConnectionManager platform probe toggle
@@ -6106,6 +6166,7 @@ def main():
         _run_execution_self_tests()
         return
         
+    SecureTempSessionLogManager.cleanup_stale_temp_session_dirs(settings.base_output_dir)
     app = NetworkToolbeltApp()
     app.mainloop()
 
