@@ -376,6 +376,7 @@ class AppSettings:
         self.platform_probe_last_read = 1.0
         self.diagnostics_enabled = True
         self.execution_strategy = "safe_timing"
+        self.retry_on_command_timeout = False
         
         self.output_profile = "lean"
         self.write_json_outputs = False
@@ -933,14 +934,13 @@ class ConnectionManager:
                 needs_retry = True
                 retry_reason = "malformed_echo"
                 fallback_last_read = True
-            elif not out.strip():
-                needs_retry = True
-                retry_reason = "empty_output"
-                fallback_last_read = True
         elif status == CommandStatus.COMMAND_TIMEOUT:
-            needs_retry = True
-            retry_reason = "command_timeout"
-            fallback_last_read = True
+            if settings.retry_on_command_timeout:
+                needs_retry = True
+                retry_reason = "command_timeout"
+                fallback_last_read = True
+            else:
+                needs_retry = False
         else:
             if status != CommandStatus.SUCCESS:
                 needs_retry = True
@@ -1017,7 +1017,7 @@ class ConnectionManager:
 
         return finalize_result(out, err, status, 2, method_used, reconnect_performed, False, elapsed_1, elapsed_2, retry_reason, "")
     @staticmethod
-    def connect(ip: str, creds: dict, platform_choice: str, temp_session_log: str, run_platform_probe: bool = True):
+    def connect(ip: str, creds: dict, platform_choice: str, temp_session_log: str, run_platform_probe: bool = True, log_callback=None):
         try:
             device_type = "cisco_ios"
 
@@ -1109,7 +1109,8 @@ class ConnectionManager:
                     logical = DeviceDetector.classify(ver_out)
                     ver_out_saved = ver_out
                     elapsed = time.perf_counter() - t0
-                    # if log_callback is needed, could pass it, but skipped for now per request scope.
+                    if log_callback and settings.diagnostics_enabled:
+                        log_callback(f"  Debug: Platform probe completed in {elapsed:.2f}s [bytes={len(ver_out.encode('utf-8'))}, lines={len(ver_out.splitlines())}, timeout={settings.platform_probe_timeout}s, last_read={settings.platform_probe_last_read}s]")
                 except Exception:
                     pass
 
@@ -1177,7 +1178,7 @@ class ConnectionManager:
             log_callback(f"Using mapped credential for {host}: {display_str}")
             
         c_dict = {"username": c_record.username, "password": c_record.password, "secret": c_record.secret}
-        res = ConnectionManager.connect(host, c_dict, platform_choice, temp_session_log, run_platform_probe)
+        res = ConnectionManager.connect(host, c_dict, platform_choice, temp_session_log, run_platform_probe, log_callback)
         
         if res.status == ConnectionStatus.SUCCESS:
             return res
@@ -1204,7 +1205,7 @@ class ConnectionManager:
                     disp = f"Credential Set {idx_remaining + 1}" if idx_remaining != -1 else r.label
                     log_callback(f"  Trying {disp} for {host}...")
                 rem_dict = {"username": r.username, "password": r.password, "secret": r.secret}
-                rem_res = ConnectionManager.connect(host, rem_dict, platform_choice, temp_session_log, run_platform_probe)
+                rem_res = ConnectionManager.connect(host, rem_dict, platform_choice, temp_session_log, run_platform_probe, log_callback)
                 if rem_res.status == ConnectionStatus.SUCCESS:
                     return rem_res
                     
@@ -1223,7 +1224,7 @@ class ConnectionManager:
                 break
                 
             username = cred.get("username", "unknown")
-            res = ConnectionManager.connect(host, cred, platform_choice, temp_session_log, run_platform_probe)
+            res = ConnectionManager.connect(host, cred, platform_choice, temp_session_log, run_platform_probe, log_callback)
             
             history_record = {
                 "set_number": i,
@@ -1742,7 +1743,8 @@ class CompareEngine:
 
         sum_txt_data = "\n".join(summary_txt)
         (out_dir / "summary.txt").write_text(sum_txt_data, encoding="utf-8")
-        with open(out_dir / "summary.json", "w") as f: json.dump(summary_json, f, indent=4)
+        if settings.write_json_outputs:
+            with open(out_dir / "summary.json", "w") as f: json.dump(summary_json, f, indent=4)
         with open(out_dir / "summary.csv", "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerows(summary_csv)
@@ -2071,6 +2073,9 @@ Important:
 Command edits apply to future runs only. They do not change a run that is already in progress."""),
 
     DocumentationSection("Output Files and Folder Structure", """Network Toolbelt writes output under the Base Output Directory configured in Settings.
+
+v2.9 Lean Output Profile:
+By default, the tool writes TXT-first outputs. JSON is disabled by default to save space, meaning scanner_summary.json, compare summary.json, and per-host JSON snapshots are skipped. Session logs are saved only for errors or diagnostics (like slow commands/timeouts) unless you explicitly change settings.
 
 Typical base path:
 toolbelt-output
@@ -3796,6 +3801,9 @@ class MaintenanceRunnerPage(BaseRunnerPage):
                             err_msg = ""
                             method_used = "platform_probe_cache"
                             abort_host = False
+                            exec_res = CommandExecutionResult(
+                                command=cmd, status=status, output=cmd_out, error_message="", attempts=0, method_used="platform_probe_cache", reconnect_performed=False, unsupported_reason="", abort_host=False, elapsed_seconds=0.0, first_attempt_elapsed_seconds=0.0, retry_elapsed_seconds=0.0, output_bytes=len(cmd_out.encode('utf-8')), output_lines=len(cmd_out.splitlines()), timeout_seconds=0, last_read_seconds=0.0, slow_command=False, diagnostic_reason="", retry_reason=""
+                            )
                         else:
                             exec_res = ConnectionManager.execute_command_with_recovery(context, cmd, log_callback=log_cb)
                             self.active_conn = context.conn
@@ -4432,6 +4440,7 @@ class BaseScannerPage(BaseRunnerPage):
                 
                 outputs = {}
                 errors = []
+                last_exec_res = None
                 
                 if not cmd_bundle:
                     self.enqueue("LOG_EXEC", f"  ✗ No commands for platform {logical_plat.name}")
@@ -4467,6 +4476,7 @@ class BaseScannerPage(BaseRunnerPage):
                                 self.enqueue("LOG_EXEC", f"  ✗ Host aborted due to transport/reconnect failure.")
                                 break
                                 
+                        last_exec_res = exec_res
                         diag_hdr = ConnectionManager.format_diagnostic_header(exec_res)
                             
                         if status == CommandStatus.COMMAND_UNSUPPORTED:
@@ -4496,7 +4506,18 @@ class BaseScannerPage(BaseRunnerPage):
                 tail_stop_event.set()
                 tail_t.join(1)
                 
-                has_errors = bool(errors) or exec_res.abort_host if 'exec_res' in locals() else False
+                parsed_data = {}
+                findings = []
+                warnings = []
+                try:
+                    if outputs and not self.stop_event.is_set():
+                        parsed_data, findings, warnings = self.scanner_def.parser_callback(logical_plat.name, outputs, config.options)
+                except Exception as e:
+                    errors.append(f"Parser crash: {str(e)}")
+                    
+                has_errors = bool(errors) or (last_exec_res.abort_host if last_exec_res else False)
+                self.set_host_status(host, idx, total_hosts, "Success" if not has_errors else "Completed with errors", "moving to next target")
+                
                 if settings.save_session_logs == "never" or (settings.save_session_logs == "errors_only" and not (has_errors or host_had_diagnostics) and conn_result.status == ConnectionStatus.SUCCESS):
                     try: Path(temp_session_log).unlink(missing_ok=True)
                     except Exception: pass
@@ -4508,16 +4529,6 @@ class BaseScannerPage(BaseRunnerPage):
                     else:
                         Path(temp_session_log).rename(host_out_dir / f"{safe_host}_{config.timestamp}_session_RAW.log")
                 
-                parsed_data = {}
-                self.set_host_status(host, idx, total_hosts, "Success" if not has_errors else "Completed with errors", "moving to next target")
-                findings = []
-                warnings = []
-                try:
-                    if outputs and not self.stop_event.is_set():
-                        parsed_data, findings, warnings = self.scanner_def.parser_callback(logical_plat.name, outputs, config.options)
-                except Exception as e:
-                    errors.append(f"Parser crash: {str(e)}")
-                    
                 res = ScannerHostResult(host, safe_host, "SUCCESS", logical_plat.name, conn_result.netmiko_device_type, outputs, parsed_data, findings, errors, warnings)
                 host_results.append(res)
                 
