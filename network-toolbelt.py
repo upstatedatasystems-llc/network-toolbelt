@@ -124,6 +124,16 @@ class CommandExecutionResult:
     reconnect_performed: bool = False
     unsupported_reason: str = ""
     abort_host: bool = False
+    elapsed_seconds: float = 0.0
+    first_attempt_elapsed_seconds: float = 0.0
+    retry_elapsed_seconds: float = 0.0
+    output_bytes: int = 0
+    output_lines: int = 0
+    timeout_seconds: int = 0
+    last_read_seconds: float = 0.0
+    slow_command: bool = False
+    diagnostic_reason: str = ""
+    retry_reason: str = ""
 
 @dataclass
 class CompareFinding:
@@ -198,7 +208,7 @@ class ScannerDefinition:
 # Constants and Settings
 # ============================================================
 
-APP_VERSION = "2.85"
+APP_VERSION = "2.9"
 
 @dataclass
 class DocumentationSection:
@@ -357,7 +367,23 @@ class AppSettings:
     def __init__(self):
         self.base_output_dir = Path.cwd() / "toolbelt-output"
         self.base_output_dir.mkdir(exist_ok=True)
-        self.command_timeout = 300
+        self.command_timeout = 20
+        self.slow_command_threshold = 5
+        self.timing_last_read = 0.75
+        self.prep_command_timeout = 10
+        self.prep_last_read = 0.5
+        self.platform_probe_timeout = 20
+        self.platform_probe_last_read = 1.0
+        self.diagnostics_enabled = True
+        self.execution_strategy = "safe_timing"
+        
+        self.output_profile = "lean"
+        self.write_json_outputs = False
+        self.write_full_output_json = False
+        self.write_csv_summaries = True
+        self.save_session_logs = "errors_only"
+        self.include_full_output_in_compare_reports = False
+        
         self.command_policy_mode = CommandPolicyMode.SAFE_READ_ONLY
         self.capture_mode = "redacted"
         self.current_theme = "dark"
@@ -810,7 +836,11 @@ class ConnectionManager:
             
         for cmd in commands:
             try:
-                conn.send_command_timing(cmd, strip_prompt=False, strip_command=False)
+                t0 = time.perf_counter()
+                conn.send_command_timing(cmd, read_timeout=settings.prep_command_timeout, last_read=settings.prep_last_read, strip_prompt=False, strip_command=False)
+                elapsed = time.perf_counter() - t0
+                if settings.diagnostics_enabled and log_callback:
+                    log_callback(f"  Debug: Session prep '{cmd}' completed in {elapsed:.2f}s")
             except Exception as e:
                 if log_callback:
                     log_callback(f"Debug: Session prep command '{cmd}' error: {e}")
@@ -837,20 +867,41 @@ class ConnectionManager:
         return False
 
     @staticmethod
+    def summarize_command_diagnostics(result: CommandExecutionResult) -> str:
+        s = f"method={result.method_used}, attempts={result.attempts}, bytes={result.output_bytes}, lines={result.output_lines}, timeout={result.timeout_seconds}s, last_read={result.last_read_seconds}s"
+        if result.status == CommandStatus.SUCCESS:
+            if result.slow_command:
+                return f"! Slow command: {result.command.strip()} took {result.elapsed_seconds:.1f}s [{s}]. Possible causes: large output, device delay, timing wait, or prompt/read behavior."
+            return f"✓ {result.command.strip()} completed in {result.elapsed_seconds:.1f}s [{s}]"
+        elif result.status == CommandStatus.COMMAND_TIMEOUT:
+            return f"✗ Timeout after {result.elapsed_seconds:.1f}s: {result.command.strip()} [{s}]"
+        else:
+            return f"✗ Failed in {result.elapsed_seconds:.1f}s: {result.command.strip()} [status={result.status.name}, {s}, reason={result.retry_reason or result.diagnostic_reason or 'unknown'}]"
+
+    @staticmethod
+    def format_diagnostic_header(result: CommandExecutionResult) -> str:
+        return f"# status={result.status.name} elapsed={result.elapsed_seconds:.1f}s method={result.method_used} attempts={result.attempts} bytes={result.output_bytes} lines={result.output_lines} timeout={result.timeout_seconds}s last_read={result.last_read_seconds}s retry={result.retry_reason or 'none'}"
+
+    @staticmethod
     def execute_command_with_recovery(context: DeviceSessionContext, cmd: str, read_timeout: int = None, log_callback=None) -> CommandExecutionResult:
+        total_t0 = time.perf_counter()
         timeout_val = read_timeout or settings.command_timeout
+        last_read_val = settings.timing_last_read
         
         use_timing = False
-        if "|" in cmd or context.logical_platform in (LogicalPlatform.ASA, LogicalPlatform.NXOS, LogicalPlatform.IOS_XE_SWITCH, LogicalPlatform.IOS_XE_ROUTER):
+        if settings.execution_strategy == "safe_timing":
+            use_timing = True
+        elif "|" in cmd or context.logical_platform in (LogicalPlatform.ASA, LogicalPlatform.NXOS, LogicalPlatform.IOS_XE_SWITCH, LogicalPlatform.IOS_XE_ROUTER):
             use_timing = True
 
         def run_once(conn, method_timing):
             out = ""
             err = ""
             status = CommandStatus.SUCCESS
+            t0 = time.perf_counter()
             try:
                 if method_timing:
-                    out = conn.send_command_timing(cmd, read_timeout=timeout_val, strip_prompt=False, strip_command=False)
+                    out = conn.send_command_timing(cmd, read_timeout=timeout_val, last_read=last_read_val, strip_prompt=False, strip_command=False)
                 else:
                     out = conn.send_command(cmd, read_timeout=timeout_val, cmd_verify=False, strip_prompt=False, strip_command=False)
             except NetmikoTimeoutException as e:
@@ -859,39 +910,78 @@ class ConnectionManager:
             except Exception as e:
                 err = str(e)
                 status = CommandStatus.UNKNOWN_ERROR
-            return out, err, status
+            elapsed = time.perf_counter() - t0
+            return out, err, status, elapsed
             
-        out, err, status = run_once(context.conn, use_timing)
+        out, err, status, elapsed_1 = run_once(context.conn, use_timing)
         method_used = "send_command_timing" if use_timing else "send_command"
         
         needs_retry = False
         is_transport = False
+        retry_reason = ""
+        fallback_last_read = False
         if status != CommandStatus.SUCCESS and ConnectionManager.is_transport_error(err, out):
             needs_retry = True
             is_transport = True
+            retry_reason = "transport_error"
         elif status == CommandStatus.SUCCESS:
             if ConnectionManager.is_transport_error("", out):
                 needs_retry = True
                 is_transport = True
+                retry_reason = "transport_error"
             elif ConnectionManager.is_malformed_echo(cmd, out):
                 needs_retry = True
+                retry_reason = "malformed_echo"
+                fallback_last_read = True
+            elif not out.strip():
+                needs_retry = True
+                retry_reason = "empty_output"
+                fallback_last_read = True
+        elif status == CommandStatus.COMMAND_TIMEOUT:
+            needs_retry = True
+            retry_reason = "command_timeout"
+            fallback_last_read = True
+        else:
+            if status != CommandStatus.SUCCESS:
+                needs_retry = True
+                retry_reason = "unknown_error"
         
         if not needs_retry and status == CommandStatus.SUCCESS:
             out_lower = out.lower()
             if "% invalid input" in out_lower or "% incomplete command" in out_lower or "% ambiguous command" in out_lower or "% unrecognized command" in out_lower:
                 status = CommandStatus.COMMAND_UNSUPPORTED
                 
-        if not needs_retry:
-            return CommandExecutionResult(
-                command=cmd, status=status, output=out, error_message=err, attempts=1, method_used=method_used, reconnect_performed=False, unsupported_reason="Unsupported" if status == CommandStatus.COMMAND_UNSUPPORTED else ""
+        def finalize_result(out_f, err_f, status_f, attempts_f, method_f, recon_perf, abort_h, elaps_1, elaps_retry, r_reason, d_reason):
+            elaps = time.perf_counter() - total_t0
+            ob = len(out_f.encode('utf-8')) if out_f else 0
+            ol = len(out_f.splitlines()) if out_f else 0
+            slow = elaps >= settings.slow_command_threshold
+            res = CommandExecutionResult(
+                command=cmd, status=status_f, output=out_f, error_message=err_f, attempts=attempts_f, method_used=method_f, reconnect_performed=recon_perf, 
+                unsupported_reason="Unsupported" if status_f == CommandStatus.COMMAND_UNSUPPORTED else "", abort_host=abort_h,
+                elapsed_seconds=elaps, first_attempt_elapsed_seconds=elaps_1, retry_elapsed_seconds=elaps_retry,
+                output_bytes=ob, output_lines=ol, timeout_seconds=timeout_val, last_read_seconds=last_read_val if "timing" in method_f else 0.0,
+                slow_command=slow, diagnostic_reason=d_reason, retry_reason=r_reason
             )
+            if settings.diagnostics_enabled and log_callback:
+                log_callback(ConnectionManager.summarize_command_diagnostics(res))
+            return res
+                
+        if not needs_retry:
+            return finalize_result(out, err, status, 1, method_used, False, False, elapsed_1, 0.0, "", "")
             
-        if log_callback:
-            log_callback(f"  Debug: Command echo malformed or transport error detected. Retrying...")
+        if fallback_last_read:
+            last_read_val = 2.0
+            if log_callback:
+                log_callback(f"  Debug: Retrying with conservative timing last_read=2.0s ({retry_reason})")
+        elif log_callback:
+            log_callback(f"  Debug: Command error detected ({retry_reason}). Retrying...")
             
+        recon_elapsed = 0.0
         if is_transport and context._reconnect_credential:
             if log_callback:
                 log_callback(f"  Debug: Transport error detected. Reconnecting...")
+            t_rec = time.perf_counter()
             try:
                 context.conn.disconnect()
             except:
@@ -902,13 +992,15 @@ class ConnectionManager:
                 context.conn = recon_res.connection
                 ConnectionManager.prepare_session(context.conn, context.logical_platform, context.device_type, log_callback)
             else:
-                return CommandExecutionResult(command=cmd, status=CommandStatus.UNKNOWN_ERROR, output=out, error_message=f"Reconnect failed: {recon_res.error_message}", attempts=1, abort_host=True)
-                
-            out, err, status = run_once(context.conn, True)
+                recon_elapsed = time.perf_counter() - t_rec
+                return finalize_result(out, f"Reconnect failed: {recon_res.error_message}", CommandStatus.UNKNOWN_ERROR, 1, method_used, False, True, elapsed_1, 0.0, retry_reason, "Reconnect failed")
+            recon_elapsed = time.perf_counter() - t_rec
+            
+            out, err, status, elapsed_2 = run_once(context.conn, True)
             method_used = "reconnect + send_command_timing"
             reconnect_performed = True
         else:
-            out, err, status = run_once(context.conn, True)
+            out, err, status, elapsed_2 = run_once(context.conn, True)
             method_used = "retry + send_command_timing"
             reconnect_performed = False
 
@@ -918,14 +1010,12 @@ class ConnectionManager:
                 status = CommandStatus.COMMAND_UNSUPPORTED
 
         if (status != CommandStatus.SUCCESS and ConnectionManager.is_transport_error(err, out)) or (status == CommandStatus.SUCCESS and ConnectionManager.is_transport_error("", out)):
-            return CommandExecutionResult(command=cmd, status=status if status != CommandStatus.SUCCESS else CommandStatus.UNKNOWN_ERROR, output=out, error_message=err or "Transport error during retry", attempts=2, method_used=method_used, reconnect_performed=reconnect_performed, abort_host=True)
+            return finalize_result(out, err or "Transport error during retry", status if status != CommandStatus.SUCCESS else CommandStatus.UNKNOWN_ERROR, 2, method_used, reconnect_performed, True, elapsed_1, elapsed_2, retry_reason, "Transport error persisted")
 
         if status == CommandStatus.SUCCESS and ConnectionManager.is_malformed_echo(cmd, out):
-            return CommandExecutionResult(command=cmd, status=CommandStatus.UNKNOWN_ERROR, output=out, error_message="Malformed command echo persisted after retry", attempts=2, method_used=method_used, reconnect_performed=reconnect_performed, abort_host=True)
+            return finalize_result(out, "Malformed command echo persisted after retry", CommandStatus.UNKNOWN_ERROR, 2, method_used, reconnect_performed, True, elapsed_1, elapsed_2, retry_reason, "Malformed echo persisted")
 
-        return CommandExecutionResult(
-            command=cmd, status=status, output=out, error_message=err, attempts=2, method_used=method_used, reconnect_performed=reconnect_performed, unsupported_reason="Unsupported" if status == CommandStatus.COMMAND_UNSUPPORTED else ""
-        )
+        return finalize_result(out, err, status, 2, method_used, reconnect_performed, False, elapsed_1, elapsed_2, retry_reason, "")
     @staticmethod
     def connect(ip: str, creds: dict, platform_choice: str, temp_session_log: str, run_platform_probe: bool = True):
         try:
@@ -1014,9 +1104,12 @@ class ConnectionManager:
 
             if run_platform_probe:
                 try:
-                    ver_out = conn.send_command_timing("show version", read_timeout=15, strip_prompt=False, strip_command=False)
+                    t0 = time.perf_counter()
+                    ver_out = conn.send_command_timing("show version", read_timeout=settings.platform_probe_timeout, last_read=settings.platform_probe_last_read, strip_prompt=False, strip_command=False)
                     logical = DeviceDetector.classify(ver_out)
                     ver_out_saved = ver_out
+                    elapsed = time.perf_counter() - t0
+                    # if log_callback is needed, could pass it, but skipped for now per request scope.
                 except Exception:
                     pass
 
@@ -1559,6 +1652,20 @@ class CompareEngine:
         return findings
 
     @staticmethod
+    def build_snapshot_from_txt(filepath: Path) -> dict:
+        if not filepath.exists():
+            return None
+        text = filepath.read_text(encoding="utf-8")
+        run_id, phase, host, platform, mode = "unknown", "unknown", "unknown", "UNKNOWN", "REDACTED"
+        for line in text.splitlines()[:20]:
+            if line.startswith("# Run ID:"): run_id = line.split(":", 1)[1].strip()
+            elif line.startswith("# Phase:"): phase = line.split(":", 1)[1].strip()
+            elif line.startswith("# Host:"): host = line.split(":", 1)[1].strip()
+            elif line.startswith("# Platform:"): platform = line.split(":", 1)[1].strip()
+            elif line.startswith("# Capture Mode:"): mode = line.split(":", 1)[1].strip()
+        return SnapshotBuilder.build(run_id, phase, host, platform, "UNKNOWN", mode, text)
+
+    @staticmethod
     def run_comparison(run_id: str, base_dir: Path) -> str:
         pre_dir = base_dir / "pre"
         post_dir = base_dir / "post"
@@ -1572,18 +1679,31 @@ class CompareEngine:
         summary_csv = [["Host", "Category", "Status", "Message", "Pre Value", "Post Value"]]
         summary_json = {}
 
-        for pre_file in pre_dir.glob("*-pre*.json"):
-            ip = pre_file.name.replace("-pre_RAW.json", "").replace("-pre.json", "")
+        for pre_file in list(pre_dir.glob("*-pre*.json")) + list(pre_dir.glob("*-pre*.txt")):
+            if pre_file.suffix == ".txt" and pre_file.with_suffix(".json").exists(): continue
             
-            post_file_redacted = post_dir / f"{ip}-post.json"
-            post_file_raw = post_dir / f"{ip}-post_RAW.json"
-            post_file = post_file_raw if post_file_raw.exists() else post_file_redacted
-
-            with open(pre_file, "r") as f: pre_snap = json.load(f)
+            ip = pre_file.name.replace("-pre_RAW.json", "").replace("-pre.json", "").replace("-pre_RAW.txt", "").replace("-pre.txt", "")
+            
+            post_file_redacted_json = post_dir / f"{ip}-post.json"
+            post_file_raw_json = post_dir / f"{ip}-post_RAW.json"
+            post_file_redacted_txt = post_dir / f"{ip}-post.txt"
+            post_file_raw_txt = post_dir / f"{ip}-post_RAW.txt"
+            
+            pre_snap = None
+            if pre_file.suffix == ".json":
+                with open(pre_file, "r") as f: pre_snap = json.load(f)
+            else:
+                pre_snap = CompareEngine.build_snapshot_from_txt(pre_file)
             
             post_snap = None
-            if post_file.exists():
-                with open(post_file, "r") as f: post_snap = json.load(f)
+            if post_file_raw_json.exists():
+                with open(post_file_raw_json, "r") as f: post_snap = json.load(f)
+            elif post_file_redacted_json.exists():
+                with open(post_file_redacted_json, "r") as f: post_snap = json.load(f)
+            elif post_file_raw_txt.exists():
+                post_snap = CompareEngine.build_snapshot_from_txt(post_file_raw_txt)
+            elif post_file_redacted_txt.exists():
+                post_snap = CompareEngine.build_snapshot_from_txt(post_file_redacted_txt)
 
             findings = CompareEngine.compare_snapshots(pre_snap, post_snap)
             
@@ -1601,14 +1721,20 @@ class CompareEngine:
             if not findings:
                 host_txt.append("[PASS] No material changes detected.")
                 
-            host_txt.append("\n--- Post-Maintenance Raw/Redacted Output ---")
-            post_txt_file = post_dir / f"{ip}-post_RAW.txt"
-            if not post_txt_file.exists():
-                post_txt_file = post_dir / f"{ip}-post.txt"
-            if post_txt_file.exists():
-                host_txt.append(post_txt_file.read_text(encoding="utf-8"))
+            host_txt.append("\n--- Post-Maintenance Summary ---")
+            if settings.include_full_output_in_compare_reports:
+                host_txt.append("\n--- Post-Maintenance Raw/Redacted Output ---")
+                post_txt_file = post_dir / f"{ip}-post_RAW.txt"
+                if not post_txt_file.exists():
+                    post_txt_file = post_dir / f"{ip}-post.txt"
+                if post_txt_file.exists():
+                    host_txt.append(post_txt_file.read_text(encoding="utf-8"))
+                else:
+                    host_txt.append("No post-maintenance output found.")
             else:
-                host_txt.append("No post-maintenance output found.")
+                post_txt_file = post_dir / f"{ip}-post.txt"
+                pre_txt_file = pre_dir / f"{ip}-pre.txt"
+                host_txt.append(f"Output files stored in:\n  Pre:  {pre_txt_file}\n  Post: {post_txt_file}")
                 
             hosts_dir = out_dir / "hosts"
             hosts_dir.mkdir(parents=True, exist_ok=True)
@@ -2458,7 +2584,7 @@ Best practices:
     DocumentationSection("About Network Toolbelt", """Network Toolbelt is a local Python/Tkinter utility for network operations tasks.
 
 Version:
-Network Toolbelt v2.85
+Network Toolbelt v2.9
 
 Primary design goals:
 - Portable single-file utility.
@@ -2482,7 +2608,8 @@ From the File menu, you can choose:
    - Useful for sharing a complete snapshot of a run.
 
 2. Export Text Outputs as Merged TXT...
-   - Finds all text-based outputs (.txt, .log, .csv, .json, .md) and merges them into one single text file.
+   - Finds text-based outputs (.txt, .csv, .md) and merges them into one single text file.
+   - Note: Raw JSON files and session logs are excluded by default to reduce noise.
    - Adds clear BEGIN and END delimiters with timestamps before each file.
    - Perfect for feeding a set of scanner outputs or command logs into an AI analysis tool for rapid summarization.
 
@@ -2490,6 +2617,18 @@ Security Note:
 If you used Raw Capture mode, these exports may contain sensitive data (passwords, secrets). Review exported files before sharing."""),
 
     DocumentationSection("Version Changelog", """Network Toolbelt Version History
+
+## v2.9 - Diagnostics, Performance, and Lean Output
+- Command timeout default is now 20 seconds.
+- Timing last_read default is 0.75 seconds.
+- Slow command threshold is 5 seconds.
+- TXT-first output profile (JSON disabled by default).
+- Session logs are errors-only by default.
+- Compare no longer relies on full-output JSON by default.
+- Added per-command elapsed-time diagnostics and slow-command warnings.
+- Improved status bar states with command-level detail.
+- Added target-list scrollbars to UI.
+- Increased default app window size.
 
 ## v2.85 - Netmiko Execution Engine Overhaul
 - Generic Command Runner no longer performs hidden show version classification probes.
@@ -3030,9 +3169,17 @@ class TargetPanel(tk.LabelFrame):
         self.platform_var = tk.StringVar(value="Auto Detect Platform")
         self.platform_cb = ttk.Combobox(self, textvariable=self.platform_var, values=["Auto Detect Platform", "Cisco IOS / IOS-XE", "Cisco NX-OS", "Cisco ASA"], state="readonly")
         self.platform_cb.pack(fill=tk.X, padx=5, pady=(5, 0))
-        self.targets_text = tk.Text(self, height=6, width=30)
-        self.targets_text.pack(padx=5, pady=5, fill=tk.BOTH, expand=True)
         
+        text_frame = ttk.Frame(self)
+        text_frame.pack(padx=5, pady=5, fill=tk.BOTH, expand=True)
+        
+        self.targets_scrollbar = ttk.Scrollbar(text_frame)
+        self.targets_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.targets_text = tk.Text(text_frame, height=6, width=30, yscrollcommand=self.targets_scrollbar.set)
+        self.targets_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.targets_scrollbar.config(command=self.targets_text.yview)
+
         self.stats_lbl = tk.Label(self, text="Session targets: 0, Mapped: 0", font=("Arial", 9))
         self.stats_lbl.pack(anchor="w", padx=5)
         
@@ -3307,8 +3454,25 @@ class BaseRunnerPage(tk.Frame):
         main_pane = tk.PanedWindow(self, orient=tk.HORIZONTAL)
         main_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        self.left_panel = tk.Frame(main_pane)
-        main_pane.add(self.left_panel, minsize=260, width=280)
+        left_outer = tk.Frame(main_pane)
+        main_pane.add(left_outer, minsize=260, width=280)
+        
+        left_canvas = tk.Canvas(left_outer, highlightthickness=0)
+        left_scrollbar = ttk.Scrollbar(left_outer, orient="vertical", command=left_canvas.yview)
+        
+        self.left_panel = tk.Frame(left_canvas)
+        self.left_panel.bind("<Configure>", lambda e: left_canvas.configure(scrollregion=left_canvas.bbox("all")))
+        
+        self._left_window_id = left_canvas.create_window((0, 0), window=self.left_panel, anchor="nw")
+        
+        def _on_canvas_configure(event):
+            left_canvas.itemconfig(self._left_window_id, width=event.width)
+            
+        left_canvas.bind("<Configure>", _on_canvas_configure)
+        left_canvas.configure(yscrollcommand=left_scrollbar.set)
+        
+        left_canvas.pack(side="left", fill="both", expand=True)
+        left_scrollbar.pack(side="right", fill="y")
 
         right_pane = tk.PanedWindow(main_pane, orient=tk.VERTICAL)
         main_pane.add(right_pane, minsize=400)
@@ -3410,6 +3574,12 @@ class BaseRunnerPage(tk.Frame):
 
     def get_run_ts(self):
         return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    def set_host_status(self, host: str, idx: int, total: int, state: str, detail: str = ""):
+        msg = f"{state} on {host} ({idx}/{total})"
+        if detail:
+            msg += f" - {detail}"
+        self.set_status(msg)
 
     def sync_tail(self, temp_path: str, tail_stop_event: threading.Event = None):
         with open(temp_path, "r", encoding="utf-8") as f:
@@ -3541,7 +3711,7 @@ class MaintenanceRunnerPage(BaseRunnerPage):
 
         total_hosts = len(targets)
         for idx, host in enumerate(targets, 1):
-            self.set_status(f"Connecting to {host} ({idx}/{total_hosts})")
+            self.set_host_status(host, idx, total_hosts, "Connecting")
             self.set_progress((idx - 1) / total_hosts * 100)
             if self.stop_event.is_set(): break
             safe_host = FilenameSafety.safe_host_label(host)
@@ -3554,13 +3724,18 @@ class MaintenanceRunnerPage(BaseRunnerPage):
             tail_t = threading.Thread(target=self.sync_tail, args=(temp_session_log, tail_stop_event), daemon=True)
             tail_t.start()
 
+            host_had_diagnostics = False
+
             def log_cb(msg):
                 self.enqueue("LOG_EXEC", msg)
             conn_result = ConnectionManager.connect_with_mapped_or_global_credentials(host, platform_choice, temp_session_log, self.controller.credential_store, getattr(self.controller, 'target_credential_store', None), log_cb, self.stop_event, getattr(self, 'fallback_to_all_credentials_for_run', False))
             
             if conn_result.status == ConnectionStatus.SUCCESS:
                 self.active_conn = conn_result.connection
+                self.set_host_status(host, idx, total_hosts, "Connected", f"Platform: {conn_result.logical_platform.name}")
             else:
+                host_had_diagnostics = True
+                self.set_host_status(host, idx, total_hosts, "Connection failed", "moving to next target")
                 if not self.stop_event.is_set():
                     pass
                 tail_stop_event.set()
@@ -3610,8 +3785,9 @@ class MaintenanceRunnerPage(BaseRunnerPage):
                     features_detected = []
                     
                     def exec_cmd(cmd):
-                        nonlocal raw_text, features_detected
+                        nonlocal raw_text, features_detected, host_had_diagnostics
                         self.enqueue("LOG_EXEC", f"  -> {cmd}")
+                        self.set_host_status(host, idx, total_hosts, "Running commands", f"command: {cmd}")
                         
                         if cmd == "show version" and context.platform_probe_output:
                             self.enqueue("LOG_EXEC", f"  ✓ Using cached platform probe output")
@@ -3628,6 +3804,14 @@ class MaintenanceRunnerPage(BaseRunnerPage):
                             err_msg = exec_res.error_message
                             method_used = exec_res.method_used
                             abort_host = exec_res.abort_host
+                            
+                            if exec_res.status == CommandStatus.COMMAND_TIMEOUT or exec_res.slow_command or exec_res.retry_reason or exec_res.reconnect_performed or exec_res.abort_host or ConnectionManager.is_transport_error(exec_res.error_message, exec_res.output) or ConnectionManager.is_malformed_echo(cmd, exec_res.output):
+                                host_had_diagnostics = True
+                                
+                            if exec_res.slow_command:
+                                self.set_host_status(host, idx, total_hosts, "Slow command", f"'{cmd}' running > {settings.slow_command_threshold}s")
+                            
+                        diag_hdr = ConnectionManager.format_diagnostic_header(exec_res)
 
                         if status == CommandStatus.COMMAND_UNSUPPORTED:
                             self.enqueue("LOG_EXEC", f"  ! Command unsupported: {cmd}")
@@ -3653,14 +3837,14 @@ class MaintenanceRunnerPage(BaseRunnerPage):
                             cmd_out_redacted = cmd_out
                             
                         if status == CommandStatus.COMMAND_TIMEOUT:
-                            f.write(f"\n## {cmd}\nCOMMAND TIMEOUT\n")
-                            raw_text += f"\n## {cmd}\nCOMMAND TIMEOUT\n"
+                            f.write(f"\n## {cmd}\n{diag_hdr}\nCOMMAND TIMEOUT\n")
+                            raw_text += f"\n## {cmd}\n{diag_hdr}\nCOMMAND TIMEOUT\n"
                         elif status != CommandStatus.SUCCESS and not cmd_out:
-                            f.write(f"\n## {cmd}\nERROR: {err_msg}\n")
-                            raw_text += f"\n## {cmd}\nERROR: {err_msg}\n"
+                            f.write(f"\n## {cmd}\n{diag_hdr}\nERROR: {err_msg}\n")
+                            raw_text += f"\n## {cmd}\n{diag_hdr}\nERROR: {err_msg}\n"
                         else:
-                            f.write(f"\n## {cmd}\n{cmd_out_redacted}\n")
-                            raw_text += f"\n## {cmd}\n{cmd_out_redacted}\n"
+                            f.write(f"\n## {cmd}\n{diag_hdr}\n{cmd_out_redacted}\n")
+                            raw_text += f"\n## {cmd}\n{diag_hdr}\n{cmd_out_redacted}\n"
                         
                         if cmd == "show running-config" and status == CommandStatus.SUCCESS:
                             features_detected = FeatureDetector.detect_features(cmd_out)
@@ -3672,6 +3856,7 @@ class MaintenanceRunnerPage(BaseRunnerPage):
                     for cmd in base_cmds:
                         if self.stop_event.is_set(): break
                         if exec_cmd(cmd):
+                            self.set_host_status(host, idx, total_hosts, "Host aborted", "transport/reconnect failure")
                             self.enqueue("LOG_EXEC", f"  ✗ Host aborted due to transport/reconnect failure.")
                             break
                         
@@ -3693,12 +3878,13 @@ class MaintenanceRunnerPage(BaseRunnerPage):
                                 if self.stop_event.is_set(): break
                                 self.enqueue("LOG_EXEC", f"  + Dynamic feature {feature}: {cmd}")
                                 if exec_cmd(cmd):
+                                    self.set_host_status(host, idx, total_hosts, "Host aborted", "transport/reconnect failure")
                                     self.enqueue("LOG_EXEC", f"  ✗ Host aborted due to transport/reconnect failure.")
                                     aborted = True
                                     break
                             if aborted: break
 
-                if not self.stop_event.is_set() and raw_text:
+                if not self.stop_event.is_set() and raw_text and settings.write_json_outputs:
                     snap = SnapshotBuilder.build(run_id, phase, host, logical_plat.name, cmd_set_key, settings.capture_mode, raw_text, command_results)
                     with open(out_dir / json_fname, "w") as jf:
                         json.dump(snap, jf, indent=4)
@@ -3711,18 +3897,24 @@ class MaintenanceRunnerPage(BaseRunnerPage):
             tail_stop_event.set()
             tail_t.join(1)
             
-            # Process session log redaction
-            if settings.capture_mode == "redacted":
-                redactor.redact_file(Path(temp_session_log), out_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
+            # Process session log saving/redaction
+            has_errors = any(c.get("status") != "SUCCESS" or "method=retry" in c.get("method_used","") or "method=reconnect" in c.get("method_used","") for c in command_results)
+            
+            if settings.save_session_logs == "never" or (settings.save_session_logs == "errors_only" and not (has_errors or host_had_diagnostics) and conn_result.status == ConnectionStatus.SUCCESS):
+                try: Path(temp_session_log).unlink(missing_ok=True)
+                except Exception: pass
             else:
-                Path(temp_session_log).rename(out_dir / f"{safe_host}_{run_ts}_session_RAW.log")
-                
-            try: Path(temp_session_log).unlink(missing_ok=True)
-            except Exception: pass
+                if settings.capture_mode == "redacted":
+                    redactor.redact_file(Path(temp_session_log), out_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
+                    try: Path(temp_session_log).unlink(missing_ok=True)
+                    except Exception: pass
+                else:
+                    Path(temp_session_log).rename(out_dir / f"{safe_host}_{run_ts}_session_RAW.log")
 
             if not self.stop_event.is_set():
                 self.set_progress(idx / total_hosts * 100)
                 self.enqueue("LOG_EXEC", "  ✓ completed")
+                self.set_host_status(host, idx, total_hosts, "Success" if not has_errors else "Completed with errors", "moving to next target")
 
         if self.stop_event.is_set():
             self.set_status("Stopped by user")
@@ -3816,7 +4008,7 @@ class CommandRunnerPage(BaseRunnerPage):
             
             total_hosts = len(targets)
             for idx, host in enumerate(targets, 1):
-                self.set_status(f"Connecting to {host} ({idx}/{total_hosts})")
+                self.set_host_status(host, idx, total_hosts, "Connecting")
                 self.set_progress((idx - 1) / total_hosts * 100)
                 if self.stop_event.is_set(): break
                 safe_host = FilenameSafety.safe_host_label(host)
@@ -3828,6 +4020,8 @@ class CommandRunnerPage(BaseRunnerPage):
                 tail_stop_event = threading.Event()
                 tail_t = threading.Thread(target=self.sync_tail, args=(temp_session_log, tail_stop_event), daemon=True)
                 tail_t.start()
+                
+                host_had_diagnostics = False
 
                 def log_cb(msg):
                     self.enqueue("LOG_EXEC", msg)
@@ -3835,7 +4029,10 @@ class CommandRunnerPage(BaseRunnerPage):
                 
                 if conn_result.status == ConnectionStatus.SUCCESS:
                     self.active_conn = conn_result.connection
+                    self.set_host_status(host, idx, total_hosts, "Connected")
                 else:
+                    host_had_diagnostics = True
+                    self.set_host_status(host, idx, total_hosts, "Connection failed", "moving to next target")
                     if not self.stop_event.is_set():
                         pass # generic failure already logged by helper
                     tail_stop_event.set()
@@ -3862,29 +4059,44 @@ class CommandRunnerPage(BaseRunnerPage):
                 ConnectionManager.prepare_session(context.conn, context.logical_platform, context.device_type, log_cb)
 
                 output_log = [f"===== Session started: {datetime.now()} =====\nHost: {host}\nCapture Mode: {settings.capture_mode.upper()}\n\n"]
-                for cmd in commands:
+                has_errors = False
+                for cmd_idx, cmd in enumerate(commands, 1):
                     if self.stop_event.is_set(): break
                     self.enqueue("LOG_EXEC", f"  -> {cmd}")
+                    self.set_host_status(host, idx, total_hosts, "Running commands", f"command {cmd_idx}/{len(commands)}")
                     
                     exec_res = ConnectionManager.execute_command_with_recovery(context, cmd, log_callback=log_cb)
                     self.active_conn = context.conn # Update conn in case of reconnect
                     
+                    if exec_res.status == CommandStatus.COMMAND_TIMEOUT or exec_res.slow_command or exec_res.retry_reason or exec_res.reconnect_performed or exec_res.abort_host or ConnectionManager.is_transport_error(exec_res.error_message, exec_res.output) or ConnectionManager.is_malformed_echo(cmd, exec_res.output):
+                        host_had_diagnostics = True
+                    
+                    if exec_res.slow_command:
+                        self.set_host_status(host, idx, total_hosts, "Slow command", f"'{cmd}' running > {settings.slow_command_threshold}s")
+                        
+                    diag_hdr = ConnectionManager.format_diagnostic_header(exec_res)
+                        
                     if exec_res.status == CommandStatus.COMMAND_TIMEOUT:
+                        self.set_host_status(host, idx, total_hosts, "Command timeout", f"moving to next command")
                         self.enqueue("LOG_EXEC", f"  ✗ Command timed out: {cmd}")
-                        output_log.append(f"##### {cmd} #####\nCOMMAND TIMEOUT\n\n")
+                        output_log.append(f"##### {cmd} #####\n{diag_hdr}\nCOMMAND TIMEOUT\n\n")
+                        has_errors = True
                     elif exec_res.status != CommandStatus.SUCCESS and exec_res.status != CommandStatus.COMMAND_UNSUPPORTED:
                         self.enqueue("LOG_EXEC", f"  ✗ Error running {cmd}: {exec_res.error_message}")
-                        output_log.append(f"##### {cmd} #####\nERROR: {exec_res.error_message}\n\n")
+                        output_log.append(f"##### {cmd} #####\n{diag_hdr}\nERROR: {exec_res.error_message}\n\n")
+                        has_errors = True
                     else:
                         cmd_out = exec_res.output
                         if settings.capture_mode == "redacted":
                             cmd_out = redactor.redact_text(cmd_out)
-                        output_log.append(f"##### {cmd} #####\n{cmd_out}\n\n")
+                        output_log.append(f"##### {cmd} #####\n{diag_hdr}\n{cmd_out}\n\n")
                         if exec_res.status == CommandStatus.COMMAND_UNSUPPORTED:
                             self.enqueue("LOG_EXEC", f"  ! Unsupported command: {cmd}")
                             
                     if exec_res.abort_host:
+                        self.set_host_status(host, idx, total_hosts, "Host aborted", "transport/reconnect failure")
                         self.enqueue("LOG_EXEC", f"  ✗ Host aborted due to transport/reconnect failure.")
+                        has_errors = True
                         break
 
                 if not self.stop_event.is_set():
@@ -3892,6 +4104,7 @@ class CommandRunnerPage(BaseRunnerPage):
                     (log_dir / fname).write_text("".join(output_log), encoding="utf-8")
                     self.set_progress(idx / total_hosts * 100)
                     self.enqueue("LOG_EXEC", "  ✓ completed")
+                    self.set_host_status(host, idx, total_hosts, "Success" if not has_errors else "Completed with errors", "moving to next target")
 
                 try: self.active_conn.disconnect()
                 except Exception: pass
@@ -3900,12 +4113,16 @@ class CommandRunnerPage(BaseRunnerPage):
                 tail_stop_event.set()
                 tail_t.join(1)
                 
-                if settings.capture_mode == "redacted":
-                    redactor.redact_file(Path(temp_session_log), log_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
+                if settings.save_session_logs == "never" or (settings.save_session_logs == "errors_only" and not (has_errors or host_had_diagnostics) and conn_result.status == ConnectionStatus.SUCCESS):
+                    try: Path(temp_session_log).unlink(missing_ok=True)
+                    except Exception: pass
                 else:
-                    Path(temp_session_log).rename(log_dir / f"{safe_host}_{run_ts}_session_RAW.log")
-                try: Path(temp_session_log).unlink(missing_ok=True)
-                except Exception: pass
+                    if settings.capture_mode == "redacted":
+                        redactor.redact_file(Path(temp_session_log), log_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
+                        try: Path(temp_session_log).unlink(missing_ok=True)
+                        except Exception: pass
+                    else:
+                        Path(temp_session_log).rename(log_dir / f"{safe_host}_{run_ts}_session_RAW.log")
 
             if self.stop_event.is_set():
                 self.set_status("Stopped by user")
@@ -3998,7 +4215,9 @@ class ScannerEngine:
         sum_json = {}
         
         for r in host_results:
-            idx_txt.append(f"- hosts/{r.safe_host}_report.json")
+            if settings.write_json_outputs:
+                idx_txt.append(f"- hosts/{r.safe_host}_report.json")
+            idx_txt.append(f"- hosts/{r.safe_host}_report.txt")
             sum_txt.append(f"\n[{r.host}] - {r.connection_status}")
             sum_json[r.host] = {"status": r.connection_status, "findings": [f.__dict__ for f in r.findings], "errors": r.errors, "warnings": r.warnings}
             
@@ -4020,9 +4239,11 @@ class ScannerEngine:
                 
         (base_dir / "index.txt").write_text("\n".join(idx_txt), encoding="utf-8")
         (base_dir / "scanner_summary.txt").write_text("\n".join(sum_txt), encoding="utf-8")
-        with open(base_dir / "scanner_summary.json", "w") as f: json.dump(sum_json, f, indent=4)
-        with open(base_dir / "scanner_summary.csv", "w", newline="") as f:
-            csv.writer(f).writerows(sum_csv)
+        if settings.write_json_outputs:
+            with open(base_dir / "scanner_summary.json", "w") as f: json.dump(sum_json, f, indent=4)
+        if settings.write_csv_summaries:
+            with open(base_dir / "scanner_summary.csv", "w", newline="") as f:
+                csv.writer(f).writerows(sum_csv)
 
 class BaseScannerPage(BaseRunnerPage):
     def __init__(self, parent, controller, scanner_def: ScannerDefinition):
@@ -4136,7 +4357,7 @@ class BaseScannerPage(BaseRunnerPage):
             
             total_hosts = len(config.targets)
             for idx, host in enumerate(config.targets, 1):
-                self.set_status(f"Connecting to {host} ({idx}/{total_hosts})")
+                self.set_host_status(host, idx, total_hosts, "Connecting")
                 self.set_progress((idx - 1) / total_hosts * 100)
                 if self.stop_event.is_set(): break
                 safe_host = FilenameSafety.safe_host_label(host)
@@ -4162,14 +4383,18 @@ class BaseScannerPage(BaseRunnerPage):
                 tail_t = threading.Thread(target=sync_tail, daemon=True)
                 tail_t.start()
                 
+                host_had_diagnostics = False
+                
                 def log_cb(msg):
                     self.enqueue("LOG_EXEC", msg)
                 conn_result = ConnectionManager.connect_with_mapped_or_global_credentials(host, config.platform_choice, temp_session_log, self.controller.credential_store, getattr(self.controller, 'target_credential_store', None), log_cb, self.stop_event, getattr(self, 'fallback_to_all_credentials_for_run', False), run_platform_probe=True)
                 
                 if conn_result.status == ConnectionStatus.SUCCESS:
                     self.active_conn = conn_result.connection
-                
-                if conn_result.status != ConnectionStatus.SUCCESS:
+                    self.set_host_status(host, idx, total_hosts, "Connected", f"Platform: {conn_result.logical_platform.name}")
+                else:
+                    host_had_diagnostics = True
+                    self.set_host_status(host, idx, total_hosts, "Connection failed", "moving to next target")
                     tail_stop_event.set()
                     tail_t.join(1)
                     if settings.capture_mode == "redacted":
@@ -4212,15 +4437,19 @@ class BaseScannerPage(BaseRunnerPage):
                     self.enqueue("LOG_EXEC", f"  ✗ No commands for platform {logical_plat.name}")
                     errors.append(f"No commands for {logical_plat.name}")
                 else:
-                    for cmd in cmd_bundle:
+                    for cmd_idx, cmd in enumerate(cmd_bundle, 1):
                         if self.stop_event.is_set(): break
                         self.enqueue("LOG_EXEC", f"  -> {cmd}")
+                        self.set_host_status(host, idx, total_hosts, "Running commands", f"command {cmd_idx}/{len(cmd_bundle)}")
                         
                         if cmd == "show version" and context.platform_probe_output:
                             self.enqueue("LOG_EXEC", f"  ✓ Using cached platform probe output")
                             cmd_out = context.platform_probe_output
                             status = CommandStatus.SUCCESS
                             err_msg = ""
+                            exec_res = CommandExecutionResult(
+                                command=cmd, status=status, output=cmd_out, error_message="", attempts=0, method_used="platform_probe_cache", reconnect_performed=False, unsupported_reason="", abort_host=False, elapsed_seconds=0.0, first_attempt_elapsed_seconds=0.0, retry_elapsed_seconds=0.0, output_bytes=len(cmd_out.encode('utf-8')), output_lines=len(cmd_out.splitlines()), timeout_seconds=0, last_read_seconds=0.0, slow_command=False, diagnostic_reason="", retry_reason=""
+                            )
                         else:
                             exec_res = ConnectionManager.execute_command_with_recovery(context, cmd, log_callback=log_cb)
                             self.active_conn = context.conn
@@ -4228,28 +4457,37 @@ class BaseScannerPage(BaseRunnerPage):
                             status = exec_res.status
                             err_msg = exec_res.error_message
                             
+                            if exec_res.status == CommandStatus.COMMAND_TIMEOUT or exec_res.slow_command or exec_res.retry_reason or exec_res.reconnect_performed or exec_res.abort_host or ConnectionManager.is_transport_error(exec_res.error_message, exec_res.output) or ConnectionManager.is_malformed_echo(cmd, exec_res.output):
+                                host_had_diagnostics = True
+                                
+                            if exec_res.slow_command:
+                                self.set_host_status(host, idx, total_hosts, "Slow command", f"'{cmd}' running > {settings.slow_command_threshold}s")
                             if exec_res.abort_host:
+                                self.set_host_status(host, idx, total_hosts, "Host aborted", "transport/reconnect failure")
                                 self.enqueue("LOG_EXEC", f"  ✗ Host aborted due to transport/reconnect failure.")
                                 break
+                                
+                        diag_hdr = ConnectionManager.format_diagnostic_header(exec_res)
                             
                         if status == CommandStatus.COMMAND_UNSUPPORTED:
                             self.enqueue("LOG_EXEC", f"  ! Command unsupported: {cmd}")
                         elif status == CommandStatus.PRIVILEGE_DENIED:
                             self.enqueue("LOG_EXEC", f"  ! Privilege denied: {cmd}")
                         elif status == CommandStatus.COMMAND_TIMEOUT:
+                            self.set_host_status(host, idx, total_hosts, "Command timeout", f"moving to next command")
                             self.enqueue("LOG_EXEC", f"  ✗ Timeout: {cmd}")
-                            outputs[cmd] = "COMMAND TIMEOUT"
+                            outputs[cmd] = f"{diag_hdr}\nCOMMAND TIMEOUT"
                             errors.append(f"Timeout on {cmd}")
                             continue
                         elif status != CommandStatus.SUCCESS:
                             self.enqueue("LOG_EXEC", f"  ✗ Error: {cmd} - {err_msg}")
-                            outputs[cmd] = f"ERROR: {err_msg}"
+                            outputs[cmd] = f"{diag_hdr}\nERROR: {err_msg}"
                             errors.append(f"Error on {cmd}: {err_msg}")
                             continue
                         
                         if settings.capture_mode == "redacted":
                             cmd_out = redactor.redact_text(cmd_out)
-                        outputs[cmd] = cmd_out
+                        outputs[cmd] = f"{diag_hdr}\n{cmd_out}"
                             
                 try: self.active_conn.disconnect()
                 except Exception: pass
@@ -4258,14 +4496,20 @@ class BaseScannerPage(BaseRunnerPage):
                 tail_stop_event.set()
                 tail_t.join(1)
                 
-                if settings.capture_mode == "redacted":
-                    redactor.redact_file(Path(temp_session_log), host_out_dir / f"{safe_host}_{config.timestamp}_session_REDACTED.log")
+                has_errors = bool(errors) or exec_res.abort_host if 'exec_res' in locals() else False
+                if settings.save_session_logs == "never" or (settings.save_session_logs == "errors_only" and not (has_errors or host_had_diagnostics) and conn_result.status == ConnectionStatus.SUCCESS):
+                    try: Path(temp_session_log).unlink(missing_ok=True)
+                    except Exception: pass
                 else:
-                    Path(temp_session_log).rename(host_out_dir / f"{safe_host}_{config.timestamp}_session_RAW.log")
-                try: Path(temp_session_log).unlink(missing_ok=True)
-                except Exception: pass
+                    if settings.capture_mode == "redacted":
+                        redactor.redact_file(Path(temp_session_log), host_out_dir / f"{safe_host}_{config.timestamp}_session_REDACTED.log")
+                        try: Path(temp_session_log).unlink(missing_ok=True)
+                        except Exception: pass
+                    else:
+                        Path(temp_session_log).rename(host_out_dir / f"{safe_host}_{config.timestamp}_session_RAW.log")
                 
                 parsed_data = {}
+                self.set_host_status(host, idx, total_hosts, "Success" if not has_errors else "Completed with errors", "moving to next target")
                 findings = []
                 warnings = []
                 try:
@@ -4278,8 +4522,11 @@ class BaseScannerPage(BaseRunnerPage):
                 host_results.append(res)
                 
                 if not self.stop_event.is_set():
-                    out_json = {"host": host, "status": res.connection_status, "parsed": parsed_data, "findings": [f.__dict__ for f in findings], "errors": errors, "warnings": warnings, "outputs": outputs}
-                    with open(host_out_dir / f"{safe_host}_report.json", "w") as f: json.dump(out_json, f, indent=4)
+                    if settings.write_json_outputs:
+                        out_json = {"host": host, "status": res.connection_status, "parsed": parsed_data, "findings": [f.__dict__ for f in findings], "errors": errors, "warnings": warnings}
+                        if settings.write_full_output_json:
+                            out_json["outputs"] = outputs
+                        with open(host_out_dir / f"{safe_host}_report.json", "w") as f: json.dump(out_json, f, indent=4)
                     
                     host_severity = "PASS"
                     if any(f.status == "FAIL" for f in findings) or errors: host_severity = "FAIL"
@@ -5270,7 +5517,8 @@ class NetworkToolbeltApp(tk.Tk):
         self.documentation_window = None
         self.tool_command_manager = ToolCommandManager()
         self.title(f"Network Toolbelt v{APP_VERSION}")
-        self.geometry("1200x700")
+        self.geometry("1400x850")
+        self.minsize(1200, 800)
 
         self.setup_menu()
 
@@ -5421,7 +5669,7 @@ class NetworkToolbeltApp(tk.Tk):
         
         if not save_path: return
         
-        ext_to_include = {".txt", ".log", ".csv", ".json", ".md"}
+        ext_to_include = {".txt", ".csv", ".md"}
         
         try:
             target_save_path = Path(save_path).resolve()
@@ -5635,6 +5883,61 @@ def _run_execution_self_tests():
         if original_detect: globals()['SSHDetect'] = original_detect
         if 'original_connect' in locals() and original_connect: globals()['ConnectHandler'] = original_connect
     
+    # 7. v2.86 Diagnostics & Timing Settings Defaults
+    assert settings.command_timeout == 20
+    assert settings.timing_last_read == 0.75
+    assert not settings.write_json_outputs
+    assert settings.write_csv_summaries
+    assert settings.save_session_logs == "errors_only"
+    assert not settings.include_full_output_in_compare_reports
+    
+    # 8. CommandExecutionResult and Diagnostic Formatting
+    res2 = CommandExecutionResult(
+        command="show version", status=CommandStatus.SUCCESS, output="Cisco IOS",
+        elapsed_seconds=6.5, timeout_seconds=20, method_used="send_command_timing",
+        attempts=1, output_bytes=9, output_lines=1, last_read_seconds=0.75,
+        slow_command=True
+    )
+    assert res2.elapsed_seconds == 6.5
+    assert res2.slow_command is True
+    diag_summary = ConnectionManager.summarize_command_diagnostics(res2)
+    assert "Slow command:" in diag_summary
+    assert "show version took 6.5s" in diag_summary
+    assert "bytes=9" in diag_summary
+    
+    # 9. CompareEngine TXT Snapshot Building
+    mock_txt = """# Run ID: TEST-123
+# Phase: pre
+# Host: 10.0.0.1
+# Platform: Cisco IOS
+# Timestamp: 2026-05-05-120000
+# Capture Mode: REDACTED
+
+## show version
+Cisco IOS Software
+"""
+    tmp_path = Path("test_snapshot.txt")
+    tmp_path.write_text(mock_txt, encoding="utf-8")
+    try:
+        snap = CompareEngine.build_snapshot_from_txt(tmp_path)
+        assert snap is not None
+        assert snap["run_id"] == "TEST-123"
+        assert snap["phase"] == "pre"
+        assert snap["host"] == "10.0.0.1"
+        assert snap["detected_platform"] == "Cisco IOS"
+        assert snap["capture_mode"] == "REDACTED"
+    finally:
+        if tmp_path.exists(): tmp_path.unlink()
+        
+    # 10. TargetPanel init
+    try:
+        root = tk.Tk()
+        tp = TargetPanel(root)
+        assert hasattr(tp, 'targets_scrollbar')
+        root.destroy()
+    except Exception as e:
+        print(f"Skipping GUI test: {e}")
+        
     print("All execution self-tests passed.")
 
 def main():

@@ -1,6 +1,6 @@
 # Network Toolbelt System Manifest
 
-**Version:** 2.85  
+**Version:** 2.9  
 **Primary Application File:** `network-toolbelt.py`  
 **Project Name:** Network Toolbelt  
 **Current Focus:** Cisco/Netmiko-optimized network operations utility  
@@ -669,11 +669,11 @@ Then verify:
 
 ## 16. Current Version Summary
 
-Network Toolbelt v2.85 includes:
+Network Toolbelt v2.9 includes:
 
-- Netmiko Execution Engine Overhaul.
-- Replaced hidden autodetect probes with explicit platform-aware session preparation.
-- Added automatic transport-error recovery for disconnected sockets.
-- Added malformed echo detection.
-- Expanded hidden execution self-tests.
-- (Plus all features from the v2.8 Network Toolbelt stabilization pass).
+- Execution diagnostic tracking (elapsed time, slow command warnings).
+- Lean output mode (TXT-first output, JSON disabled by default, errors-only session logs).
+- CompareEngine memory building from TXT files.
+- UI enhancements (target list scrollbars, larger default geometry).
+- Improved granular status bar messages.
+- (Plus all execution engine improvements from v2.85).

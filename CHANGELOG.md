@@ -6,6 +6,31 @@ Network Toolbelt is currently a single-file Python/Tkinter desktop utility optim
 
 ---
 
+## v2.9 - Diagnostics, Performance, and Lean Output
+
+### Summary
+v2.9 addresses performance bottlenecks introduced by v2.85 execution improvements, enhances UI feedback, and reduces default file footprint by shifting to lean output formats.
+
+### Added
+- Added `elapsed_seconds` and diagnostic tracking to `CommandExecutionResult`.
+- Added slow-command logging and threshold warnings in status bars.
+- Added explicit settings for `write_json_outputs` and `write_csv_summaries`.
+- Added `save_session_logs` options ("never", "errors_only", "always") for cleaner output folders.
+- Added target list scrollbars to Runner and Scanner pages.
+
+### Changed
+- Command timeout default is now 20 seconds.
+- Timing last_read default is 0.75 seconds.
+- Slow command threshold is 5 seconds.
+- TXT-first output profile (JSON disabled by default).
+- Session logs are errors-only by default.
+- Compare no longer relies on full-output JSON by default.
+- Export Merged TXT excludes `.json` and `.log` by default.
+- Increased default app window size to 1400x850.
+- Replaced basic progress states with explicit status messaging (e.g., "Connecting", "Running commands", "Slow command").
+
+---
+
 ## v2.85 - Netmiko Execution Engine Overhaul
 
 ### Summary
