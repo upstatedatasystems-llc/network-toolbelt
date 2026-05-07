@@ -1863,8 +1863,8 @@ Core ideas:
 - Reports are written to a local output directory for later review.
 
 Primary tools:
-- Credential Manager: Load, edit, and delete temporary credential sets.
-- Set Target IPs & Credentials: Build a session target list and map each target to a working credential.
+- Credential Manager: Load, edit, and delete temporary credential sets inline.
+- Set Target IPs & Credentials: Build a session target list and map each target to a working credential using inline tools.
 - Maintenance Pre/Post Runner: Collect pre/post snapshots and compare changes.
 - Generic Command Runner: Run ad-hoc commands against selected targets.
 - Network Scanner Suite: Run focused read-only checks such as interface errors, routing neighbors, logs, inventory, optics, and BGP route collection.
@@ -1946,8 +1946,10 @@ Each credential set has:
 Credential labels are for your convenience. They may appear in logs and mapping tables, but passwords and secrets should not.
 
 Editing credentials:
+- Adding or editing is done directly through the inline form on the right.
 - Changing only the label should keep existing mappings valid and update the display label.
 - Changing username, password, or enable secret marks related target mappings as STALE because the actual login behavior may have changed.
+- Leaving password or secret blank keeps the existing value.
 
 Deleting credentials:
 - If a credential is deleted, any target mappings using that credential become STALE.
@@ -3138,42 +3140,117 @@ class CredentialManagerPage(tk.Frame):
         self.status_lbl = tk.Label(self, text="Credentials loaded: 0", font=("Arial", 12))
         self.status_lbl.pack(pady=5)
         
-        list_frame = tk.Frame(self)
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        main_pane = tk.PanedWindow(self, orient=tk.HORIZONTAL)
+        main_pane.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
         
-        self.listbox = tk.Listbox(list_frame, font=("Arial", 11))
+        left_frame = tk.Frame(main_pane)
+        main_pane.add(left_frame, minsize=300)
+        
+        right_frame = tk.Frame(main_pane)
+        main_pane.add(right_frame, minsize=300)
+        
+        self.listbox = tk.Listbox(left_frame, font=("Arial", 11))
         self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
-        scroll = tk.Scrollbar(list_frame, command=self.listbox.yview)
+        scroll = tk.Scrollbar(left_frame, command=self.listbox.yview)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.listbox.config(yscrollcommand=scroll.set)
+        
+        self.listbox.bind('<<ListboxSelect>>', self.on_select)
         
         btn_frame = tk.Frame(self)
         btn_frame.pack(pady=10)
         
-        tk.Button(btn_frame, text="Add Credential", command=self.add_cred).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Edit Selected", command=self.edit_cred).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="Delete Selected", command=self.delete_cred).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="Clear All", command=self.clear_creds).pack(side=tk.LEFT, padx=5)
         
+        tk.Label(right_frame, text="Add / Edit Credential", font=("Arial", 14, "bold")).pack(pady=10)
+        
+        tk.Label(right_frame, text="Label:").pack(pady=(10,0))
+        self.lbl_var = tk.StringVar()
+        tk.Entry(right_frame, textvariable=self.lbl_var, width=30).pack()
+        
+        tk.Label(right_frame, text="Username:").pack(pady=(10,0))
+        self.user_var = tk.StringVar()
+        tk.Entry(right_frame, textvariable=self.user_var, width=30).pack()
+        
+        tk.Label(right_frame, text="Password (leave blank to keep existing):").pack(pady=(10,0))
+        self.pass_var = tk.StringVar()
+        tk.Entry(right_frame, textvariable=self.pass_var, show="*", width=30).pack()
+        
+        tk.Label(right_frame, text="Enable Secret (leave blank to keep existing):").pack(pady=(10,0))
+        self.sec_var = tk.StringVar()
+        tk.Entry(right_frame, textvariable=self.sec_var, show="*", width=30).pack()
+        
+        self.current_edit_id = None
+        
+        form_btn_frame = tk.Frame(right_frame)
+        form_btn_frame.pack(pady=20)
+        
+        tk.Button(form_btn_frame, text="Save Credential", command=self.save_cred).pack(side=tk.LEFT, padx=5)
+        tk.Button(form_btn_frame, text="New / Clear", command=self.clear_form).pack(side=tk.LEFT, padx=5)
+        
+    def on_select(self, event):
+        sel = self.listbox.curselection()
+        if not sel: return
+        idx = sel[0]
+        record = self.controller.credential_store.records[idx]
+        self.current_edit_id = record.id
+        self.lbl_var.set(record.label)
+        self.user_var.set(record.username)
+        self.pass_var.set("")
+        self.sec_var.set("")
+        
+    def clear_form(self):
+        self.current_edit_id = None
+        self.lbl_var.set("")
+        self.user_var.set("")
+        self.pass_var.set("")
+        self.sec_var.set("")
+        self.listbox.selection_clear(0, tk.END)
+
+    def save_cred(self):
+        l, u, p, s = self.lbl_var.get().strip(), self.user_var.get().strip(), self.pass_var.get().strip(), self.sec_var.get().strip()
+        if not u:
+            messagebox.showerror("Error", "Username is required.")
+            return
+            
+        record = None
+        if self.current_edit_id:
+            for r in self.controller.credential_store.records:
+                if r.id == self.current_edit_id:
+                    record = r
+                    break
+                    
+        if not record and not p:
+            messagebox.showerror("Error", "Password is required for new credentials.")
+            return
+            
+        if record:
+            username_changed = record.username != u
+            password_changed = p != ""
+            secret_changed = s != ""
+            self.controller.credential_store.update(record.id, l, u, p, s)
+            if (username_changed or password_changed or secret_changed) and hasattr(self.controller, "target_credential_store"):
+                self.controller.target_credential_store.mark_stale_for_credential(record.id)
+            elif hasattr(self.controller, "target_credential_store"):
+                for m in self.controller.target_credential_store.mappings.values():
+                    if m.credential_id == record.id:
+                        m.credential_label = l
+        else:
+            self.controller.credential_store.add(l, u, p, s)
+            
+        self.refresh_list()
+        self.clear_form()
+        if "LandingPage" in self.controller.frames:
+            self.controller.frames["LandingPage"].refresh_credential_status()
+
     def refresh_list(self):
         self.listbox.delete(0, tk.END)
         safe_list = self.controller.credential_store.list_safe()
         for item in safe_list:
             self.listbox.insert(tk.END, item)
         self.status_lbl.config(text=f"Credentials loaded: {len(self.controller.credential_store.records)}")
-        
-    def add_cred(self):
-        self.open_edit_dialog(None)
-        
-    def edit_cred(self):
-        sel = self.listbox.curselection()
-        if not sel:
-            messagebox.showwarning("Warning", "Please select a credential set to edit.")
-            return
-        idx = sel[0]
-        record = self.controller.credential_store.records[idx]
-        self.open_edit_dialog(record)
         
     def delete_cred(self):
         sel = self.listbox.curselection()
@@ -3184,6 +3261,7 @@ class CredentialManagerPage(tk.Frame):
         if hasattr(self.controller, "target_credential_store"):
             self.controller.target_credential_store.mark_stale_for_credential(record.id)
         self.refresh_list()
+        self.clear_form()
         
     def clear_creds(self):
         if messagebox.askyesno("Clear All", "Are you sure you want to clear all credentials?"):
@@ -3194,64 +3272,10 @@ class CredentialManagerPage(tk.Frame):
                     m.error_message = "Credential store was cleared"
             self.controller.credential_store.clear()
             self.refresh_list()
+            self.clear_form()
             if hasattr(self.controller, "frames") and "LandingPage" in self.controller.frames:
                 self.controller.frames["LandingPage"].refresh_credential_status()
-            
-    def open_edit_dialog(self, record):
-        dlg = tk.Toplevel(self)
-        dlg.title("Edit Credential" if record else "Add Credential")
-        dlg.geometry("400x300")
-        dlg.transient(self)
-        dlg.grab_set()
-        if hasattr(self.controller, "apply_theme_to_widget"):
-            self.controller.apply_theme_to_widget(dlg)
-        
-        tk.Label(dlg, text="Label:").pack(pady=(10,0))
-        lbl_var = tk.StringVar(value=record.label if record else "")
-        tk.Entry(dlg, textvariable=lbl_var, width=30).pack()
-        
-        tk.Label(dlg, text="Username:").pack(pady=(10,0))
-        user_var = tk.StringVar(value=record.username if record else "")
-        tk.Entry(dlg, textvariable=user_var, width=30).pack()
-        
-        tk.Label(dlg, text="Password (leave blank to keep existing):").pack(pady=(10,0))
-        pass_var = tk.StringVar()
-        tk.Entry(dlg, textvariable=pass_var, show="*", width=30).pack()
-        
-        tk.Label(dlg, text="Enable Secret (leave blank to keep existing):").pack(pady=(10,0))
-        sec_var = tk.StringVar()
-        tk.Entry(dlg, textvariable=sec_var, show="*", width=30).pack()
-        
-        def save():
-            l, u, p, s = lbl_var.get().strip(), user_var.get().strip(), pass_var.get().strip(), sec_var.get().strip()
-            if not u:
-                messagebox.showerror("Error", "Username is required.", parent=dlg)
-                return
-            if not record and not p:
-                messagebox.showerror("Error", "Password is required for new credentials.", parent=dlg)
-                return
-            
-            if record:
-                username_changed = record.username != u
-                password_changed = p != ""
-                secret_changed = s != ""
-                self.controller.credential_store.update(record.id, l, u, p, s)
-                if (username_changed or password_changed or secret_changed) and hasattr(self.controller, "target_credential_store"):
-                    self.controller.target_credential_store.mark_stale_for_credential(record.id)
-                elif hasattr(self.controller, "target_credential_store"):
-                    # Just label changed, update display labels in mappings
-                    for m in self.controller.target_credential_store.mappings.values():
-                        if m.credential_id == record.id:
-                            m.credential_label = l
-            else:
-                self.controller.credential_store.add(l, u, p, s)
-            self.refresh_list()
-            if "LandingPage" in self.controller.frames:
-                self.controller.frames["LandingPage"].refresh_credential_status()
-            dlg.destroy()
 
-        tk.Button(dlg, text="Save", command=save).pack(pady=20)
-        self.wait_window(dlg)
 class CredentialStatusPanel(tk.LabelFrame):
     def __init__(self, parent, controller, **kwargs):
         super().__init__(parent, text="Credentials (Temp)", font=("Arial", 10, "bold"), **kwargs)
@@ -4051,6 +4075,12 @@ class CommandRunnerPage(BaseRunnerPage):
         self.cred_panel.pack(fill=tk.X, pady=5)
         self.target_panel = TargetPanel(self.left_panel, self.controller)
         self.target_panel.pack(fill=tk.X, pady=5)
+        
+        run_id_frame = tk.Frame(self.left_panel)
+        run_id_frame.pack(fill=tk.X, pady=5)
+        tk.Label(run_id_frame, text="Run ID (optional):", font=("Arial", 10)).pack(side=tk.LEFT)
+        self.run_id_entry = tk.Entry(run_id_frame, width=20)
+        self.run_id_entry.pack(side=tk.LEFT, padx=5)
 
         cmd_frame = tk.LabelFrame(self.left_panel, text="3. Commands to Run", font=("Arial", 10, "bold"))
         cmd_frame.pack(fill=tk.X, pady=5)
@@ -4069,6 +4099,10 @@ class CommandRunnerPage(BaseRunnerPage):
         platform_choice = self.target_panel.get_platform()
         commands = [c.strip() for c in self.cmd_text.get("1.0", tk.END).splitlines() if c.strip()]
         cred_sets = self.controller.credential_store.as_netmiko_dicts()
+        run_id = self.run_id_entry.get().strip()
+        if not run_id:
+            run_id = f"CommandRunner-{self.get_run_ts()}"
+        run_id = FilenameSafety.safe_run_id(run_id)
 
         if not cred_sets:
             messagebox.showerror("Error", "Please add at least one Credential Set")
@@ -4106,20 +4140,21 @@ class CommandRunnerPage(BaseRunnerPage):
                 self.update_session_log_label()
 
             self.is_running = True
-            threading.Thread(target=self.execution_thread, args=(cred_sets, targets, commands, platform_choice), daemon=True).start()
+            threading.Thread(target=self.execution_thread, args=(cred_sets, targets, commands, platform_choice, run_id), daemon=True).start()
             
         self.prompt_for_mapping_if_needed(targets, begin_run)
 
     def clear_page_fields(self, retain_targets: bool, retain_credentials: bool):
         self.cmd_text.delete("1.0", tk.END)
+        self.run_id_entry.delete(0, tk.END)
         if not retain_targets:
             self.target_panel.targets_text.delete("1.0", tk.END)
 
-    def execution_thread(self, cred_sets, targets, commands, platform_choice):
+    def execution_thread(self, cred_sets, targets, commands, platform_choice, run_id):
         try:
             self.enqueue("LOG_EXEC", f"=== COMMAND RUNNER ===")
             run_ts = self.get_run_ts()
-            log_dir = settings.base_output_dir / "Command_Runner" / f"CommandRunner-{run_ts}"
+            log_dir = settings.base_output_dir / "Command_Runner" / run_id
             log_dir.mkdir(parents=True, exist_ok=True)
             self.enqueue("LOG_EXEC", f"Logs will be saved to: {log_dir}")
             
@@ -5279,25 +5314,30 @@ class TargetCredentialMapperPage(tk.Frame):
         control_frame = tk.Frame(upper_frame)
         control_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5)
         
-        tk.Button(control_frame, text="Enter / Update Targets", command=self.enter_targets, width=25).pack(pady=5)
+        tk.Label(control_frame, text="Targets (IP/Hostname):", font=("Arial", 10, "bold")).pack(anchor=tk.W)
+        self.targets_text = tk.Text(control_frame, height=5, width=30)
+        self.targets_text.pack(pady=2)
+        
+        tk.Label(control_frame, text="Platform for Fast Mapping:").pack(anchor=tk.W)
+        self.fast_platform_var = tk.StringVar(value="Cisco IOS/IOS-XE")
+        fast_platform_cb = ttk.Combobox(control_frame, textvariable=self.fast_platform_var, values=["Cisco IOS/IOS-XE", "Cisco NX-OS", "Cisco ASA", "Auto Detect"])
+        fast_platform_cb.pack(fill=tk.X, pady=2)
+        
+        self.probe_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(control_frame, text="Run platform detection during mapping", variable=self.probe_var).pack(anchor=tk.W, pady=2)
+        
         self.start_btn = tk.Button(control_frame, text="Start Credential Mapping", command=self.start_mapping, width=25)
         self.start_btn.pack(pady=5)
         
-        tk.Label(control_frame, text="Single target test:").pack(pady=(10, 0))
-        self.single_ip_var = tk.StringVar()
-        tk.Entry(control_frame, textvariable=self.single_ip_var, width=25).pack(pady=2)
-        self.test_single_btn = tk.Button(control_frame, text="Test Single IP", command=self.test_single_ip, width=25)
-        self.test_single_btn.pack(pady=2)
-        
         self.stop_btn = tk.Button(control_frame, text="STOP", command=self.stop_mapping, width=25, state=tk.DISABLED, fg="red")
-        self.stop_btn.pack(pady=(10, 5))
-        tk.Button(control_frame, text="Clear Mapping Session", command=self.clear_session, width=25).pack(pady=5)
+        self.stop_btn.pack(pady=2)
+        tk.Button(control_frame, text="Clear Mapping Session", command=self.clear_session, width=25).pack(pady=2)
         
         self.retest_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(control_frame, text="Re-test already mapped targets", variable=self.retest_var).pack(anchor=tk.W, pady=5)
+        tk.Checkbutton(control_frame, text="Re-test already mapped", variable=self.retest_var).pack(anchor=tk.W, pady=2)
         
         self.stats_lbl = tk.Label(control_frame, text="", justify=tk.LEFT)
-        self.stats_lbl.pack(anchor=tk.W, pady=10)
+        self.stats_lbl.pack(anchor=tk.W, pady=5)
         self.update_stats()
         
         table_frame = tk.Frame(upper_frame)
@@ -5320,21 +5360,42 @@ class TargetCredentialMapperPage(tk.Frame):
         log_frame = tk.Frame(main_pane)
         main_pane.add(log_frame, minsize=200)
         
-        log_pane = tk.PanedWindow(log_frame, orient=tk.HORIZONTAL)
-        log_pane.pack(fill=tk.BOTH, expand=True)
-        
-        exec_frame = tk.Frame(log_pane)
-        log_pane.add(exec_frame, minsize=300)
+        # Vertical stacking
+        exec_frame = tk.Frame(log_frame)
+        exec_frame.pack(fill=tk.BOTH, expand=True)
         tk.Label(exec_frame, text="Execution Log").pack(anchor=tk.W)
-        self.exec_log = tk.Text(exec_frame, height=10)
+        self.exec_log = tk.Text(exec_frame, height=5)
         self.exec_log.pack(fill=tk.BOTH, expand=True)
         
-        sess_frame = tk.Frame(log_pane)
-        log_pane.add(sess_frame, minsize=300)
-        self.sess_lbl = tk.Label(sess_frame, text="Session Log")
+        sess_frame = tk.Frame(log_frame)
+        sess_frame.pack(fill=tk.BOTH, expand=False)
+        
+        self.sess_container = tk.Frame(sess_frame)
+        
+        def toggle_session_log():
+            if self.sess_container.winfo_manager():
+                self.sess_container.pack_forget()
+                self.toggle_sess_btn.config(text="Show Session Log ▶")
+            else:
+                self.sess_container.pack(fill=tk.BOTH, expand=True)
+                self.toggle_sess_btn.config(text="Hide Session Log ▼")
+                
+        self.toggle_sess_btn = tk.Button(sess_frame, text="Show Session Log ▶", command=toggle_session_log)
+        self.toggle_sess_btn.pack(anchor=tk.W)
+        
+        self.sess_lbl = tk.Label(self.sess_container, text="Session Log")
         self.sess_lbl.pack(anchor=tk.W)
-        self.sess_log = tk.Text(sess_frame, height=10)
+        self.sess_log = tk.Text(self.sess_container, height=5)
         self.sess_log.pack(fill=tk.BOTH, expand=True)
+        
+        # Hydrate targets_text with existing targets
+        self.refresh_targets_text()
+        
+    def refresh_targets_text(self):
+        self.targets_text.delete("1.0", tk.END)
+        targets = self.mapping_store.get_all_hosts()
+        if targets:
+            self.targets_text.insert(tk.END, "\n".join(targets))
         
     def tkraise(self, *args, **kwargs):
         super().tkraise(*args, **kwargs)
