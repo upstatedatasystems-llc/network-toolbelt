@@ -1,6 +1,6 @@
 # Network Toolbelt System Manifest
 
-**Version:** 2.9  
+**Version:** 2.91  
 **Primary Application File:** `network-toolbelt.py`  
 **Project Name:** Network Toolbelt  
 **Current Focus:** Cisco/Netmiko-optimized network operations utility  
@@ -458,13 +458,13 @@ Exports are user-selected save files and can include:
 
 ### 10.1 Credential Manager
 
-Loads, edits, deletes, and clears volatile credential records.
+Loads, edits, deletes, and clears volatile credential records. Now fully inline instead of relying on popups.
 
 ### 10.2 Set Target IPs & Credentials
 
 Embedded in-app page for:
 
-- Managing session targets.
+- Managing session targets via an inline multiline text editor.
 - Mapping targets to credentials.
 - Testing a single IP.
 - Viewing mapping status and logs.
@@ -669,12 +669,13 @@ Then verify:
 
 ## 16. Current Version Summary
 
-Network Toolbelt v2.9 includes:
+Network Toolbelt v2.91 includes:
 
-- Execution diagnostic tracking (elapsed time, slow command warnings).
-- Lean output mode (TXT-first output, JSON disabled by default, errors-only session logs).
-- CompareEngine memory building from TXT files.
-- UI enhancements (target list scrollbars, larger default geometry).
-- Improved granular status bar messages.
-- Self-test mode exit fix.
-- (Plus all execution engine improvements from v2.85).
+- Correctness and security fixes for regex redaction backreferences (fixing \x01 anomalies) and SNMPv3 secret scrubbing.
+- Improved command output authorization checking to prevent false-positive failures.
+- Securely isolated credential mapping logs using centralized `.temp_sessions` directory logic and stale cleanup triggers.
+- Explicit `os.walk` path exclusions preventing `.temp_sessions` from entering user-facing ZIP or TXT exports.
+- Improved Generic Command Runner handling to avoid `run_id` crashes and generate automatic Run IDs.
+- Significantly faster mapping logic by defaulting to auth-only connection modes with platform probing disabled by default.
+- UI conversion replacing unused popups for credential adding/editing and target entry into fully inline panels.
+- Vertically stacked mapping logs featuring a conditionally hidden/collapsed session log viewer.
