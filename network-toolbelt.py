@@ -5393,7 +5393,7 @@ class TargetCredentialMapperPage(tk.Frame):
         
     def refresh_targets_text(self):
         self.targets_text.delete("1.0", tk.END)
-        targets = self.mapping_store.get_all_hosts()
+        targets = self.mapping_store.get_targets()
         if targets:
             self.targets_text.insert(tk.END, "\n".join(targets))
         
@@ -5430,37 +5430,6 @@ class TargetCredentialMapperPage(tk.Frame):
         t_count = len(self.mapping_store.targets)
         m_count = self.mapping_store.mapped_count_for_current_targets()
         self.stats_lbl.config(text=f"Credentials loaded: {c_count}   Targets loaded: {t_count}   Mapped targets: {m_count}/{t_count}")
-        
-    def enter_targets(self):
-        d = tk.Toplevel(self)
-        d.title("Enter Target IPs")
-        d.geometry("400x400")
-        d.transient(self)
-        d.grab_set()
-        if hasattr(self.controller, "apply_theme_to_widget"):
-            self.controller.apply_theme_to_widget(d)
-        
-        tk.Label(d, text="Paste Target IPs/Hostnames (one per line):").pack(pady=5)
-        text = tk.Text(d, width=40, height=15)
-        text.pack(padx=10, pady=5, fill=tk.BOTH, expand=True)
-        text.insert("1.0", "\n".join(self.mapping_store.targets))
-        
-        def save():
-            lines = text.get("1.0", tk.END).splitlines()
-            cleaned = []
-            seen = set()
-            for l in lines:
-                l = l.strip()
-                if l and l not in seen:
-                    cleaned.append(l)
-                    seen.add(l)
-            self.mapping_store.set_targets(cleaned)
-            self.refresh_table_from_store()
-            self.update_stats()
-            self.controller.frames["LandingPage"].refresh_credential_status()
-            d.destroy()
-            
-        tk.Button(d, text="Save Targets", command=save).pack(pady=10)
         
     def refresh_table_from_store(self):
         for item in self.tree.get_children():
@@ -5546,17 +5515,49 @@ class TargetCredentialMapperPage(tk.Frame):
         
         callbacks = {"log_cb": _log, "status_cb": _stat, "progress_cb": _prog, "sess_log_cb": _sess_log}
         
+        platform_name = self.fast_platform_var.get().strip()
+        if platform_name == "Auto Detect":
+            platform_choice = "Auto Detect"
+        elif platform_name == "Cisco IOS/IOS-XE":
+            platform_choice = "Cisco IOS"
+        elif platform_name == "Cisco NX-OS":
+            platform_choice = "Cisco NX-OS"
+        elif platform_name == "Cisco ASA":
+            platform_choice = "Cisco ASA"
+        else:
+            platform_choice = "Auto Detect"
+            
+        run_probe = self.probe_var.get()
+
         def run():
             CredentialMappingRunner.map_targets(
-                targets, self.credential_store, self.mapping_store, "Auto Detect Platform",
-                callbacks, self.stop_event, self.retest_var.get(), True, "redacted"
+                targets, self.credential_store, self.mapping_store, platform_choice,
+                callbacks, self.stop_event, self.retest_var.get(), True, "redacted", run_probe
             )
             self.ui_queue.put(("DONE", None))
             
         threading.Thread(target=run, daemon=True).start()
 
     def start_mapping(self):
-        self._run_mapping(self.mapping_store.targets)
+        lines = self.targets_text.get("1.0", "end").splitlines()
+        hosts = []
+        for line in lines:
+            line = line.strip()
+            if not line: continue
+            if "," in line:
+                for part in line.split(","):
+                    if part.strip(): hosts.append(part.strip())
+            else:
+                hosts.append(line)
+        self.mapping_store.set_targets(hosts)
+        self.refresh_table_from_store()
+        
+        targets = self.mapping_store.get_targets()
+        if not targets:
+            messagebox.showerror("Error", "No targets to map. Please enter targets first.", parent=self)
+            return
+            
+        self._run_mapping(targets)
         
     def test_single_ip(self):
         ip = self.single_ip_var.get().strip()
@@ -5564,10 +5565,12 @@ class TargetCredentialMapperPage(tk.Frame):
             messagebox.showerror("Error", "Please enter a single IP.", parent=self)
             return
         
-        # Add to targets if not present
-        if ip not in self.mapping_store.targets:
+        targets = self.mapping_store.get_targets()
+        if ip not in targets:
             if messagebox.askyesno("Add Target", f"'{ip}' is not in the session targets list. Add it?", parent=self):
-                self.mapping_store.targets.append(ip)
+                targets.append(ip)
+                self.mapping_store.set_targets(targets)
+                self.refresh_targets_text()
                 self.refresh_table_from_store()
                 self.update_stats()
             else:
