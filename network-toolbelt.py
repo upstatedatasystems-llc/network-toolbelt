@@ -5410,7 +5410,6 @@ class TargetCredentialMapperPage(tk.Frame):
             self.stop_event.set()
         self.is_running = False
         self.start_btn.config(state=tk.NORMAL)
-        self.test_single_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
         self.status_lbl.config(text="Idle")
         self.progress["value"] = 0
@@ -5473,7 +5472,6 @@ class TargetCredentialMapperPage(tk.Frame):
                 elif msg_type == "DONE":
                     self.is_running = False
                     self.start_btn.config(state=tk.NORMAL)
-                    self.test_single_btn.config(state=tk.NORMAL)
                     self.stop_btn.config(state=tk.DISABLED)
                     if self.stop_event.is_set():
                         self.status_lbl.config(text="Stopped by user")
@@ -5499,7 +5497,6 @@ class TargetCredentialMapperPage(tk.Frame):
         self.is_running = True
         self.stop_event.clear()
         self.start_btn.config(state=tk.DISABLED)
-        self.test_single_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         self.status_lbl.config(text="Mapping...")
         self.progress["value"] = 0
@@ -5558,25 +5555,6 @@ class TargetCredentialMapperPage(tk.Frame):
             return
             
         self._run_mapping(targets)
-        
-    def test_single_ip(self):
-        ip = self.single_ip_var.get().strip()
-        if not ip:
-            messagebox.showerror("Error", "Please enter a single IP.", parent=self)
-            return
-        
-        targets = self.mapping_store.get_targets()
-        if ip not in targets:
-            if messagebox.askyesno("Add Target", f"'{ip}' is not in the session targets list. Add it?", parent=self):
-                targets.append(ip)
-                self.mapping_store.set_targets(targets)
-                self.refresh_targets_text()
-                self.refresh_table_from_store()
-                self.update_stats()
-            else:
-                return
-
-        self._run_mapping([ip])
         
     def stop_mapping(self):
         self.stop_event.set()
