@@ -100,6 +100,7 @@ class ConnectionResult:
     attempt_history: List[Dict] = field(default_factory=list)
     _reconnect_credential: Optional[Dict[str, str]] = field(default=None, repr=False, compare=False)
     platform_probe_output: str = ""
+    session_prepped: bool = False
 
 @dataclass
 class DeviceSessionContext:
@@ -208,7 +209,7 @@ class ScannerDefinition:
 # Constants and Settings
 # ============================================================
 
-APP_VERSION = "2.91"
+APP_VERSION = "2.92"
 
 @dataclass
 class DocumentationSection:
@@ -373,7 +374,7 @@ class AppSettings:
         self.prep_command_timeout = 10
         self.prep_last_read = 0.5
         self.platform_probe_timeout = 20
-        self.platform_probe_last_read = 1.0
+        self.platform_probe_last_read = 0.5
         self.diagnostics_enabled = True
         self.execution_strategy = "safe_timing"
         self.retry_on_command_timeout = False
@@ -1065,7 +1066,8 @@ class ConnectionManager:
             recon_res = ConnectionManager.connect(context.host, context._reconnect_credential, context.platform_choice, context.temp_session_log, context.run_platform_probe)
             if recon_res.status == ConnectionStatus.SUCCESS:
                 context.conn = recon_res.connection
-                ConnectionManager.prepare_session(context.conn, context.logical_platform, context.device_type, log_callback)
+                if not recon_res.session_prepped:
+                    ConnectionManager.prepare_session(context.conn, context.logical_platform, context.device_type, log_callback)
             else:
                 recon_elapsed = time.perf_counter() - t_rec
                 return finalize_result(out, f"Reconnect failed: {recon_res.error_message}", CommandStatus.UNKNOWN_ERROR, 1, method_used, False, True, elapsed_1, 0.0, retry_reason, "Reconnect failed")
@@ -1105,6 +1107,7 @@ class ConnectionManager:
 
             if device_type == "autodetect":
                 if run_platform_probe:
+                    guesser = None
                     try:
                         guesser = SSHDetect(
                             device_type="autodetect",
@@ -1119,6 +1122,12 @@ class ConnectionManager:
                         if log_callback:
                             log_callback(f"autodetect failed ({exc.__class__.__name__}); falling back to cisco_ios")
                         best_match = None
+                    finally:
+                        if guesser is not None:
+                            try:
+                                guesser.connection.disconnect()
+                            except Exception:
+                                pass
 
                     if not best_match:
                         if log_callback:
@@ -1179,6 +1188,7 @@ class ConnectionManager:
 
             logical = LogicalPlatform.UNKNOWN_CISCO
             ver_out_saved = ""
+            session_prepped = False
             if platform_choice == "Cisco ASA" or device_type == "cisco_asa":
                 logical = LogicalPlatform.ASA
             elif platform_choice == "Cisco NX-OS" or device_type == "cisco_nxos":
@@ -1187,6 +1197,8 @@ class ConnectionManager:
                 logical = LogicalPlatform.IOS
 
             if run_platform_probe:
+                ConnectionManager.prepare_session(conn, logical, device_type, log_callback)
+                session_prepped = True
                 try:
                     t0 = time.perf_counter()
                     ver_out = conn.send_command_timing("show version", read_timeout=settings.platform_probe_timeout, last_read=settings.platform_probe_last_read, strip_prompt=False, strip_command=False)
@@ -1205,7 +1217,8 @@ class ConnectionManager:
                 netmiko_device_type=device_type,
                 logical_platform=logical,
                 _reconnect_credential=creds,
-                platform_probe_output=ver_out_saved
+                platform_probe_output=ver_out_saved,
+                session_prepped=session_prepped
             )
 
         except Exception as e:
@@ -3899,7 +3912,8 @@ class MaintenanceRunnerPage(BaseRunnerPage):
                 platform_probe_output=conn_result.platform_probe_output,
                 _reconnect_credential=conn_result._reconnect_credential
             )
-            ConnectionManager.prepare_session(context.conn, context.logical_platform, context.device_type, log_cb)
+            if not conn_result.session_prepped:
+                ConnectionManager.prepare_session(context.conn, context.logical_platform, context.device_type, log_cb)
 
             logical_plat = conn_result.logical_platform
             cmd_set_key = PLATFORM_COMMAND_SET_MAP.get(logical_plat)
@@ -4208,7 +4222,8 @@ class CommandRunnerPage(BaseRunnerPage):
                     run_platform_probe=False,
                     _reconnect_credential=conn_result._reconnect_credential
                 )
-                ConnectionManager.prepare_session(context.conn, context.logical_platform, context.device_type, log_cb)
+                if not conn_result.session_prepped:
+                    ConnectionManager.prepare_session(context.conn, context.logical_platform, context.device_type, log_cb)
 
                 output_log = [f"===== Session started: {datetime.now()} =====\nHost: {host}\nCapture Mode: {settings.capture_mode.upper()}\n\n"]
                 has_errors = False
@@ -4577,7 +4592,8 @@ class BaseScannerPage(BaseRunnerPage):
                     platform_probe_output=conn_result.platform_probe_output,
                     _reconnect_credential=conn_result._reconnect_credential
                 )
-                ConnectionManager.prepare_session(context.conn, context.logical_platform, context.device_type, log_cb)
+                if not conn_result.session_prepped:
+                    ConnectionManager.prepare_session(context.conn, context.logical_platform, context.device_type, log_cb)
 
                 logical_plat = conn_result.logical_platform
                 cmd_set_key = PLATFORM_COMMAND_SET_MAP.get(logical_plat)

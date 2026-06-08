@@ -1,6 +1,6 @@
 # Network Toolbelt System Manifest
 
-**Version:** 2.91  
+**Version:** 2.92  
 **Primary Application File:** `network-toolbelt.py`  
 **Project Name:** Network Toolbelt  
 **Current Focus:** Cisco/Netmiko-optimized network operations utility  
@@ -669,13 +669,10 @@ Then verify:
 
 ## 16. Current Version Summary
 
-Network Toolbelt v2.91 includes:
+Network Toolbelt v2.92 includes:
 
-- Correctness and security fixes for regex redaction backreferences (fixing \x01 anomalies) and SNMPv3 secret scrubbing.
-- Improved command output authorization checking to prevent false-positive failures.
-- Securely isolated credential mapping logs using centralized `.temp_sessions` directory logic and stale cleanup triggers.
-- Explicit `os.walk` path exclusions preventing `.temp_sessions` from entering user-facing ZIP or TXT exports.
-- Improved Generic Command Runner handling to avoid `run_id` crashes and generate automatic Run IDs.
-- Significantly faster mapping logic by defaulting to auth-only connection modes with platform probing disabled by default.
-- UI conversion replacing unused popups for credential adding/editing and target entry into fully inline panels.
-- Vertically stacked mapping logs featuring a conditionally hidden/collapsed session log viewer.
+- Fixed SSHDetect connection leak that held VTY lines open after autodetect, causing connection delays on devices with constrained VTY pools such as C9300 switch stacks.
+- Moved `prepare_session()` (terminal length/width setup) to run before the platform probe inside `connect()`, preventing `--More--` prompts during `show version` on devices with large output.
+- Added `session_prepped` flag to `ConnectionResult` to prevent redundant terminal setup calls across Maintenance Runner, Command Runner, and Scanner Engine.
+- Reduced `platform_probe_last_read` from 1.0s to 0.5s, cutting the mandatory silence-wait overhead during platform detection.
+- Reconnect path now respects `session_prepped` to avoid duplicate prep after transport-error recovery.

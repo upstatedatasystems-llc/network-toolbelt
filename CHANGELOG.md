@@ -6,6 +6,48 @@ Network Toolbelt is currently a single-file Python/Tkinter desktop utility optim
 
 ---
 
+## v2.92 - First-Command Delay Fix (Switch Stack Performance)
+
+### Summary
+
+v2.92 resolves a compounding set of bugs that caused extended delays before the first command executed on each host, most visible on Cisco C9300-48P switch stacks and other devices with limited VTY resources. The root cause was a leaked SSHDetect session holding VTY lines, combined with session prep running after the platform probe and an overly conservative probe timing window.
+
+### Fixed
+
+- **Fixed SSHDetect connection leak.** When using Auto Detect Platform, the SSHDetect session used for device-type guessing was never explicitly disconnected. The leaked SSH session held a VTY line open until garbage collection, causing subsequent ConnectHandler connections to block waiting for a free VTY on devices with constrained VTY pools (e.g., switch stacks). The SSHDetect session is now properly closed in a `finally` block.
+- **Fixed session prep running after platform probe.** `prepare_session()` (which sends `terminal length 0` and `terminal width 511`) was called after the `show version` platform probe, meaning the probe ran without paging disabled. On switch stacks with large `show version` output, this could trigger `--More--` prompts during the probe, adding delay. Session prep now runs before the platform probe inside `connect()` when `run_platform_probe=True`.
+- **Fixed redundant session prep calls.** Added `session_prepped` flag to `ConnectionResult` so that external callers (Maintenance Runner, Command Runner, Scanner Engine) skip `prepare_session()` when the connection phase already handled it. This eliminates duplicate `terminal length 0` / `terminal width 511` commands.
+- **Reduced platform probe timing window.** Lowered `platform_probe_last_read` from 1.0s to 0.5s. The 1.0s silence-wait was unnecessarily conservative for platform classification and added a guaranteed minimum 1.0s overhead per host, which was especially costly on switch stacks where `show version` output arrives in bursts across stack members.
+
+### Changed
+
+- `ConnectionResult` dataclass now includes a `session_prepped` field (default `False`) to track whether terminal setup was already performed during the connection phase.
+- Reconnect path in `execute_command_with_recovery()` now respects the `session_prepped` flag to avoid redundant prep after reconnection.
+
+---
+
+## v2.91 - Correctness and Security Patch
+
+### Summary
+
+v2.91 addresses correctness and security issues across redaction, parsing, session handling, and command execution.
+
+### Fixed
+
+- Fixed SSHDetect fallback logic to properly handle autodetect failures without crashing and securely pass credentials.
+- Improved command output analysis to correctly identify authorization and syntax errors.
+- Enhanced parser engine to use exact section header matching, preventing cross-section data bleed.
+- Updated ARP snapshot parser to correctly capture `show ip arp` outputs.
+- Standardized scanner platform normalization, fixing issues where Nexus-specific parsing was ignored.
+- Fixed malformed echo detection logic to properly identify token-prefix truncation.
+- Improved redaction engine to use line-buffered streaming, preventing secrets from leaking across chunk boundaries.
+- Added targeted redaction patterns for TACACS/RADIUS nested keys, SNMPv3 secrets, and varied password prompts.
+- Hardened temp session logging with strict directory permissions and robust cleanup handlers to ensure no raw artifacts persist.
+- Gracefully handle privilege escalation (enable) failures, logging the warning instead of aborting the connection.
+- Renamed "Routes Advertised / Received Scanner" to "BGP/Route Summary Scanner" to clarify its summary-only capabilities.
+
+---
+
 ## v2.9 - Diagnostics, Performance, and Lean Output
 
 ### Summary
@@ -288,15 +330,3 @@ v2.8 is a usability, stabilization, documentation, and workflow-polish release. 
 
 The application started as a practical internal operations tool and evolved rapidly. Some early changes were implemented before formal version tracking was introduced. The changelog above is therefore a best-effort reconstruction from the development history and current application behavior.
 
-## v2.91 - Correctness and Security Patch
-- Fixed SSHDetect fallback logic to properly handle autodetect failures without crashing and securely pass credentials.
-- Improved command output analysis to correctly identify authorization and syntax errors.
-- Enhanced parser engine to use exact section header matching, preventing cross-section data bleed.
-- Updated ARP snapshot parser to correctly capture `show ip arp` outputs.
-- Standardized scanner platform normalization, fixing issues where Nexus-specific parsing was ignored.
-- Fixed malformed echo detection logic to properly identify token-prefix truncation.
-- Improved redaction engine to use line-buffered streaming, preventing secrets from leaking across chunk boundaries.
-- Added targeted redaction patterns for TACACS/RADIUS nested keys, SNMPv3 secrets, and varied password prompts.
-- Hardened temp session logging with strict directory permissions and robust cleanup handlers to ensure no raw artifacts persist.
-- Gracefully handle privilege escalation (enable) failures, logging the warning instead of aborting the connection.
-- Renamed "Routes Advertised / Received Scanner" to "BGP/Route Summary Scanner" to clarify its summary-only capabilities.
