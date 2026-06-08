@@ -1,7 +1,7 @@
 # Network Toolbelt System Manifest
 
 **Version:** 2.92  
-**Primary Application File:** `network-toolbelt.py`  
+**Primary Application File:** `network-toolbelt.pyw`  
 **Project Name:** Network Toolbelt  
 **Current Focus:** Cisco/Netmiko-optimized network operations utility  
 **Long-Term Direction:** Broader multi-vendor network operations toolkit  
@@ -79,7 +79,7 @@ The current application does not attempt to be:
 
 ```bash
 pip install -r requirements.txt
-python cisco_toolbelt.py
+python network-toolbelt.pyw
 ```
 
 If no requirements file is present, the minimum third-party dependency is typically:
@@ -99,7 +99,7 @@ Tkinter behavior and styling can vary slightly by OS. On macOS, system Tk warnin
 Network Toolbelt is intentionally implemented as a single primary Python file:
 
 ```text
-network-toolbelt.py
+network-toolbelt.pyw
 ```
 
 The app remains single-file for portability. This lets a network engineer copy, test, back up, and run the utility without packaging a Python module tree.
@@ -627,7 +627,7 @@ Expected repository context:
 
 ```text
 Primary branch: main
-Primary app file: network-toolbelt.py
+Primary app file: network-toolbelt.pyw
 ```
 
 If using a dedicated GitHub SSH alias, confirm the remote and identity before committing:
@@ -648,7 +648,7 @@ Do not commit output files containing raw logs or sensitive device output.
 Before a release or major commit:
 
 ```bash
-python -m py_compile network-toolbelt.py
+python -m py_compile network-toolbelt.pyw
 ```
 
 Then verify:
