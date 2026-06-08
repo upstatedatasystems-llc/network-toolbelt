@@ -10,19 +10,25 @@ Network Toolbelt is currently a single-file Python/Tkinter desktop utility optim
 
 ### Summary
 
-v2.92 resolves a compounding set of bugs that caused extended delays before the first command executed on each host, most visible on Cisco C9300-48P switch stacks and other devices with limited VTY resources. The root cause was a leaked SSHDetect session holding VTY lines, combined with session prep running after the platform probe and an overly conservative probe timing window.
+v2.92 resolves a critical performance bug that caused ~120-second delays before the first command executed on each host when using Auto Detect Platform, most visible on Cisco C9300-48P switch stacks. The root cause was Netmiko's SSHDetect autodetect mechanism, which opens a separate SSH session and cycles through many device types — each one timing out — before giving up and falling back to cisco_ios. This has been replaced with a direct cisco_ios connection, with the existing platform probe (`show version` + `DeviceDetector.classify()`) handling device classification instead. Additionally, session prep ordering, probe timing, and execution log verbosity have been improved.
 
 ### Fixed
 
-- **Fixed SSHDetect connection leak.** When using Auto Detect Platform, the SSHDetect session used for device-type guessing was never explicitly disconnected. The leaked SSH session held a VTY line open until garbage collection, causing subsequent ConnectHandler connections to block waiting for a free VTY on devices with constrained VTY pools (e.g., switch stacks). The SSHDetect session is now properly closed in a `finally` block.
+- **Eliminated SSHDetect autodetect (~120s delay).** When using Auto Detect Platform, the app previously opened an SSHDetect session that cycled through multiple Netmiko device types before falling back to cisco_ios. On C9300 IOS-XE switch stacks, this consistently took ~120 seconds. SSHDetect has been removed entirely; the app now connects directly as cisco_ios and relies on the platform probe (`show version` → `DeviceDetector.classify()`) for platform classification.
 - **Fixed session prep running after platform probe.** `prepare_session()` (which sends `terminal length 0` and `terminal width 511`) was called after the `show version` platform probe, meaning the probe ran without paging disabled. On switch stacks with large `show version` output, this could trigger `--More--` prompts during the probe, adding delay. Session prep now runs before the platform probe inside `connect()` when `run_platform_probe=True`.
-- **Fixed redundant session prep calls.** Added `session_prepped` flag to `ConnectionResult` so that external callers (Maintenance Runner, Command Runner, Scanner Engine) skip `prepare_session()` when the connection phase already handled it. This eliminates duplicate `terminal length 0` / `terminal width 511` commands.
-- **Reduced platform probe timing window.** Lowered `platform_probe_last_read` from 1.0s to 0.5s. The 1.0s silence-wait was unnecessarily conservative for platform classification and added a guaranteed minimum 1.0s overhead per host, which was especially costly on switch stacks where `show version` output arrives in bursts across stack members.
+- **Fixed redundant session prep calls.** Added `session_prepped` flag to `ConnectionResult` so that external callers (Maintenance Runner, Command Runner, Scanner Engine) skip `prepare_session()` when the connection phase already handled it.
+- **Reduced platform probe timing window.** Lowered `platform_probe_last_read` from 1.0s to 0.5s. The 1.0s silence-wait was unnecessarily conservative for platform classification.
+
+### Added
+
+- **Comprehensive connection debug logging.** Every phase of the connection process (SSH session open, enable mode, session prep, platform probe) now logs timestamped progress messages to the execution log, making delays and failures immediately visible.
+- **Improved host start messages.** Host iteration messages now read `▶ Starting host [x/y] <ip>` for better readability.
 
 ### Changed
 
 - `ConnectionResult` dataclass now includes a `session_prepped` field (default `False`) to track whether terminal setup was already performed during the connection phase.
 - Reconnect path in `execute_command_with_recovery()` now respects the `session_prepped` flag to avoid redundant prep after reconnection.
+- Session Log label text simplified from "Session Log (creds etc redacted)" to "Session Log".
 
 ---
 

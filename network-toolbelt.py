@@ -1096,6 +1096,7 @@ class ConnectionManager:
     @staticmethod
     def connect(ip: str, creds: dict, platform_choice: str, temp_session_log: str, run_platform_probe: bool = True, log_callback=None):
         try:
+            t_connect_total = time.perf_counter()
             device_type = "cisco_ios"
 
             if platform_choice == "Cisco NX-OS":
@@ -1103,41 +1104,13 @@ class ConnectionManager:
             elif platform_choice == "Cisco ASA":
                 device_type = "cisco_asa"
             elif platform_choice in ("Auto Detect", "Auto Detect Platform"):
-                device_type = "autodetect"
+                device_type = "cisco_ios"
+                if log_callback and settings.diagnostics_enabled:
+                    log_callback(f"  ℹ Auto Detect selected — connecting as cisco_ios (platform probe will classify device)")
 
-            if device_type == "autodetect":
-                if run_platform_probe:
-                    guesser = None
-                    try:
-                        guesser = SSHDetect(
-                            device_type="autodetect",
-                            host=ip,
-                            username=creds["username"],
-                            password=creds["password"],
-                            secret=creds.get("secret", ""),
-                            timeout=10
-                        )
-                        best_match = guesser.autodetect()
-                    except Exception as exc:
-                        if log_callback:
-                            log_callback(f"autodetect failed ({exc.__class__.__name__}); falling back to cisco_ios")
-                        best_match = None
-                    finally:
-                        if guesser is not None:
-                            try:
-                                guesser.connection.disconnect()
-                            except Exception:
-                                pass
-
-                    if not best_match:
-                        if log_callback:
-                            log_callback("autodetect unavailable; falling back to cisco_ios")
-                        device_type = "cisco_ios"
-                    else:
-                        device_type = best_match
-                else:
-                    device_type = "cisco_ios"
-
+            if log_callback and settings.diagnostics_enabled:
+                log_callback(f"  ⏳ Opening SSH session (device_type={device_type}, timeout=15s)...")
+            t_ssh = time.perf_counter()
             try:
                 try:
                     conn = ConnectHandler(
@@ -1165,10 +1138,16 @@ class ConnectionManager:
                         fast_cli=False
                     )
             except NetmikoAuthenticationException as e:
+                if log_callback and settings.diagnostics_enabled:
+                    log_callback(f"  ✗ SSH authentication failed after {time.perf_counter() - t_ssh:.2f}s")
                 return ConnectionResult(host=ip, status=ConnectionStatus.AUTH_FAILED, error_message=str(e), _reconnect_credential=creds)
             except NetmikoTimeoutException as e:
+                if log_callback and settings.diagnostics_enabled:
+                    log_callback(f"  ✗ SSH connection timed out after {time.perf_counter() - t_ssh:.2f}s")
                 return ConnectionResult(host=ip, status=ConnectionStatus.TIMEOUT, error_message=str(e), _reconnect_credential=creds)
             except Exception as e:
+                if log_callback and settings.diagnostics_enabled:
+                    log_callback(f"  ✗ SSH connection error after {time.perf_counter() - t_ssh:.2f}s: {type(e).__name__}")
                 err = str(e).lower()
                 if "connection refused" in err:
                     status = ConnectionStatus.CONNECTION_REFUSED
@@ -1179,12 +1158,19 @@ class ConnectionManager:
                 else:
                     status = ConnectionStatus.UNKNOWN_ERROR
                 return ConnectionResult(host=ip, status=status, error_message=str(e), _reconnect_credential=creds)
+            if log_callback and settings.diagnostics_enabled:
+                log_callback(f"  ✓ SSH session established in {time.perf_counter() - t_ssh:.2f}s")
 
+            if log_callback and settings.diagnostics_enabled:
+                log_callback(f"  ⏳ Attempting privilege escalation (enable)...")
+            t_enable = time.perf_counter()
             try:
                 conn.enable()
+                if log_callback and settings.diagnostics_enabled:
+                    log_callback(f"  ✓ Enable mode succeeded in {time.perf_counter() - t_enable:.2f}s")
             except Exception as e:
                 if log_callback:
-                    log_callback("Warning: enable mode failed (session will continue without privilege escalation).")
+                    log_callback(f"  ⚠ Enable mode failed in {time.perf_counter() - t_enable:.2f}s (session will continue without privilege escalation)")
 
             logical = LogicalPlatform.UNKNOWN_CISCO
             ver_out_saved = ""
@@ -1197,8 +1183,12 @@ class ConnectionManager:
                 logical = LogicalPlatform.IOS
 
             if run_platform_probe:
+                if log_callback and settings.diagnostics_enabled:
+                    log_callback(f"  ⏳ Preparing session (terminal length/width)...")
                 ConnectionManager.prepare_session(conn, logical, device_type, log_callback)
                 session_prepped = True
+                if log_callback and settings.diagnostics_enabled:
+                    log_callback(f"  ⏳ Running platform probe (show version, timeout={settings.platform_probe_timeout}s, last_read={settings.platform_probe_last_read}s)...")
                 try:
                     t0 = time.perf_counter()
                     ver_out = conn.send_command_timing("show version", read_timeout=settings.platform_probe_timeout, last_read=settings.platform_probe_last_read, strip_prompt=False, strip_command=False)
@@ -1206,9 +1196,13 @@ class ConnectionManager:
                     ver_out_saved = ver_out
                     elapsed = time.perf_counter() - t0
                     if log_callback and settings.diagnostics_enabled:
-                        log_callback(f"  Debug: Platform probe completed in {elapsed:.2f}s [bytes={len(ver_out.encode('utf-8'))}, lines={len(ver_out.splitlines())}, timeout={settings.platform_probe_timeout}s, last_read={settings.platform_probe_last_read}s]")
-                except Exception:
-                    pass
+                        log_callback(f"  ✓ Platform probe completed in {elapsed:.2f}s — classified as {logical.name} [bytes={len(ver_out.encode('utf-8'))}, lines={len(ver_out.splitlines())}]")
+                except Exception as e:
+                    if log_callback and settings.diagnostics_enabled:
+                        log_callback(f"  ⚠ Platform probe failed after {time.perf_counter() - t0:.2f}s: {type(e).__name__}")
+
+            if log_callback and settings.diagnostics_enabled:
+                log_callback(f"  ✓ Connection setup complete in {time.perf_counter() - t_connect_total:.2f}s [platform={logical.name}, device_type={device_type}]")
 
             return ConnectionResult(
                 host=ip,
@@ -2116,7 +2110,7 @@ Raw mode:
 - Treat raw output files as sensitive.
 
 Session log labels:
-- Session Log (creds etc redacted): Redacted display.
+- Session Log: Redacted display of the raw SSH session.
 - Session Log (RAW - sensitive): Raw display.
 
 Mapping sessions:
@@ -3565,7 +3559,7 @@ class BaseRunnerPage(tk.Frame):
             if settings.capture_mode == "raw":
                 self.session_frame.config(text="Session Log (RAW - sensitive)")
             else:
-                self.session_frame.config(text="Session Log (creds etc redacted)")
+                self.session_frame.config(text="Session Log")
 
     def set_status(self, text):
         self.enqueue("STATUS_UPDATE", f"Status: {text}")
@@ -3629,7 +3623,7 @@ class BaseRunnerPage(tk.Frame):
         eb.pack(side=tk.RIGHT, fill=tk.Y)
         self.exec_text.config(yscrollcommand=eb.set)
 
-        self.session_frame = tk.LabelFrame(right_pane, text="Session Log (creds etc redacted)", font=("Arial", 10, "bold"))
+        self.session_frame = tk.LabelFrame(right_pane, text="Session Log", font=("Arial", 10, "bold"))
         right_pane.add(self.session_frame, minsize=100)
         
         self.session_text = tk.Text(self.session_frame, bg="#1e1e1e", fg="#00ff00", font=("Consolas", 10))
@@ -3868,7 +3862,7 @@ class MaintenanceRunnerPage(BaseRunnerPage):
             self.set_progress((idx - 1) / total_hosts * 100)
             if self.stop_event.is_set(): break
             safe_host = FilenameSafety.safe_host_label(host)
-            self.enqueue("LOG_EXEC", f"\n[{idx}/{len(targets)}] {host}")
+            self.enqueue("LOG_EXEC", f"\n▶ Starting host [{idx}/{len(targets)}] {host}")
             self.active_conn = None
             
             temp_dir = SecureTempSessionLogManager.ensure_secure_temp_session_dir(settings.base_output_dir, run_id)
@@ -4178,7 +4172,7 @@ class CommandRunnerPage(BaseRunnerPage):
                 self.set_progress((idx - 1) / total_hosts * 100)
                 if self.stop_event.is_set(): break
                 safe_host = FilenameSafety.safe_host_label(host)
-                self.enqueue("LOG_EXEC", f"\n[{idx}/{len(targets)}] {host}")
+                self.enqueue("LOG_EXEC", f"\n▶ Starting host [{idx}/{len(targets)}] {host}")
                 self.active_conn = None
                 
                 temp_dir = SecureTempSessionLogManager.ensure_secure_temp_session_dir(settings.base_output_dir, run_id)
@@ -4526,7 +4520,7 @@ class BaseScannerPage(BaseRunnerPage):
                 self.set_progress((idx - 1) / total_hosts * 100)
                 if self.stop_event.is_set(): break
                 safe_host = FilenameSafety.safe_host_label(host)
-                self.enqueue("LOG_EXEC", f"\n[{idx}/{len(config.targets)}] {host}")
+                self.enqueue("LOG_EXEC", f"\n▶ Starting host [{idx}/{len(config.targets)}] {host}")
                 
                 host_out_dir = config.output_dir / "hosts"
                 host_out_dir.mkdir(exist_ok=True)
@@ -5517,7 +5511,7 @@ class TargetCredentialMapperPage(tk.Frame):
         self.status_lbl.config(text="Mapping...")
         self.progress["value"] = 0
         
-        self.sess_lbl.config(text="Session Log (creds etc redacted)", fg=THEMES[settings.current_theme]["fg"])
+        self.sess_lbl.config(text="Session Log", fg=THEMES[settings.current_theme]["fg"])
         self.sess_log.delete("1.0", tk.END)
         self.exec_log.delete("1.0", tk.END)
 
