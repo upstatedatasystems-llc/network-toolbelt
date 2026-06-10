@@ -6,6 +6,35 @@ Network Toolbelt is currently a single-file Python/Tkinter desktop utility optim
 
 ---
 
+## v3.0 - Portable Windows Build Support
+
+### Summary
+
+v3.0 adds PyInstaller `--onedir` packaging support, allowing Network Toolbelt to be distributed as a portable Windows folder. End users can run the app without installing Python, Netmiko, Paramiko, or any Python dependencies.
+
+### Added
+
+- **Portable Windows folder build.** Added PyInstaller `--onedir` build configuration to produce a standalone `NetworkToolbelt.exe` with all dependencies bundled.
+- **`build-windows.ps1` build script.** PowerShell script that cleans previous artifacts, runs PyInstaller, validates the output, and creates `dist\NetworkToolbelt-portable.zip`.
+- **`NetworkToolbelt.spec` committed for repeatable builds.** Future builds use the spec file directly; edit the spec file to change build settings.
+- **Packaging-safe path helpers.** Added `is_frozen()`, `get_app_dir()`, `get_bundle_resource_dir()`, `get_output_base_dir()`, and `_configure_frozen_environment()` functions near the top of `network-toolbelt.pyw`.
+- **Bundled NTC Templates/TextFSM environment handling.** `_configure_frozen_environment()` sets the `NET_TEXTFSM` environment variable to the correct bundled template path when running as a packaged EXE.
+- **README release/test documentation.** Added Portable Windows Build section with end-user instructions, development setup, build commands, output location documentation, and a manual release test checklist.
+
+### Changed
+
+- **Packaged EXE output directory** defaults to `%USERPROFILE%\Documents\NetworkToolbelt\toolbelt-output` instead of using `Path.cwd()`. This prevents failures when the EXE is launched from read-only or unpredictable working directories.
+- **Source mode output directory** now uses `<repo folder>\toolbelt-output` via `Path(__file__).resolve().parent` instead of `Path.cwd()`, ensuring consistent behavior regardless of how the script is launched.
+- **`.gitignore` updated** to include `.venv/`, `build/`, and `dist/` patterns. Duplicate entries removed. `*.spec` is intentionally not ignored.
+
+### Notes
+
+- The existing **Settings → Change Output Directory** behavior is preserved. Users can override the default output path at any time.
+- PyInstaller `--onedir` is preferred over `--onefile` because it starts faster, is easier to debug, and is generally less suspicious to endpoint security than a self-extracting one-file executable.
+- Python 3.14 packaging risk is low with current PyInstaller support (v6.15.0+), but final confidence depends on clean-machine validation with Netmiko, Paramiko, Cryptography, and the organization's endpoint-security tooling.
+
+---
+
 ## v2.92 - First-Command Delay Fix (Switch Stack Performance)
 
 ### Summary

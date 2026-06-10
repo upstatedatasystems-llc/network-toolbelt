@@ -1,6 +1,6 @@
 # Network Toolbelt System Manifest
 
-**Version:** 2.92  
+**Version:** 3.0  
 **Primary Application File:** `network-toolbelt.pyw`  
 **Project Name:** Network Toolbelt  
 **Current Focus:** Cisco/Netmiko-optimized network operations utility  
@@ -8,7 +8,7 @@
 **Target Runtime:** Python 3.14.2 or compatible Python 3.x  
 **GUI Framework:** Tkinter  
 **Network Automation Library:** Netmiko  
-**Deployment Model:** Single-file desktop utility  
+**Deployment Model:** Single-file desktop utility; also distributable as a portable Windows folder via PyInstaller  
 
 ---
 
@@ -118,6 +118,26 @@ The app remains single-file for portability. This lets a network engineer copy, 
 - Refactors require extra caution.
 - Documentation, UI, parser logic, and execution logic live together.
 - Strong internal organization is important to prevent the file from becoming hard to maintain.
+
+### Portable Windows Build (PyInstaller)
+
+Network Toolbelt can also be distributed as a portable Windows folder built with PyInstaller `--onedir`. This bundles the Python runtime, Netmiko, Paramiko, Cryptography, TextFSM, NTC Templates, Tkinter/Tcl, and all other dependencies into a standalone folder.
+
+Build artifacts:
+
+- Build script: `build-windows.ps1`
+- Spec file: `NetworkToolbelt.spec` (committed for repeatable builds)
+- Release artifact: `dist\NetworkToolbelt-portable.zip`
+- Executable: `dist\NetworkToolbelt\NetworkToolbelt.exe`
+
+Output paths:
+
+- Source mode: `<repo folder>\toolbelt-output`
+- Packaged EXE mode: `%USERPROFILE%\Documents\NetworkToolbelt\toolbelt-output`
+
+The app detects whether it is running from source or as a packaged EXE using `sys.frozen` and adjusts output paths accordingly. The `_configure_frozen_environment()` function sets the `NET_TEXTFSM` environment variable to point to bundled NTC template files.
+
+PyInstaller `--onedir` is preferred over `--onefile` because it starts faster, is easier to debug, and is generally less suspicious to endpoint security.
 
 ---
 
@@ -403,11 +423,19 @@ This pattern is used by runner pages, scanner pages, and mapper workflows.
 
 ## 9. Output Structure
 
-Default output location:
+Default output location (source mode):
 
 ```text
 toolbelt-output/
 ```
+
+Default output location (packaged EXE mode):
+
+```text
+Documents\NetworkToolbelt\toolbelt-output\
+```
+
+The output directory can be changed at runtime via Settings → Change Output Directory.
 
 Typical subfolders:
 
@@ -628,6 +656,9 @@ Expected repository context:
 ```text
 Primary branch: main
 Primary app file: network-toolbelt.pyw
+Build script: build-windows.ps1
+PyInstaller spec: NetworkToolbelt.spec
+Release artifact: dist\NetworkToolbelt-portable.zip
 ```
 
 If using a dedicated GitHub SSH alias, confirm the remote and identity before committing:
@@ -669,7 +700,7 @@ Then verify:
 
 ## 16. Current Version Summary
 
-Network Toolbelt v2.92 includes:
+Network Toolbelt v3.0 includes:
 
 - Eliminated SSHDetect autodetect, which caused ~120-second delays on C9300 IOS-XE switch stacks by cycling through many device types before falling back to cisco_ios. The app now connects directly as cisco_ios and relies on the platform probe for classification.
 - Moved `prepare_session()` (terminal length/width setup) to run before the platform probe inside `connect()`, preventing `--More--` prompts during `show version` on devices with large output.

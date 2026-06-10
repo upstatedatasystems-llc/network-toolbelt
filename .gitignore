@@ -1,13 +1,19 @@
-# Ignore common junk and output
+# Python
 __pycache__/
 *.pyc
-.DS_Store
-toolbelt-output/
-scratch/
 
-# Ignore specific common junk and output
-__pycache__/
-*.pyc
-.DS_Store
+# Virtual environment
+.venv/
+
+# PyInstaller build artifacts
+build/
+dist/
+
+# App output
 toolbelt-output/
+
+# OS junk
+.DS_Store
+
+# Scratch / temp
 scratch/

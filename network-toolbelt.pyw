@@ -19,6 +19,69 @@ from typing import List, Dict, Optional, Tuple, Any
 import tkinter as tk
 from tkinter import messagebox, filedialog, simpledialog, ttk
 
+
+# ============================================================
+# Packaging-Safe Path Helpers
+# ============================================================
+
+def is_frozen() -> bool:
+    """Return True when running from a PyInstaller-built executable."""
+    return getattr(sys, "frozen", False)
+
+def get_app_dir() -> Path:
+    """Return the directory containing the app executable or source file."""
+    if is_frozen():
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+def get_bundle_resource_dir() -> Path:
+    """
+    Return the PyInstaller bundle resource directory when frozen.
+
+    In PyInstaller one-folder mode, sys._MEIPASS usually points to the
+    internal bundle directory. In source mode, fall back to the app directory.
+    """
+    if is_frozen() and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)
+    return get_app_dir()
+
+def get_output_base_dir() -> Path:
+    """
+    Return the default output directory.
+
+    Source/dev mode:
+        <repo folder>\\toolbelt-output
+
+    Packaged EXE mode:
+        %USERPROFILE%\\Documents\\NetworkToolbelt\\toolbelt-output
+    """
+    if is_frozen():
+        return Path.home() / "Documents" / "NetworkToolbelt" / "toolbelt-output"
+    return get_app_dir() / "toolbelt-output"
+
+def _configure_frozen_environment() -> None:
+    """
+    Configure environment variables needed by packaged builds.
+
+    NTC Templates/TextFSM may need NET_TEXTFSM to locate bundled templates.
+    Check both the PyInstaller resource directory and the _internal folder.
+    """
+    if not is_frozen():
+        return
+
+    candidate_paths = [
+        get_bundle_resource_dir() / "ntc_templates" / "templates",
+        get_app_dir() / "_internal" / "ntc_templates" / "templates",
+    ]
+
+    for templates_path in candidate_paths:
+        if templates_path.is_dir():
+            os.environ["NET_TEXTFSM"] = str(templates_path)
+            break
+
+_configure_frozen_environment()
+
+
 try:
     from netmiko import ConnectHandler
     from netmiko.ssh_autodetect import SSHDetect
@@ -33,6 +96,7 @@ except ImportError:
     root.withdraw()
     mb.showerror("Missing Dependency", "The 'netmiko' library is required.\n\nPlease run:\npip install netmiko")
     sys.exit(1)
+
 
 
 # ============================================================
@@ -209,7 +273,7 @@ class ScannerDefinition:
 # Constants and Settings
 # ============================================================
 
-APP_VERSION = "2.92"
+APP_VERSION = "3.0"
 
 @dataclass
 class DocumentationSection:
@@ -366,8 +430,8 @@ class TargetCredentialMapStore:
 
 class AppSettings:
     def __init__(self):
-        self.base_output_dir = Path.cwd() / "toolbelt-output"
-        self.base_output_dir.mkdir(exist_ok=True)
+        self.base_output_dir = get_output_base_dir()
+        self.base_output_dir.mkdir(parents=True, exist_ok=True)
         self.command_timeout = 20
         self.slow_command_threshold = 5
         self.timing_last_read = 0.75

@@ -21,7 +21,7 @@ The app is intentionally maintained as a single-file utility, `network-toolbelt.
 
 ## Status
 
-Current version: **v2.92**
+Current version: **v3.0**
 
 Current focus:
 
@@ -70,6 +70,97 @@ or:
 
 ```bash
 python3 network-toolbelt.pyw
+```
+
+---
+
+## Portable Windows Build
+
+Network Toolbelt can be built into a portable Windows folder that does not require Python, Netmiko, Paramiko, or any dependencies to be installed.
+
+The release artifact is:
+
+```text
+dist\NetworkToolbelt-portable.zip
+```
+
+### For End Users
+
+1. Extract `NetworkToolbelt-portable.zip` to a normal user-writable location, such as Documents or Desktop.
+2. Open the extracted `NetworkToolbelt` folder.
+3. Run `NetworkToolbelt.exe`.
+
+> **Important:** Do not move `NetworkToolbelt.exe` out of the extracted folder. It depends on the bundled `_internal` files alongside it.
+
+Users do not need to install Python, Netmiko, Paramiko, or any Python dependencies when using the portable ZIP.
+
+### Output Location
+
+When running from source, output files are saved to:
+
+```text
+<repo folder>\toolbelt-output
+```
+
+When running as a packaged EXE, output files are saved to:
+
+```text
+%USERPROFILE%\Documents\NetworkToolbelt\toolbelt-output
+```
+
+The output directory can be changed at runtime from **Settings → Change Output Directory**.
+
+### Development Setup
+
+To run from source during development:
+
+```powershell
+py -3.14 -m venv .venv
+.\.venv\Scripts\activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+pip install pyinstaller
+python network-toolbelt.pyw
+```
+
+### Building the Portable Folder
+
+```powershell
+.\build-windows.ps1
+```
+
+This cleans previous build artifacts, runs PyInstaller, and creates the portable ZIP:
+
+```text
+dist\NetworkToolbelt-portable.zip
+```
+
+### Manual Release Test Checklist
+
+Before distributing a portable build, verify the following:
+
+```text
+[ ] Extract ZIP to a fresh folder
+[ ] Launch NetworkToolbelt.exe
+[ ] Open Credential Manager
+[ ] Add/delete/update a credential
+[ ] Map a credential to an IP
+[ ] Run a single-device test
+[ ] Run Generic Command Runner
+[ ] Run one scanner
+[ ] Run Maintenance Pre/Post
+[ ] Confirm output files are created under Documents\NetworkToolbelt\toolbelt-output
+[ ] Confirm bad credentials fail cleanly
+[ ] Confirm SSH timeout fails cleanly
+[ ] Confirm Settings → Change Output Directory still works
+[ ] Confirm Open Output Folder works if present in the UI
+[ ] Run from a path with spaces, such as C:\Users\<user>\Documents\Network Toolbelt Test\
+[ ] Move the extracted folder and confirm the app still launches
+[ ] Confirm no files are written into the extracted app folder during normal use
+[ ] Confirm the ZIP contains the NetworkToolbelt folder as the top-level folder
+[ ] Test on a Windows standard user account
+[ ] Test on a machine/user profile without the development venv
+[ ] Close and reopen the app
 ```
 
 ---
@@ -274,11 +365,19 @@ Credentials loaded: N   Session targets: N   Mapped targets: X/N
 
 ## Output Structure
 
-Default output folder:
+Default output folder (from source):
 
 ```text
 toolbelt-output/
 ```
+
+Default output folder (from packaged EXE):
+
+```text
+Documents\NetworkToolbelt\toolbelt-output\
+```
+
+The output directory can be changed at runtime via **Settings → Change Output Directory**.
 
 Typical structure:
 
@@ -427,6 +526,8 @@ README.md
 CHANGELOG.md
 system_manifest.md
 requirements.txt
+build-windows.ps1
+NetworkToolbelt.spec
 ```
 
 The application itself currently lives in:
