@@ -3545,6 +3545,19 @@ class BaseRunnerPage(tk.Frame):
         self.is_running = False
         self.fallback_to_all_credentials_for_run = False
 
+    def sync_targets_to_session(self, targets):
+        """Push the current target list into the shared session store so other
+        pages see the same set when they are raised."""
+        store = getattr(self.controller, 'target_credential_store', None)
+        if store is not None:
+            seen = set()
+            cleaned = []
+            for t in targets:
+                if t not in seen:
+                    seen.add(t)
+                    cleaned.append(t)
+            store.set_targets(cleaned)
+
     def prompt_for_mapping_if_needed(self, targets, on_continue):
         if not targets:
             import tkinter.messagebox as mb
@@ -3613,9 +3626,9 @@ class BaseRunnerPage(tk.Frame):
         
         if hasattr(self, 'target_panel') and hasattr(self.controller, 'target_credential_store'):
             self.target_panel.refresh_session_counts()
-            current_text = self.target_panel.targets_text.get("1.0", "end-1c").strip()
             session_targets = self.controller.target_credential_store.targets
-            if not current_text and session_targets:
+            if session_targets:
+                self.target_panel.targets_text.delete("1.0", "end")
                 self.target_panel.targets_text.insert("1.0", "\n".join(session_targets))
 
     def update_session_log_label(self):
@@ -3853,6 +3866,7 @@ class MaintenanceRunnerPage(BaseRunnerPage):
             return
 
         targets = self.target_panel.get_targets()
+        self.sync_targets_to_session(targets)
         platform_choice = self.target_panel.get_platform()
         cred_sets = self.controller.credential_store.as_netmiko_dicts()
 
@@ -4168,6 +4182,7 @@ class CommandRunnerPage(BaseRunnerPage):
         self.clear_btn.pack(fill=tk.X, pady=5)
     def start_execution(self):
         targets = self.target_panel.get_targets()
+        self.sync_targets_to_session(targets)
         platform_choice = self.target_panel.get_platform()
         commands = [c.strip() for c in self.cmd_text.get("1.0", tk.END).splitlines() if c.strip()]
         cred_sets = self.controller.credential_store.as_netmiko_dicts()
@@ -4517,6 +4532,7 @@ class BaseScannerPage(BaseRunnerPage):
             return
             
         targets = self.target_panel.get_targets()
+        self.sync_targets_to_session(targets)
         platform_choice = self.target_panel.get_platform()
         cred_sets = self.controller.credential_store.as_netmiko_dicts()
         options = self.get_options()
@@ -5296,6 +5312,7 @@ class CredentialMappingRunner:
                 if stop_event.is_set():
                     break
                     
+                log_cb(f"  Trying credential set {i}/{len(creds_to_try)}: user={cred_record.username} ...")
                 cred_dict = {"username": cred_record.username, "password": cred_record.password, "secret": cred_record.secret}
                 res = ConnectionManager.connect(host, cred_dict, platform_choice, temp_session_log, run_platform_probe)
                 
@@ -5473,6 +5490,7 @@ class TargetCredentialMapperPage(tk.Frame):
         
     def tkraise(self, *args, **kwargs):
         super().tkraise(*args, **kwargs)
+        self.refresh_targets_text()
         self.refresh_table_from_store()
         self.update_stats()
         
