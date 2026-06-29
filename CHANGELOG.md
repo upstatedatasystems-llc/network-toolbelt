@@ -6,6 +6,32 @@ Network Toolbelt is currently a single-file Python/Tkinter desktop utility optim
 
 ---
 
+## v3.01 - UI Polish and Cleanups
+
+### Summary
+
+v3.01 implements several UI refinements to streamline the application, improve menu accessibility, remove deprecated stubs, and improve navigation consistency.
+
+### Added
+
+- **New File Menu Shortcuts**: Added direct shortcuts under the File dropdown menu to quickly access Generic Command Runner, Maintenance Pre/Post Runner, and Credential Manager & Library.
+
+### Changed
+
+- **Settings Menu Restructuring**: Moved "Toggle Dark/Light Mode" from the File menu to the Settings menu for better logical organization.
+- **Help Menu Simplification**: Consolidated the "General Information" and "How-To Instructions" menu items into a single "Documentation" button that opens the help window directly.
+- **Network Scanners Page Polish**:
+  - Repositioned the "Back to Dashboard" button to the top left of the Network Scanners page for consistent navigation across runner modules.
+  - Aligned BGP/Route Summary button to center-span the grid.
+- **Dashboard Text Cleanup**: Removed the redundant "Temporary Session Only. Credentials are never saved." subtitle from the main dashboard.
+
+### Removed
+
+- **Scanner Stubs**: Removed non-functional scanner buttons containing "(Soon)" (Config Backup / Diff Tool, Outage Snapshot Tool, Reachability / Path Test, VLAN / Trunk Consistency, STP Health Scanner) from the Network Scanners suite landing page.
+- **Page Help Buttons**: Removed the `[Help]` button from the top right of runner pages (`BaseRunnerPage`) and the top left of `Network Scanners` page.
+
+---
+
 ## v3.0 - Portable Windows Build Support
 
 ### Summary
