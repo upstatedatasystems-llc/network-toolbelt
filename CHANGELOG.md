@@ -6,6 +6,30 @@ Network Toolbelt is currently a single-file Python/Tkinter desktop utility optim
 
 ---
 
+## v3.3 - Concurrent Host Execution
+
+### Summary
+
+v3.3 introduces concurrent host execution across all SSH-based tools in Network Toolbelt. Every runner and scanner page now includes a **Concurrent Hosts** spinbox control that allows parallelizing target host connections using a bounded `ThreadPoolExecutor`. Each host gets its own independent Netmiko session — no sessions are shared across threads. A new thread-safe `ActiveConnectionRegistry` enables clean teardown of all active connections on user-initiated STOP requests. Sequential execution is preserved when concurrency is set to 1.
+
+### Added
+
+- **`ConcurrentHostsControl` Widget**: Reusable `tk.LabelFrame` with a `Spinbox` (range 1–20, default 3) for selecting the number of concurrent host connections. Integrated into Maintenance Pre/Post Runner, all 7 SSH Scanner pages (via `BaseScannerPage`), and the Credential Mapper.
+- **`ActiveConnectionRegistry` Class**: Thread-safe connection tracking with `register()`, `unregister()`, and `disconnect_all()` methods, all protected by `threading.Lock()`. Enables clean multi-connection teardown on STOP.
+- **`format_concurrent_status()` Helper**: Returns human-readable status bar messages during concurrent execution (e.g., `"Running — 5/10 hosts completed, 3 active"`).
+- **Bounded ThreadPoolExecutor Host Loop**: All concurrent runners use `concurrent.futures.wait(return_when=FIRST_COMPLETED)` to limit active tasks to `max_workers`, submitting new hosts as previous ones complete.
+- **Host-Prefixed Log Output**: Concurrent execution log messages are prefixed with `[host_ip]` for clear per-host visibility in the shared execution log pane.
+- **SNMP Scanner Concurrency**: `SnmpOidScannerPage` uses the same `ThreadPoolExecutor` pattern with a default concurrency of 5.
+- **Credential Mapper Concurrency**: Target credential mapping uses bounded concurrency (default 3) to protect AAA (TACACS+/RADIUS) servers from lockout.
+
+### Changed
+
+- **`BaseRunnerPage`**: Now initializes `self.active_conns` from the controller's `ActiveConnectionRegistry`. `stop_execution()` and `stop_and_clear_for_navigation()` both call `active_conns.disconnect_all()` to sever all concurrent connections.
+- **`NetworkToolbeltApp`**: Instantiates a shared `ActiveConnectionRegistry` on `self.active_conns` during app initialization.
+- **Sequential Pathway Preservation**: When `concurrency == 1`, all tools route through the original sequential execution pathway without modifications.
+
+---
+
 ## v3.2 - UI Status Prefixes and Wide CSV Outputs
 
 ### Summary

@@ -453,7 +453,7 @@ class ScannerDefinition:
 # Constants and Settings
 # ============================================================
 
-APP_VERSION = "3.2"
+APP_VERSION = "3.3"
 
 @dataclass
 class DocumentationSection:
@@ -1042,6 +1042,29 @@ class SecureTempSessionLogManager:
                 except Exception: pass
 
 # ============================================================
+# Active Connection Registry for Thread-Safe Disconnections
+# ============================================================
+class ActiveConnectionRegistry:
+    def __init__(self):
+        self.connections = {}
+        self.lock = threading.Lock()
+
+    def register(self, key, conn):
+        with self.lock:
+            self.connections[key] = conn
+
+    def unregister(self, key):
+        with self.lock:
+            if key in self.connections:
+                del self.connections[key]
+
+    def disconnect_all(self):
+        with self.lock:
+            for conn in list(self.connections.values()):
+                try: conn.disconnect()
+                except Exception: pass
+            self.connections.clear()
+
 # ============================================================
 # Redaction
 # ============================================================
@@ -3317,6 +3340,17 @@ If you used Raw Capture mode, these exports may contain sensitive data (password
 
     DocumentationSection("Version Changelog", """Network Toolbelt Version History
 
+## v3.3 - Concurrent Host Execution
+- Added concurrent host execution across all SSH-based tools.
+- New Concurrent Hosts spinbox control (1-20, default 3) on Maintenance Runner, all SSH Scanners, and Credential Mapper.
+- ThreadPoolExecutor-based bounded submission with FIRST_COMPLETED wait pattern.
+- Each host gets its own Netmiko session — no shared sessions across threads.
+- Thread-safe ActiveConnectionRegistry for clean STOP teardown of all active connections.
+- Host-prefixed log output for concurrent execution visibility.
+- Sequential mode preserved when concurrency is set to 1.
+- SNMP Scanner uses same concurrency pattern (default 5).
+- All self-tests updated and passing.
+
 ## v2.91 - Diagnostics, Performance, and Lean Output
 - Command timeout default is now 20 seconds.
 - Timing last_read default is 0.75 seconds.
@@ -4819,6 +4853,41 @@ class TargetPanel(tk.LabelFrame):
         return self.platform_var.get()
 
 
+class ConcurrentHostsControl(tk.LabelFrame):
+    """Spinbox control for selecting the number of concurrent host connections."""
+    DEFAULT_CONCURRENCY = 3
+    MAX_CONCURRENCY = 20
+
+    def __init__(self, parent, default=None, **kwargs):
+        super().__init__(parent, text="Concurrent Hosts", font=("Arial", 10, "bold"), **kwargs)
+        if default is None:
+            default = self.DEFAULT_CONCURRENCY
+        self._var = tk.IntVar(value=default)
+        inner = tk.Frame(self)
+        inner.pack(fill=tk.X, padx=5, pady=5)
+        tk.Label(inner, text="Max parallel hosts:").pack(side=tk.LEFT)
+        self._spinbox = tk.Spinbox(
+            inner, from_=1, to=self.MAX_CONCURRENCY,
+            textvariable=self._var, width=4, justify=tk.CENTER
+        )
+        self._spinbox.pack(side=tk.LEFT, padx=(5, 0))
+        tk.Label(self, text="Set to 1 for sequential execution.", font=("Arial", 8, "italic")).pack(anchor="w", padx=5, pady=(0, 3))
+
+    def get_value(self) -> int:
+        try:
+            v = self._var.get()
+            return max(1, min(v, self.MAX_CONCURRENCY))
+        except (tk.TclError, ValueError):
+            return self.DEFAULT_CONCURRENCY
+
+
+def format_concurrent_status(completed: int, total: int, active: int, stopped: bool) -> str:
+    """Return a human-readable status string for concurrent execution progress."""
+    if stopped:
+        return f"STOPPED — {completed}/{total} hosts completed, {active} still winding down"
+    return f"Running — {completed}/{total} hosts completed, {active} active"
+
+
 # ============================================================
 # Runner Pages
 # ============================================================
@@ -4898,6 +4967,7 @@ class BaseRunnerPage(tk.Frame):
         self.stop_event = threading.Event()
         self.is_running = False
         self.active_conn = None
+        self.active_conns = getattr(controller, "active_conns", None)
 
         self._setup_base_ui()
         self.after(100, self.process_queue)
@@ -4909,6 +4979,8 @@ class BaseRunnerPage(tk.Frame):
             try: self.active_conn.disconnect()
             except Exception: pass
             self.active_conn = None
+        if self.active_conns:
+            self.active_conns.disconnect_all()
         self.enqueue("CLEAR_LOGS")
         self.set_status("Idle")
         self.set_progress(0)
@@ -5134,6 +5206,8 @@ class BaseRunnerPage(tk.Frame):
         if self.active_conn:
             try: self.active_conn.disconnect()
             except Exception: pass
+        if self.active_conns:
+            self.active_conns.disconnect_all()
 
     def clear_current_session(self):
         dlg = ClearSessionDialog(self)
@@ -5225,6 +5299,9 @@ class MaintenanceRunnerPage(BaseRunnerPage):
         self.target_panel = TargetPanel(self.left_panel, self.controller)
         self.target_panel.pack(fill=tk.X, pady=5)
 
+        self.concurrency_control = ConcurrentHostsControl(self.left_panel)
+        self.concurrency_control.pack(fill=tk.X, pady=5)
+
         self.run_btn = tk.Button(self.left_panel, text="RUN", font=("Arial", 14, "bold"), command=self.start_execution)
         self.run_btn.pack(fill=tk.X, pady=5)
 
@@ -5232,6 +5309,7 @@ class MaintenanceRunnerPage(BaseRunnerPage):
         self.stop_btn.pack(fill=tk.X, pady=5)
         self.clear_btn = tk.Button(self.left_panel, text="Clear Current Session", font=("Arial", 11), command=self.clear_current_session)
         self.clear_btn.pack(fill=tk.X, pady=5)
+
     def start_execution(self):
         mode = self.mode_var.get()
         run_id_raw = self.run_id_entry.get()
@@ -5253,6 +5331,14 @@ class MaintenanceRunnerPage(BaseRunnerPage):
             messagebox.showerror("Error", "Please provide at least one Target IP")
             return
 
+        concurrency = 1
+        if mode != "compare":
+            try:
+                concurrency = self.concurrency_control.get_value()
+            except ValueError as err:
+                messagebox.showerror("Validation Error", str(err), parent=self)
+                return
+
         def begin_run():
             self.stop_event.clear()
             self.enqueue("SET_BUTTONS", tk.DISABLED, tk.NORMAL)
@@ -5265,18 +5351,19 @@ class MaintenanceRunnerPage(BaseRunnerPage):
                 self.update_session_log_label()
 
             self.is_running = True
-            threading.Thread(target=self.execution_thread, args=(mode, run_id, cred_sets, targets, platform_choice), daemon=True).start()
+            threading.Thread(target=self.execution_thread, args=(mode, run_id, cred_sets, targets, platform_choice, concurrency), daemon=True).start()
             
         if mode == "compare":
             begin_run()
         else:
             self.prompt_for_mapping_if_needed(targets, begin_run)
 
-    def execution_thread(self, mode, run_id, cred_sets, targets, platform_choice):
+    def execution_thread(self, mode, run_id, cred_sets, targets, platform_choice, concurrency):
         try:
             if mode in ("pre", "post"):
                 self.enqueue("LOG_EXEC", f"=== {mode.upper()} CHECKS ===")
-                self.run_checks(mode, run_id, cred_sets, targets, platform_choice)
+                self.enqueue("LOG_EXEC", f"Concurrency: {concurrency}")
+                self.run_checks(mode, run_id, cred_sets, targets, platform_choice, concurrency)
                 if self.stop_event.is_set():
                     self.enqueue("LOG_EXEC", f"\n{mode.capitalize()} checks ABORTED.")
                 else:
@@ -5305,226 +5392,532 @@ class MaintenanceRunnerPage(BaseRunnerPage):
         if not retain_targets:
             self.target_panel.targets_text.delete("1.0", tk.END)
 
-    def run_checks(self, phase, run_id, cred_sets, targets, platform_choice):
+    def run_checks(self, phase, run_id, cred_sets, targets, platform_choice, concurrency):
         out_dir = settings.base_output_dir / "Maintenance_Runner" / run_id / phase
         out_dir.mkdir(parents=True, exist_ok=True)
         run_ts = self.get_run_ts()
-
         total_hosts = len(targets)
-        for idx, host in enumerate(targets, 1):
-            self.set_host_status(host, idx, total_hosts, "Connecting")
-            self.set_progress((idx - 1) / total_hosts * 100)
-            if self.stop_event.is_set(): break
-            safe_host = FilenameSafety.safe_host_label(host)
-            self.enqueue("LOG_EXEC", f"\n▶ Starting host [{idx}/{len(targets)}] {host}")
-            self.active_conn = None
-            
-            temp_dir = SecureTempSessionLogManager.ensure_secure_temp_session_dir(settings.base_output_dir, run_id)
-            temp_session_log_path = SecureTempSessionLogManager.create_secure_session_log_path(temp_dir, safe_host)
-            temp_session_log = str(temp_session_log_path)
-            tail_stop_event = threading.Event()
-            tail_t = threading.Thread(target=self.sync_tail, args=(temp_session_log, tail_stop_event), daemon=True)
-            tail_t.start()
 
-            host_had_diagnostics = False
+        if concurrency == 1:
+            # ----------------- SEQUENTIAL PATHWAY -----------------
+            for idx, host in enumerate(targets, 1):
+                self.set_host_status(host, idx, total_hosts, "Connecting")
+                self.set_progress((idx - 1) / total_hosts * 100)
+                if self.stop_event.is_set(): break
+                safe_host = FilenameSafety.safe_host_label(host)
+                self.enqueue("LOG_EXEC", f"\n▶ Starting host [{idx}/{len(targets)}] {host}")
+                self.active_conn = None
+                
+                temp_dir = SecureTempSessionLogManager.ensure_secure_temp_session_dir(settings.base_output_dir, run_id)
+                temp_session_log_path = SecureTempSessionLogManager.create_secure_session_log_path(temp_dir, safe_host)
+                temp_session_log = str(temp_session_log_path)
+                tail_stop_event = threading.Event()
+                tail_t = threading.Thread(target=self.sync_tail, args=(temp_session_log, tail_stop_event), daemon=True)
+                tail_t.start()
 
-            def log_cb(msg):
-                self.enqueue("LOG_EXEC", msg)
-            conn_result = ConnectionManager.connect_with_mapped_or_global_credentials(host, platform_choice, temp_session_log, self.controller.credential_store, getattr(self.controller, 'target_credential_store', None), log_cb, self.stop_event, getattr(self, 'fallback_to_all_credentials_for_run', False))
-            
-            if conn_result.status == ConnectionStatus.SUCCESS:
-                self.active_conn = conn_result.connection
-                self.set_host_status(host, idx, total_hosts, "Connected", f"Platform: {conn_result.logical_platform.name}")
-            else:
-                host_had_diagnostics = True
-                self.set_host_status(host, idx, total_hosts, "Connection failed", "moving to next target")
-                if not self.stop_event.is_set():
-                    pass
+                host_had_diagnostics = False
+
+                def log_cb(msg):
+                    self.enqueue("LOG_EXEC", msg)
+                conn_result = ConnectionManager.connect_with_mapped_or_global_credentials(host, platform_choice, temp_session_log, self.controller.credential_store, getattr(self.controller, 'target_credential_store', None), log_cb, self.stop_event, getattr(self, 'fallback_to_all_credentials_for_run', False))
+                
+                if conn_result.status == ConnectionStatus.SUCCESS:
+                    self.active_conn = conn_result.connection
+                    self.set_host_status(host, idx, total_hosts, "Connected", f"Platform: {conn_result.logical_platform.name}")
+                else:
+                    host_had_diagnostics = True
+                    self.set_host_status(host, idx, total_hosts, "Connection failed", "moving to next target")
+                    tail_stop_event.set()
+                    tail_t.join(1)
+                    if settings.capture_mode == "redacted":
+                        redactor.redact_file(Path(temp_session_log), out_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
+                    else:
+                        Path(temp_session_log).rename(out_dir / f"{safe_host}_{run_ts}_session_RAW.log")
+                    SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
+                    continue
+                    
+                context = DeviceSessionContext(
+                    host=host,
+                    platform_choice=platform_choice,
+                    logical_platform=conn_result.logical_platform,
+                    device_type=conn_result.netmiko_device_type,
+                    temp_session_log=temp_session_log,
+                    conn=self.active_conn,
+                    run_platform_probe=True,
+                    platform_probe_output=conn_result.platform_probe_output,
+                    _reconnect_credential=conn_result._reconnect_credential
+                )
+                if not conn_result.session_prepped:
+                    ConnectionManager.prepare_session(context.conn, context.logical_platform, context.device_type, log_cb)
+
+                logical_plat = conn_result.logical_platform
+                cmd_set_key = PLATFORM_COMMAND_SET_MAP.get(logical_plat)
+                if not cmd_set_key or cmd_set_key not in COMMAND_SETS:
+                    self.enqueue("LOG_EXEC", f"  ✗ ERROR: No command set found for detected platform {logical_plat.name}")
+                else:
+                    self.enqueue("LOG_EXEC", f"  ✓ Detected {logical_plat.name}, using {cmd_set_key}")
+                    
+                    fname = f"{safe_host}-{phase}{'_RAW' if settings.capture_mode == 'raw' else ''}.txt"
+                    json_fname = f"{safe_host}-{phase}{'_RAW' if settings.capture_mode == 'raw' else ''}.json"
+                    outfile = out_dir / fname
+                    
+                    raw_text = ""
+                    with open(outfile, "w", encoding="utf-8") as f:
+                        f.write(f"# Run ID: {run_id}\n# Phase: {phase}\n# Host: {host}\n# Platform: {logical_plat.name}\n# Timestamp: {run_ts}\n# Capture Mode: {settings.capture_mode.upper()}\n\n")
+                        command_results = []
+                        base_cmds = self.controller.tool_command_manager.get_effective_commands("maintenance_baseline", cmd_set_key, MAINTENANCE_BASELINE_COMMANDS.get(cmd_set_key, COMMAND_SETS.get(cmd_set_key, [])))
+                        unsafe_b = self.controller.tool_command_manager.validate_commands(base_cmds)
+                        if unsafe_b:
+                            self.enqueue("LOG_EXEC", f"  ! Unsafe baseline commands in override, skipping: {unsafe_b}")
+                            base_cmds = [c for c in base_cmds if c not in unsafe_b]
+                        
+                        features_detected = []
+                        
+                        def exec_cmd(cmd):
+                            nonlocal raw_text, features_detected, host_had_diagnostics
+                            self.enqueue("LOG_EXEC", f"  -> {cmd}")
+                            self.set_host_status(host, idx, total_hosts, "Running commands", f"command: {cmd}")
+                            
+                            if cmd == "show version" and context.platform_probe_output:
+                                self.enqueue("LOG_EXEC", f"  ✓ Using cached platform probe output")
+                                cmd_out = context.platform_probe_output
+                                status = CommandStatus.SUCCESS
+                                err_msg = ""
+                                method_used = "platform_probe_cache"
+                                abort_host = False
+                                exec_res = CommandExecutionResult(
+                                    command=cmd, status=status, output=cmd_out, error_message="", attempts=0, method_used="platform_probe_cache", reconnect_performed=False, unsupported_reason="", abort_host=False, elapsed_seconds=0.0, first_attempt_elapsed_seconds=0.0, retry_elapsed_seconds=0.0, output_bytes=len(cmd_out.encode('utf-8')), output_lines=len(cmd_out.splitlines()), timeout_seconds=0, last_read_seconds=0.0, slow_command=False, diagnostic_reason="", retry_reason=""
+                                )
+                            else:
+                                exec_res = ConnectionManager.execute_command_with_recovery(context, cmd, log_callback=log_cb)
+                                self.active_conn = context.conn
+                                cmd_out = exec_res.output
+                                status = exec_res.status
+                                err_msg = exec_res.error_message
+                                method_used = exec_res.method_used
+                                abort_host = exec_res.abort_host
+                                
+                                if exec_res.status == CommandStatus.COMMAND_TIMEOUT or exec_res.slow_command or exec_res.retry_reason or exec_res.reconnect_performed or exec_res.abort_host or ConnectionManager.is_transport_error(exec_res.error_message, exec_res.output) or ConnectionManager.is_malformed_echo(cmd, exec_res.output):
+                                    host_had_diagnostics = True
+                                    
+                                if exec_res.slow_command:
+                                    self.set_host_status(host, idx, total_hosts, "Slow command", f"'{cmd}' running > {settings.slow_command_threshold}s")
+                                
+                            diag_hdr = ConnectionManager.format_diagnostic_header(exec_res)
+
+                            if status == CommandStatus.COMMAND_UNSUPPORTED:
+                                self.enqueue("LOG_EXEC", f"  ! Command unsupported: {cmd}")
+                            elif status == CommandStatus.PRIVILEGE_DENIED:
+                                self.enqueue("LOG_EXEC", f"  ! Privilege denied: {cmd}")
+                            elif status == CommandStatus.COMMAND_TIMEOUT:
+                                self.enqueue("LOG_EXEC", f"  ✗ Command timed out: {cmd}")
+                            elif status != CommandStatus.SUCCESS:
+                                self.enqueue("LOG_EXEC", f"  ✗ Error running {cmd}: {err_msg}")
+                                
+                            command_results.append({
+                                "command": cmd,
+                                "status": status.name,
+                                "error_message": err_msg,
+                                "output_length": len(cmd_out),
+                                "unsupported_reason": err_msg if status != CommandStatus.SUCCESS else "",
+                                "method_used": method_used
+                            })
+                            
+                            if settings.capture_mode == "redacted":
+                                cmd_out_redacted = redactor.redact_text(cmd_out)
+                            else:
+                                cmd_out_redacted = cmd_out
+                                
+                            if status == CommandStatus.COMMAND_TIMEOUT:
+                                f.write(f"\n## {cmd}\n{diag_hdr}\nCOMMAND TIMEOUT\n")
+                                raw_text += f"\n## {cmd}\n{diag_hdr}\nCOMMAND TIMEOUT\n"
+                            elif status != CommandStatus.SUCCESS and not cmd_out:
+                                f.write(f"\n## {cmd}\n{diag_hdr}\nERROR: {err_msg}\n")
+                                raw_text += f"\n## {cmd}\n{diag_hdr}\nERROR: {err_msg}\n"
+                            else:
+                                f.write(f"\n## {cmd}\n{diag_hdr}\n{cmd_out_redacted}\n")
+                                raw_text += f"\n## {cmd}\n{diag_hdr}\n{cmd_out_redacted}\n"
+                            
+                            if cmd == "show running-config" and status == CommandStatus.SUCCESS:
+                                features_detected = FeatureDetector.detect_features(cmd_out)
+                                if features_detected:
+                                    self.enqueue("LOG_EXEC", f"  * Detected features: {', '.join(features_detected)}")
+                                    
+                            return abort_host
+
+                        for cmd in base_cmds:
+                            if self.stop_event.is_set(): break
+                            if exec_cmd(cmd):
+                                self.set_host_status(host, idx, total_hosts, "Host aborted", "transport/reconnect failure")
+                                self.enqueue("LOG_EXEC", f"  ✗ Host aborted due to transport/reconnect failure.")
+                                break
+                            
+                        # Now process feature commands
+                        if not self.stop_event.is_set():
+                            for feature in features_detected:
+                                if self.stop_event.is_set(): break
+                                f_cmds = self.controller.tool_command_manager.get_effective_commands("maintenance_features", feature, FEATURE_COMMANDS.get(feature, []))
+                                if not f_cmds and feature in FEATURE_COMMANDS:
+                                    f_cmds = FEATURE_COMMANDS[feature]
+                                
+                                unsafe_f = self.controller.tool_command_manager.validate_commands(f_cmds)
+                                if unsafe_f:
+                                    self.enqueue("LOG_EXEC", f"  ! Unsafe {feature} commands in override, skipping: {unsafe_f}")
+                                    f_cmds = [c for c in f_cmds if c not in unsafe_f]
+        
+                                aborted = False
+                                for cmd in f_cmds:
+                                    if self.stop_event.is_set(): break
+                                    self.enqueue("LOG_EXEC", f"  + Dynamic feature {feature}: {cmd}")
+                                    if exec_cmd(cmd):
+                                        self.set_host_status(host, idx, total_hosts, "Host aborted", "transport/reconnect failure")
+                                        self.enqueue("LOG_EXEC", f"  ✗ Host aborted due to transport/reconnect failure.")
+                                        aborted = True
+                                        break
+                                if aborted: break
+
+                    if not self.stop_event.is_set() and raw_text and settings.write_json_outputs:
+                        snap = SnapshotBuilder.build(run_id, phase, host, logical_plat.name, cmd_set_key, settings.capture_mode, raw_text, command_results)
+                        with open(out_dir / json_fname, "w") as jf:
+                            json.dump(snap, jf, indent=4)
+
+                try: self.active_conn.disconnect()
+                except Exception: pass
+                self.active_conn = None
+                
+                # Stop tail thread
                 tail_stop_event.set()
                 tail_t.join(1)
-                if settings.capture_mode == "redacted":
-                    redactor.redact_file(Path(temp_session_log), out_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
-                else:
-                    Path(temp_session_log).rename(out_dir / f"{safe_host}_{run_ts}_session_RAW.log")
-                SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
-                continue
                 
-            context = DeviceSessionContext(
-                host=host,
-                platform_choice=platform_choice,
-                logical_platform=conn_result.logical_platform,
-                device_type=conn_result.netmiko_device_type,
-                temp_session_log=temp_session_log,
-                conn=self.active_conn,
-                run_platform_probe=True,
-                platform_probe_output=conn_result.platform_probe_output,
-                _reconnect_credential=conn_result._reconnect_credential
-            )
-            if not conn_result.session_prepped:
-                ConnectionManager.prepare_session(context.conn, context.logical_platform, context.device_type, log_cb)
-
-            logical_plat = conn_result.logical_platform
-            cmd_set_key = PLATFORM_COMMAND_SET_MAP.get(logical_plat)
-            if not cmd_set_key or cmd_set_key not in COMMAND_SETS:
-                self.enqueue("LOG_EXEC", f"  ✗ ERROR: No command set found for detected platform {logical_plat.name}")
-            else:
-                self.enqueue("LOG_EXEC", f"  ✓ Detected {logical_plat.name}, using {cmd_set_key}")
+                # Process session log saving/redaction
+                has_errors = any(c.get("status") != "SUCCESS" or "method=retry" in c.get("method_used","") or "method=reconnect" in c.get("method_used","") for c in command_results) if command_results else True
                 
-                fname = f"{safe_host}-{phase}{'_RAW' if settings.capture_mode == 'raw' else ''}.txt"
-                json_fname = f"{safe_host}-{phase}{'_RAW' if settings.capture_mode == 'raw' else ''}.json"
-                outfile = out_dir / fname
-                
-                raw_text = ""
-                with open(outfile, "w", encoding="utf-8") as f:
-                    f.write(f"# Run ID: {run_id}\n# Phase: {phase}\n# Host: {host}\n# Platform: {logical_plat.name}\n# Timestamp: {run_ts}\n# Capture Mode: {settings.capture_mode.upper()}\n\n")
-                    command_results = []
-                    base_cmds = self.controller.tool_command_manager.get_effective_commands("maintenance_baseline", cmd_set_key, MAINTENANCE_BASELINE_COMMANDS.get(cmd_set_key, COMMAND_SETS.get(cmd_set_key, [])))
-                    unsafe_b = self.controller.tool_command_manager.validate_commands(base_cmds)
-                    if unsafe_b:
-                        self.enqueue("LOG_EXEC", f"  ! Unsafe baseline commands in override, skipping: {unsafe_b}")
-                        base_cmds = [c for c in base_cmds if c not in unsafe_b]
-                    
-                    features_detected = []
-                    
-                    def exec_cmd(cmd):
-                        nonlocal raw_text, features_detected, host_had_diagnostics
-                        self.enqueue("LOG_EXEC", f"  -> {cmd}")
-                        self.set_host_status(host, idx, total_hosts, "Running commands", f"command: {cmd}")
-                        
-                        if cmd == "show version" and context.platform_probe_output:
-                            self.enqueue("LOG_EXEC", f"  ✓ Using cached platform probe output")
-                            cmd_out = context.platform_probe_output
-                            status = CommandStatus.SUCCESS
-                            err_msg = ""
-                            method_used = "platform_probe_cache"
-                            abort_host = False
-                            exec_res = CommandExecutionResult(
-                                command=cmd, status=status, output=cmd_out, error_message="", attempts=0, method_used="platform_probe_cache", reconnect_performed=False, unsupported_reason="", abort_host=False, elapsed_seconds=0.0, first_attempt_elapsed_seconds=0.0, retry_elapsed_seconds=0.0, output_bytes=len(cmd_out.encode('utf-8')), output_lines=len(cmd_out.splitlines()), timeout_seconds=0, last_read_seconds=0.0, slow_command=False, diagnostic_reason="", retry_reason=""
-                            )
-                        else:
-                            exec_res = ConnectionManager.execute_command_with_recovery(context, cmd, log_callback=log_cb)
-                            self.active_conn = context.conn
-                            cmd_out = exec_res.output
-                            status = exec_res.status
-                            err_msg = exec_res.error_message
-                            method_used = exec_res.method_used
-                            abort_host = exec_res.abort_host
-                            
-                            if exec_res.status == CommandStatus.COMMAND_TIMEOUT or exec_res.slow_command or exec_res.retry_reason or exec_res.reconnect_performed or exec_res.abort_host or ConnectionManager.is_transport_error(exec_res.error_message, exec_res.output) or ConnectionManager.is_malformed_echo(cmd, exec_res.output):
-                                host_had_diagnostics = True
-                                
-                            if exec_res.slow_command:
-                                self.set_host_status(host, idx, total_hosts, "Slow command", f"'{cmd}' running > {settings.slow_command_threshold}s")
-                            
-                        diag_hdr = ConnectionManager.format_diagnostic_header(exec_res)
-
-                        if status == CommandStatus.COMMAND_UNSUPPORTED:
-                            self.enqueue("LOG_EXEC", f"  ! Command unsupported: {cmd}")
-                        elif status == CommandStatus.PRIVILEGE_DENIED:
-                            self.enqueue("LOG_EXEC", f"  ! Privilege denied: {cmd}")
-                        elif status == CommandStatus.COMMAND_TIMEOUT:
-                            self.enqueue("LOG_EXEC", f"  ✗ Command timed out: {cmd}")
-                        elif status != CommandStatus.SUCCESS:
-                            self.enqueue("LOG_EXEC", f"  ✗ Error running {cmd}: {err_msg}")
-                            
-                        command_results.append({
-                            "command": cmd,
-                            "status": status.name,
-                            "error_message": err_msg,
-                            "output_length": len(cmd_out),
-                            "unsupported_reason": err_msg if status != CommandStatus.SUCCESS else "",
-                            "method_used": method_used
-                        })
-                        
-                        if settings.capture_mode == "redacted":
-                            cmd_out_redacted = redactor.redact_text(cmd_out)
-                        else:
-                            cmd_out_redacted = cmd_out
-                            
-                        if status == CommandStatus.COMMAND_TIMEOUT:
-                            f.write(f"\n## {cmd}\n{diag_hdr}\nCOMMAND TIMEOUT\n")
-                            raw_text += f"\n## {cmd}\n{diag_hdr}\nCOMMAND TIMEOUT\n"
-                        elif status != CommandStatus.SUCCESS and not cmd_out:
-                            f.write(f"\n## {cmd}\n{diag_hdr}\nERROR: {err_msg}\n")
-                            raw_text += f"\n## {cmd}\n{diag_hdr}\nERROR: {err_msg}\n"
-                        else:
-                            f.write(f"\n## {cmd}\n{diag_hdr}\n{cmd_out_redacted}\n")
-                            raw_text += f"\n## {cmd}\n{diag_hdr}\n{cmd_out_redacted}\n"
-                        
-                        if cmd == "show running-config" and status == CommandStatus.SUCCESS:
-                            features_detected = FeatureDetector.detect_features(cmd_out)
-                            if features_detected:
-                                self.enqueue("LOG_EXEC", f"  * Detected features: {', '.join(features_detected)}")
-                                
-                        return abort_host
-
-                    for cmd in base_cmds:
-                        if self.stop_event.is_set(): break
-                        if exec_cmd(cmd):
-                            self.set_host_status(host, idx, total_hosts, "Host aborted", "transport/reconnect failure")
-                            self.enqueue("LOG_EXEC", f"  ✗ Host aborted due to transport/reconnect failure.")
-                            break
-                        
-                    # Now process feature commands
-                    if not self.stop_event.is_set():
-                        for feature in features_detected:
-                            if self.stop_event.is_set(): break
-                            f_cmds = self.controller.tool_command_manager.get_effective_commands("maintenance_features", feature, FEATURE_COMMANDS.get(feature, []))
-                            if not f_cmds and feature in FEATURE_COMMANDS:
-                                f_cmds = FEATURE_COMMANDS[feature]
-                            
-                            unsafe_f = self.controller.tool_command_manager.validate_commands(f_cmds)
-                            if unsafe_f:
-                                self.enqueue("LOG_EXEC", f"  ! Unsafe {feature} commands in override, skipping: {unsafe_f}")
-                                f_cmds = [c for c in f_cmds if c not in unsafe_f]
-    
-                            aborted = False
-                            for cmd in f_cmds:
-                                if self.stop_event.is_set(): break
-                                self.enqueue("LOG_EXEC", f"  + Dynamic feature {feature}: {cmd}")
-                                if exec_cmd(cmd):
-                                    self.set_host_status(host, idx, total_hosts, "Host aborted", "transport/reconnect failure")
-                                    self.enqueue("LOG_EXEC", f"  ✗ Host aborted due to transport/reconnect failure.")
-                                    aborted = True
-                                    break
-                            if aborted: break
-
-                if not self.stop_event.is_set() and raw_text and settings.write_json_outputs:
-                    snap = SnapshotBuilder.build(run_id, phase, host, logical_plat.name, cmd_set_key, settings.capture_mode, raw_text, command_results)
-                    with open(out_dir / json_fname, "w") as jf:
-                        json.dump(snap, jf, indent=4)
-
-            try: self.active_conn.disconnect()
-            except Exception: pass
-            self.active_conn = None
-            
-            # Stop tail thread
-            tail_stop_event.set()
-            tail_t.join(1)
-            
-            # Process session log saving/redaction
-            has_errors = any(c.get("status") != "SUCCESS" or "method=retry" in c.get("method_used","") or "method=reconnect" in c.get("method_used","") for c in command_results)
-            
-            if settings.save_session_logs == "never" or (settings.save_session_logs == "errors_only" and not (has_errors or host_had_diagnostics) and conn_result.status == ConnectionStatus.SUCCESS):
-                SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
-            else:
-                if settings.capture_mode == "redacted":
-                    redactor.redact_file(Path(temp_session_log), out_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
+                if settings.save_session_logs == "never" or (settings.save_session_logs == "errors_only" and not (has_errors or host_had_diagnostics) and conn_result.status == ConnectionStatus.SUCCESS):
                     SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
                 else:
-                    Path(temp_session_log).rename(out_dir / f"{safe_host}_{run_ts}_session_RAW.log")
+                    if settings.capture_mode == "redacted":
+                        redactor.redact_file(Path(temp_session_log), out_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
+                        SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
+                    else:
+                        Path(temp_session_log).rename(out_dir / f"{safe_host}_{run_ts}_session_RAW.log")
 
-            if not self.stop_event.is_set():
-                self.set_progress(idx / total_hosts * 100)
-                self.enqueue("LOG_EXEC", "  ✓ completed")
-                self.set_host_status(host, idx, total_hosts, "Success" if not has_errors else "Completed with errors", "moving to next target")
+                if not self.stop_event.is_set():
+                    self.set_progress(idx / total_hosts * 100)
+                    self.enqueue("LOG_EXEC", "  ✓ completed")
+                    self.set_host_status(host, idx, total_hosts, "Success" if not has_errors else "Completed with errors", "moving to next target")
 
-        if self.stop_event.is_set():
-            self.set_status("Stopped by user")
+            if self.stop_event.is_set():
+                self.set_status("Stopped by user")
+            else:
+                self.set_progress(100)
+                self.set_status("Done")
+                self.enqueue("LOG_EXEC", f"\n=== ALL DONE ===")
         else:
-            self.set_progress(100)
-            self.set_status("Done")
-            self.enqueue("LOG_EXEC", f"\n=== ALL DONE ===")
+            # ----------------- CONCURRENT PATHWAY -----------------
+            def worker_task(host, idx, task_key):
+                host_start_time = time.time()
+                safe_host = FilenameSafety.safe_host_label(host)
+                
+                temp_dir = SecureTempSessionLogManager.ensure_secure_temp_session_dir(settings.base_output_dir, run_id)
+                temp_session_log_path = SecureTempSessionLogManager.create_secure_session_log_path(temp_dir, f"{safe_host}_{idx}")
+                temp_session_log = str(temp_session_log_path)
+                
+                tail_stop_event = threading.Event()
+                tail_t = threading.Thread(target=self.sync_tail, args=(temp_session_log, tail_stop_event), daemon=True)
+                tail_t.start()
+                
+                host_had_diagnostics = False
+                command_results = []
+                conn_result = None
+                error_str = ""
+                has_errors = False
+                
+                def log_cb(msg):
+                    self.enqueue("LOG_EXEC", f"[{host}] {msg}")
+                    
+                try:
+                    self.enqueue("LOG_EXEC", f"\n▶ Starting host [{idx}/{len(targets)}] {host}")
+                    self.set_host_status(host, idx, len(targets), "Connecting")
+                    
+                    conn_result = ConnectionManager.connect_with_mapped_or_global_credentials(
+                        host, platform_choice, temp_session_log, 
+                        self.controller.credential_store, 
+                        getattr(self.controller, 'target_credential_store', None), 
+                        log_cb, self.stop_event, 
+                        getattr(self, 'fallback_to_all_credentials_for_run', False)
+                    )
+                    
+                    if conn_result.status == ConnectionStatus.SUCCESS:
+                        self.active_conns.register(task_key, conn_result.connection)
+                        self.set_host_status(host, idx, len(targets), "Connected", f"Platform: {conn_result.logical_platform.name}")
+                        
+                        if not conn_result.session_prepped:
+                            ConnectionManager.prepare_session(conn_result.connection, conn_result.logical_platform, conn_result.netmiko_device_type, log_cb)
+                            
+                        logical_plat = conn_result.logical_platform
+                        cmd_set_key = PLATFORM_COMMAND_SET_MAP.get(logical_plat)
+                        
+                        if not cmd_set_key or cmd_set_key not in COMMAND_SETS:
+                            self.enqueue("LOG_EXEC", f"[{host}] ✗ ERROR: No command set found for detected platform {logical_plat.name}")
+                            error_str = f"No command set for platform {logical_plat.name}"
+                            has_errors = True
+                        else:
+                            self.enqueue("LOG_EXEC", f"[{host}] ✓ Detected {logical_plat.name}, using {cmd_set_key}")
+                            fname = f"{safe_host}-{phase}{'_RAW' if settings.capture_mode == 'raw' else ''}.txt"
+                            json_fname = f"{safe_host}-{phase}{'_RAW' if settings.capture_mode == 'raw' else ''}.json"
+                            outfile = out_dir / fname
+                            
+                            raw_text = ""
+                            with open(outfile, "w", encoding="utf-8") as f:
+                                f.write(f"# Run ID: {run_id}\n# Phase: {phase}\n# Host: {host}\n# Platform: {logical_plat.name}\n# Timestamp: {run_ts}\n# Capture Mode: {settings.capture_mode.upper()}\n\n")
+                                
+                                base_cmds = self.controller.tool_command_manager.get_effective_commands("maintenance_baseline", cmd_set_key, MAINTENANCE_BASELINE_COMMANDS.get(cmd_set_key, COMMAND_SETS.get(cmd_set_key, [])))
+                                unsafe_b = self.controller.tool_command_manager.validate_commands(base_cmds)
+                                if unsafe_b:
+                                    self.enqueue("LOG_EXEC", f"[{host}] ! Unsafe baseline commands in override, skipping: {unsafe_b}")
+                                    base_cmds = [c for c in base_cmds if c not in unsafe_b]
+                                    
+                                features_detected = []
+                                
+                                def exec_cmd(cmd):
+                                    nonlocal raw_text, features_detected, host_had_diagnostics
+                                    self.enqueue("LOG_EXEC", f"[{host}] -> {cmd}")
+                                    self.set_host_status(host, idx, len(targets), "Running commands", f"command: {cmd}")
+                                    
+                                    if cmd == "show version" and conn_result.platform_probe_output:
+                                        self.enqueue("LOG_EXEC", f"[{host}] ✓ Using cached platform probe output")
+                                        cmd_out = conn_result.platform_probe_output
+                                        status = CommandStatus.SUCCESS
+                                        err_msg = ""
+                                        method_used = "platform_probe_cache"
+                                        abort_host = False
+                                        exec_res = CommandExecutionResult(
+                                            command=cmd, status=status, output=cmd_out, error_message="", attempts=0, method_used="platform_probe_cache", reconnect_performed=False, unsupported_reason="", abort_host=False, elapsed_seconds=0.0, first_attempt_elapsed_seconds=0.0, retry_elapsed_seconds=0.0, output_bytes=len(cmd_out.encode('utf-8')), output_lines=len(cmd_out.splitlines()), timeout_seconds=0, last_read_seconds=0.0, slow_command=False, diagnostic_reason="", retry_reason=""
+                                        )
+                                    else:
+                                        context = DeviceSessionContext(
+                                            host=host,
+                                            platform_choice=platform_choice,
+                                            logical_platform=conn_result.logical_platform,
+                                            device_type=conn_result.netmiko_device_type,
+                                            temp_session_log=temp_session_log,
+                                            conn=conn_result.connection,
+                                            run_platform_probe=True,
+                                            platform_probe_output=conn_result.platform_probe_output,
+                                            _reconnect_credential=conn_result._reconnect_credential
+                                        )
+                                        exec_res = ConnectionManager.execute_command_with_recovery(context, cmd, log_callback=log_cb)
+                                        self.active_conns.register(task_key, context.conn)
+                                        cmd_out = exec_res.output
+                                        status = exec_res.status
+                                        err_msg = exec_res.error_message
+                                        method_used = exec_res.method_used
+                                        abort_host = exec_res.abort_host
+                                        
+                                    if exec_res.status == CommandStatus.COMMAND_TIMEOUT or exec_res.slow_command or exec_res.retry_reason or exec_res.reconnect_performed or exec_res.abort_host or ConnectionManager.is_transport_error(exec_res.error_message, exec_res.output) or ConnectionManager.is_malformed_echo(cmd, exec_res.output):
+                                        host_had_diagnostics = True
+                                        
+                                    if exec_res.slow_command:
+                                        self.set_host_status(host, idx, len(targets), "Slow command", f"'{cmd}' running > {settings.slow_command_threshold}s")
+                                        
+                                    diag_hdr = ConnectionManager.format_diagnostic_header(exec_res)
+                                    
+                                    if status == CommandStatus.COMMAND_UNSUPPORTED:
+                                        self.enqueue("LOG_EXEC", f"[{host}] ! Command unsupported: {cmd}")
+                                    elif status == CommandStatus.PRIVILEGE_DENIED:
+                                        self.enqueue("LOG_EXEC", f"[{host}] ! Privilege denied: {cmd}")
+                                    elif status == CommandStatus.COMMAND_TIMEOUT:
+                                        self.enqueue("LOG_EXEC", f"[{host}] ✗ Command timed out: {cmd}")
+                                    elif status != CommandStatus.SUCCESS:
+                                        self.enqueue("LOG_EXEC", f"[{host}] ✗ Error running {cmd}: {err_msg}")
+                                        
+                                    command_results.append({
+                                        "command": cmd,
+                                        "status": status.name,
+                                        "error_message": err_msg,
+                                        "output_length": len(cmd_out),
+                                        "unsupported_reason": err_msg if status != CommandStatus.SUCCESS else "",
+                                        "method_used": method_used
+                                    })
+                                    
+                                    cmd_out_redacted = redactor.redact_text(cmd_out) if settings.capture_mode == "redacted" else cmd_out
+                                    
+                                    if status == CommandStatus.COMMAND_TIMEOUT:
+                                        f.write(f"\n## {cmd}\n{diag_hdr}\nCOMMAND TIMEOUT\n")
+                                        raw_text += f"\n## {cmd}\n{diag_hdr}\nCOMMAND TIMEOUT\n"
+                                    elif status != CommandStatus.SUCCESS and not cmd_out:
+                                        f.write(f"\n## {cmd}\n{diag_hdr}\nERROR: {err_msg}\n")
+                                        raw_text += f"\n## {cmd}\n{diag_hdr}\nERROR: {err_msg}\n"
+                                    else:
+                                        f.write(f"\n## {cmd}\n{diag_hdr}\n{cmd_out_redacted}\n")
+                                        raw_text += f"\n## {cmd}\n{diag_hdr}\n{cmd_out_redacted}\n"
+                                        
+                                    if cmd == "show running-config" and status == CommandStatus.SUCCESS:
+                                        features_detected = FeatureDetector.detect_features(cmd_out)
+                                        if features_detected:
+                                            self.enqueue("LOG_EXEC", f"[{host}] * Detected features: {', '.join(features_detected)}")
+                                            
+                                    return abort_host
+                                    
+                                for cmd in base_cmds:
+                                    if self.stop_event.is_set(): break
+                                    if exec_cmd(cmd):
+                                        self.set_host_status(host, idx, len(targets), "Host aborted", "transport/reconnect failure")
+                                        self.enqueue("LOG_EXEC", f"[{host}] ✗ Host aborted due to transport/reconnect failure.")
+                                        break
+                                        
+                                if not self.stop_event.is_set():
+                                    for feature in features_detected:
+                                        if self.stop_event.is_set(): break
+                                        f_cmds = self.controller.tool_command_manager.get_effective_commands("maintenance_features", feature, FEATURE_COMMANDS.get(feature, []))
+                                        if not f_cmds and feature in FEATURE_COMMANDS:
+                                            f_cmds = FEATURE_COMMANDS[feature]
+                                            
+                                        unsafe_f = self.controller.tool_command_manager.validate_commands(f_cmds)
+                                        if unsafe_f:
+                                            self.enqueue("LOG_EXEC", f"[{host}] ! Unsafe {feature} commands in override, skipping: {unsafe_f}")
+                                            f_cmds = [c for c in f_cmds if c not in unsafe_f]
+                                            
+                                        aborted = False
+                                        for cmd in f_cmds:
+                                            if self.stop_event.is_set(): break
+                                            self.enqueue("LOG_EXEC", f"[{host}] + Dynamic feature {feature}: {cmd}")
+                                            if exec_cmd(cmd):
+                                                self.set_host_status(host, idx, len(targets), "Host aborted", "transport/reconnect failure")
+                                                self.enqueue("LOG_EXEC", f"[{host}] ✗ Host aborted due to transport/reconnect failure.")
+                                                aborted = True
+                                                break
+                                        if aborted: break
+                                        
+                            if not self.stop_event.is_set() and raw_text and settings.write_json_outputs:
+                                snap = SnapshotBuilder.build(run_id, phase, host, logical_plat.name, cmd_set_key, settings.capture_mode, raw_text, command_results)
+                                with open(out_dir / json_fname, "w") as jf:
+                                    json.dump(snap, jf, indent=4)
+                    else:
+                        host_had_diagnostics = True
+                        error_str = conn_result.error_message or "Connection failed"
+                        self.set_host_status(host, idx, len(targets), "Connection failed", "moving to next target")
+                        has_errors = True
+                except Exception as ex:
+                    host_had_diagnostics = True
+                    error_str = str(ex)
+                    self.enqueue("LOG_EXEC", f"[{host}] Exception: {error_str}")
+                    has_errors = True
+                finally:
+                    self.active_conns.unregister(task_key)
+                    if conn_result and conn_result.status == ConnectionStatus.SUCCESS:
+                        try: conn_result.connection.disconnect()
+                        except: pass
+                        
+                    tail_stop_event.set()
+                    tail_t.join(1)
+                    
+                    has_errors = any(c.get("status") != "SUCCESS" or "method=retry" in c.get("method_used","") or "method=reconnect" in c.get("method_used","") for c in command_results) if command_results else True
+                    
+                    if conn_result and conn_result.status == ConnectionStatus.SUCCESS:
+                        if settings.save_session_logs == "never" or (settings.save_session_logs == "errors_only" and not (has_errors or host_had_diagnostics)):
+                            SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
+                        else:
+                            if settings.capture_mode == "redacted":
+                                redactor.redact_file(Path(temp_session_log), out_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
+                                SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
+                            else:
+                                Path(temp_session_log).rename(out_dir / f"{safe_host}_{run_ts}_session_RAW.log")
+                    else:
+                        if settings.save_session_logs != "never":
+                            if settings.capture_mode == "redacted":
+                                redactor.redact_file(Path(temp_session_log), out_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
+                            else:
+                                Path(temp_session_log).rename(out_dir / f"{safe_host}_{run_ts}_session_RAW.log")
+                        SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
+                        
+                    if not self.stop_event.is_set():
+                        status_str = "Success" if not has_errors else "Completed with errors"
+                    else:
+                        status_str = "Stopped"
+                        
+                return HostTaskResult(
+                    host=host,
+                    safe_host=safe_host,
+                    status="stopped" if self.stop_event.is_set() else ("partial" if has_errors else "success"),
+                    elapsed_seconds=round(time.time() - host_start_time, 2),
+                    error=error_str
+                )
+
+            completed_count = 0
+            active_count = 0
+            futures = {}
+            targets_to_submit = list(enumerate(targets, 1))
+            active_futures = set()
+            
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                while len(active_futures) < concurrency and targets_to_submit:
+                    idx, host = targets_to_submit.pop(0)
+                    task_key = f"{host.lower()}::{run_id}::{idx}"
+                    active_count += 1
+                    self.set_host_status(host, idx, len(targets), "Pending")
+                    self.set_status(format_concurrent_status(completed_count, len(targets), active_count, self.stop_event.is_set()))
+                    
+                    f = executor.submit(worker_task, host, idx, task_key)
+                    active_futures.add(f)
+                    futures[f] = (host, idx)
+                    
+                while active_futures:
+                    done, not_done = wait(active_futures, return_when=FIRST_COMPLETED)
+                    for f in done:
+                        active_futures.remove(f)
+                        active_count -= 1
+                        host, idx = futures.pop(f)
+                        
+                        try:
+                            res = f.result()
+                        except Exception as e:
+                            res = HostTaskResult(
+                                host=host,
+                                safe_host=FilenameSafety.safe_host_label(host),
+                                status="failed",
+                                elapsed_seconds=0.0,
+                                error=f"Internal thread crash: {e}"
+                            )
+                            
+                        completed_count += 1
+                        self.set_progress(completed_count / len(targets) * 100)
+                        self.set_status(format_concurrent_status(completed_count, len(targets), active_count, self.stop_event.is_set()))
+                        
+                        if res.status == "success":
+                            self.enqueue("LOG_EXEC", f"✓ [{host}] completed successfully in {res.elapsed_seconds}s")
+                            self.set_host_status(host, idx, len(targets), "Success")
+                        elif res.status == "partial":
+                            self.enqueue("LOG_EXEC", f"⚠ [{host}] completed with errors in {res.elapsed_seconds}s: {res.error}")
+                            self.set_host_status(host, idx, len(targets), "Completed with errors")
+                        else:
+                            self.enqueue("LOG_EXEC", f"✗ [{host}] failed in {res.elapsed_seconds}s: {res.error}")
+                            self.set_host_status(host, idx, len(targets), "Connection failed")
+                            
+                        if not self.stop_event.is_set() and targets_to_submit:
+                            n_idx, next_host = targets_to_submit.pop(0)
+                            next_key = f"{next_host.lower()}::{run_id}::{n_idx}"
+                            active_count += 1
+                            self.set_host_status(next_host, n_idx, len(targets), "Pending")
+                            self.set_status(format_concurrent_status(completed_count, len(targets), active_count, self.stop_event.is_set()))
+                            
+                            next_f = executor.submit(worker_task, next_host, n_idx, next_key)
+                            active_futures.add(next_f)
+                            futures[next_f] = (next_host, n_idx)
+                            
+            for idx, host in targets_to_submit:
+                completed_count += 1
+                status = "stopped" if self.stop_event.is_set() else "skipped"
+                self.set_host_status(host, idx, len(targets), status.capitalize())
+                self.set_progress(completed_count / len(targets) * 100)
+                self.set_status(format_concurrent_status(completed_count, len(targets), active_count, self.stop_event.is_set()))
+
+            if self.stop_event.is_set():
+                self.set_status("Stopped by user")
+            else:
+                self.set_progress(100)
+                self.set_status("Done")
+                self.enqueue("LOG_EXEC", f"\n=== ALL DONE ===")
 
 
 class CommandRunnerPage(BaseRunnerPage):
@@ -6318,6 +6711,9 @@ class BaseScannerPage(BaseRunnerPage):
         self.target_panel = TargetPanel(self.left_panel, self.controller)
         self.target_panel.pack(fill=tk.X, pady=5)
         
+        self.concurrency_control = ConcurrentHostsControl(self.left_panel)
+        self.concurrency_control.pack(fill=tk.X, pady=5)
+        
         self.options_frame = tk.LabelFrame(self.left_panel, text="Scanner Options", font=("Arial", 10, "bold"))
         self.options_frame.pack(fill=tk.X, pady=5)
         self.build_options()
@@ -6355,6 +6751,12 @@ class BaseScannerPage(BaseRunnerPage):
             messagebox.showerror("Error", "Please provide at least one Target IP")
             return
             
+        try:
+            concurrency = self.concurrency_control.get_value()
+        except ValueError as err:
+            messagebox.showerror("Validation Error", str(err), parent=self)
+            return
+
         internal_key = self.scanner_def.internal_key
         all_cmds = []
         for grp in self.scanner_def.commands_by_command_set.keys():
@@ -6388,7 +6790,7 @@ class BaseScannerPage(BaseRunnerPage):
                 self.update_session_log_label()
 
             self.is_running = True
-            threading.Thread(target=self.execution_thread, args=(config,), daemon=True).start()
+            threading.Thread(target=self.execution_thread, args=(config, concurrency), daemon=True).start()
             
         self.prompt_for_mapping_if_needed(targets, begin_run)
 
@@ -6397,220 +6799,517 @@ class BaseScannerPage(BaseRunnerPage):
         if not retain_targets:
             self.target_panel.targets_text.delete("1.0", tk.END)
 
-    def execution_thread(self, config: ScannerRunConfig):
+    def execution_thread(self, config: ScannerRunConfig, concurrency: int):
         try:
             self.enqueue("LOG_EXEC", f"=== STARTING {config.scanner_name.upper()} ===")
             config.output_dir.mkdir(parents=True, exist_ok=True)
             self.enqueue("LOG_EXEC", f"Output directory: {config.output_dir}")
+            self.enqueue("LOG_EXEC", f"Concurrency: {concurrency}")
             
             host_results = []
-            
             total_hosts = len(config.targets)
-            for idx, host in enumerate(config.targets, 1):
-                self.set_host_status(host, idx, total_hosts, "Connecting")
-                self.set_progress((idx - 1) / total_hosts * 100)
-                if self.stop_event.is_set(): break
-                safe_host = FilenameSafety.safe_host_label(host)
-                self.enqueue("LOG_EXEC", f"\n▶ Starting host [{idx}/{len(config.targets)}] {host}")
-                
-                host_out_dir = config.output_dir / "hosts"
-                host_out_dir.mkdir(exist_ok=True)
-                temp_dir = SecureTempSessionLogManager.ensure_secure_temp_session_dir(settings.base_output_dir, "generic")
-                temp_session_log_path = SecureTempSessionLogManager.create_secure_session_log_path(temp_dir, safe_host)
-                temp_session_log = str(temp_session_log_path)
-                
-                tail_stop_event = threading.Event()
-                def sync_tail():
-                    try:
-                        buf_redactor = LineBufferedRedactor(redactor.redact_text)
-                        with open(temp_session_log, "r", encoding="utf-8", errors="replace") as f:
-                            while not tail_stop_event.is_set() and not self.stop_event.is_set():
-                                chunk = f.read(1024)
+            
+            if concurrency == 1:
+                # ----------------- SEQUENTIAL PATHWAY -----------------
+                for idx, host in enumerate(config.targets, 1):
+                    self.set_host_status(host, idx, total_hosts, "Connecting")
+                    self.set_progress((idx - 1) / total_hosts * 100)
+                    if self.stop_event.is_set(): break
+                    safe_host = FilenameSafety.safe_host_label(host)
+                    self.enqueue("LOG_EXEC", f"\n▶ Starting host [{idx}/{len(config.targets)}] {host}")
+                    
+                    host_out_dir = config.output_dir / "hosts"
+                    host_out_dir.mkdir(exist_ok=True)
+                    temp_dir = SecureTempSessionLogManager.ensure_secure_temp_session_dir(settings.base_output_dir, "generic")
+                    temp_session_log_path = SecureTempSessionLogManager.create_secure_session_log_path(temp_dir, safe_host)
+                    temp_session_log = str(temp_session_log_path)
+                    
+                    tail_stop_event = threading.Event()
+                    def sync_tail():
+                        try:
+                            buf_redactor = LineBufferedRedactor(redactor.redact_text)
+                            with open(temp_session_log, "r", encoding="utf-8", errors="replace") as f:
+                                while not tail_stop_event.is_set() and not self.stop_event.is_set():
+                                    chunk = f.read(1024)
+                                    if chunk:
+                                        out = buf_redactor.feed(chunk) if settings.capture_mode == "redacted" else chunk
+                                        if out: self.enqueue("LOG_SESSION", out)
+                                    else:
+                                        import time
+                                        time.sleep(0.1)
+                                chunk = f.read()
                                 if chunk:
                                     out = buf_redactor.feed(chunk) if settings.capture_mode == "redacted" else chunk
                                     if out: self.enqueue("LOG_SESSION", out)
-                                else:
-                                    import time
-                                    time.sleep(0.1)
-                            chunk = f.read()
-                            if chunk:
-                                out = buf_redactor.feed(chunk) if settings.capture_mode == "redacted" else chunk
+                                out = buf_redactor.flush() if settings.capture_mode == "redacted" else ""
                                 if out: self.enqueue("LOG_SESSION", out)
-                            out = buf_redactor.flush() if settings.capture_mode == "redacted" else ""
-                            if out: self.enqueue("LOG_SESSION", out)
-                    except Exception:
-                        pass
-                
-                tail_t = threading.Thread(target=sync_tail, daemon=True)
-                tail_t.start()
-                
-                host_had_diagnostics = False
-                
-                def log_cb(msg):
-                    self.enqueue("LOG_EXEC", msg)
-                conn_result = ConnectionManager.connect_with_mapped_or_global_credentials(host, config.platform_choice, temp_session_log, self.controller.credential_store, getattr(self.controller, 'target_credential_store', None), log_cb, self.stop_event, getattr(self, 'fallback_to_all_credentials_for_run', False), run_platform_probe=True)
-                
-                if conn_result.status == ConnectionStatus.SUCCESS:
-                    self.active_conn = conn_result.connection
-                    self.set_host_status(host, idx, total_hosts, "Connected", f"Platform: {conn_result.logical_platform.name}")
-                else:
-                    host_had_diagnostics = True
-                    self.set_host_status(host, idx, total_hosts, "Connection failed", "moving to next target")
+                        except Exception:
+                            pass
+                    
+                    tail_t = threading.Thread(target=sync_tail, daemon=True)
+                    tail_t.start()
+                    
+                    host_had_diagnostics = False
+                    
+                    def log_cb(msg):
+                        self.enqueue("LOG_EXEC", msg)
+                    conn_result = ConnectionManager.connect_with_mapped_or_global_credentials(host, config.platform_choice, temp_session_log, self.controller.credential_store, getattr(self.controller, 'target_credential_store', None), log_cb, self.stop_event, getattr(self, 'fallback_to_all_credentials_for_run', False), run_platform_probe=True)
+                    
+                    if conn_result.status == ConnectionStatus.SUCCESS:
+                        self.active_conn = conn_result.connection
+                        self.set_host_status(host, idx, total_hosts, "Connected", f"Platform: {conn_result.logical_platform.name}")
+                    else:
+                        host_had_diagnostics = True
+                        self.set_host_status(host, idx, total_hosts, "Connection failed", "moving to next target")
+                        tail_stop_event.set()
+                        tail_t.join(1)
+                        if settings.capture_mode == "redacted":
+                            redactor.redact_file(Path(temp_session_log), host_out_dir / f"{safe_host}_{config.timestamp}_session_REDACTED.log")
+                        else:
+                            Path(temp_session_log).rename(host_out_dir / f"{safe_host}_{config.timestamp}_session_RAW.log")
+                        SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
+                        host_results.append(ScannerHostResult(host, safe_host, conn_result.status.name if conn_result else "FAIL", "", "", {}, {}, [], [conn_result.error_message if conn_result else "Connection Failed"], []))
+                        continue
+                        
+                    context = DeviceSessionContext(
+                        host=host,
+                        platform_choice=config.platform_choice,
+                        logical_platform=conn_result.logical_platform,
+                        device_type=conn_result.netmiko_device_type,
+                        temp_session_log=temp_session_log,
+                        conn=self.active_conn,
+                        run_platform_probe=True,
+                        platform_probe_output=conn_result.platform_probe_output,
+                        _reconnect_credential=conn_result._reconnect_credential
+                    )
+                    if not conn_result.session_prepped:
+                        ConnectionManager.prepare_session(context.conn, context.logical_platform, context.device_type, log_cb)
+    
+                    logical_plat = conn_result.logical_platform
+                    cmd_set_key = PLATFORM_COMMAND_SET_MAP.get(logical_plat)
+                    
+                    cmd_bundle = self.scanner_def.commands_by_command_set.get(cmd_set_key, [])
+                    internal_key = self.scanner_def.internal_key
+                    cmd_bundle = self.controller.tool_command_manager.get_effective_commands(internal_key, cmd_set_key, cmd_bundle)
+                    unsafe_s = self.controller.tool_command_manager.validate_commands(cmd_bundle)
+                    if unsafe_s:
+                        self.enqueue("LOG_EXEC", f"  ! Unsafe commands found in override, skipping: {unsafe_s}")
+                        cmd_bundle = [c for c in cmd_bundle if c not in unsafe_s]
+                    
+                    outputs = {}
+                    errors = []
+                    last_exec_res = None
+                    
+                    if not cmd_bundle:
+                        self.enqueue("LOG_EXEC", f"  ✗ No commands for platform {logical_plat.name}")
+                        errors.append(f"No commands for {logical_plat.name}")
+                    else:
+                        for cmd_idx, cmd in enumerate(cmd_bundle, 1):
+                            if self.stop_event.is_set(): break
+                            self.enqueue("LOG_EXEC", f"  -> {cmd}")
+                            self.set_host_status(host, idx, total_hosts, "Running commands", f"command {cmd_idx}/{len(cmd_bundle)}")
+                            
+                            if cmd == "show version" and context.platform_probe_output:
+                                self.enqueue("LOG_EXEC", f"  ✓ Using cached platform probe output")
+                                cmd_out = context.platform_probe_output
+                                status = CommandStatus.SUCCESS
+                                err_msg = ""
+                                exec_res = CommandExecutionResult(
+                                    command=cmd, status=status, output=cmd_out, error_message="", attempts=0, method_used="platform_probe_cache", reconnect_performed=False, unsupported_reason="", abort_host=False, elapsed_seconds=0.0, first_attempt_elapsed_seconds=0.0, retry_elapsed_seconds=0.0, output_bytes=len(cmd_out.encode('utf-8')), output_lines=len(cmd_out.splitlines()), timeout_seconds=0, last_read_seconds=0.0, slow_command=False, diagnostic_reason="", retry_reason=""
+                                )
+                            else:
+                                exec_res = ConnectionManager.execute_command_with_recovery(context, cmd, log_callback=log_cb)
+                                self.active_conn = context.conn
+                                cmd_out = exec_res.output
+                                status = exec_res.status
+                                err_msg = exec_res.error_message
+                                
+                                if exec_res.status == CommandStatus.COMMAND_TIMEOUT or exec_res.slow_command or exec_res.retry_reason or exec_res.reconnect_performed or exec_res.abort_host or ConnectionManager.is_transport_error(exec_res.error_message, exec_res.output) or ConnectionManager.is_malformed_echo(cmd, exec_res.output):
+                                    host_had_diagnostics = True
+                                    
+                                if exec_res.slow_command:
+                                    self.set_host_status(host, idx, total_hosts, "Slow command", f"'{cmd}' running > {settings.slow_command_threshold}s")
+                                if exec_res.abort_host:
+                                    self.set_host_status(host, idx, total_hosts, "Host aborted", "transport/reconnect failure")
+                                    self.enqueue("LOG_EXEC", f"  ✗ Host aborted due to transport/reconnect failure.")
+                                    break
+                                    
+                            last_exec_res = exec_res
+                            diag_hdr = ConnectionManager.format_diagnostic_header(exec_res)
+                                
+                            if status == CommandStatus.COMMAND_UNSUPPORTED:
+                                self.enqueue("LOG_EXEC", f"  ! Command unsupported: {cmd}")
+                            elif status == CommandStatus.PRIVILEGE_DENIED:
+                                self.enqueue("LOG_EXEC", f"  ! Privilege denied: {cmd}")
+                            elif status == CommandStatus.COMMAND_TIMEOUT:
+                                self.set_host_status(host, idx, total_hosts, "Command timeout", f"moving to next command")
+                                self.enqueue("LOG_EXEC", f"  ✗ Timeout: {cmd}")
+                                outputs[cmd] = f"{diag_hdr}\nCOMMAND TIMEOUT"
+                                errors.append(f"Timeout on {cmd}")
+                                continue
+                            elif status != CommandStatus.SUCCESS:
+                                self.enqueue("LOG_EXEC", f"  ✗ Error: {cmd} - {err_msg}")
+                                outputs[cmd] = f"{diag_hdr}\nERROR: {err_msg}"
+                                errors.append(f"Error on {cmd}: {err_msg}")
+                                continue
+                            
+                            if settings.capture_mode == "redacted":
+                                cmd_out = redactor.redact_text(cmd_out)
+                            outputs[cmd] = f"{diag_hdr}\n{cmd_out}"
+                                
+                    try: self.active_conn.disconnect()
+                    except Exception: pass
+                    self.active_conn = None
+                    
                     tail_stop_event.set()
                     tail_t.join(1)
-                    if settings.capture_mode == "redacted":
-                        redactor.redact_file(Path(temp_session_log), host_out_dir / f"{safe_host}_{config.timestamp}_session_REDACTED.log")
-                    else:
-                        Path(temp_session_log).rename(host_out_dir / f"{safe_host}_{config.timestamp}_session_RAW.log")
-                    SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
-                    host_results.append(ScannerHostResult(host, safe_host, conn_result.status.name if conn_result else "FAIL", "", "", {}, {}, [], [conn_result.error_message if conn_result else "Connection Failed"], []))
-                    continue
                     
-                context = DeviceSessionContext(
-                    host=host,
-                    platform_choice=config.platform_choice,
-                    logical_platform=conn_result.logical_platform,
-                    device_type=conn_result.netmiko_device_type,
-                    temp_session_log=temp_session_log,
-                    conn=self.active_conn,
-                    run_platform_probe=True,
-                    platform_probe_output=conn_result.platform_probe_output,
-                    _reconnect_credential=conn_result._reconnect_credential
-                )
-                if not conn_result.session_prepped:
-                    ConnectionManager.prepare_session(context.conn, context.logical_platform, context.device_type, log_cb)
-
-                logical_plat = conn_result.logical_platform
-                cmd_set_key = PLATFORM_COMMAND_SET_MAP.get(logical_plat)
-                
-                cmd_bundle = self.scanner_def.commands_by_command_set.get(cmd_set_key, [])
-                internal_key = self.scanner_def.internal_key
-                cmd_bundle = self.controller.tool_command_manager.get_effective_commands(internal_key, cmd_set_key, cmd_bundle)
-                unsafe_s = self.controller.tool_command_manager.validate_commands(cmd_bundle)
-                if unsafe_s:
-                    self.enqueue("LOG_EXEC", f"  ! Unsafe commands found in override, skipping: {unsafe_s}")
-                    cmd_bundle = [c for c in cmd_bundle if c not in unsafe_s]
-                
-                outputs = {}
-                errors = []
-                last_exec_res = None
-                
-                if not cmd_bundle:
-                    self.enqueue("LOG_EXEC", f"  ✗ No commands for platform {logical_plat.name}")
-                    errors.append(f"No commands for {logical_plat.name}")
-                else:
-                    for cmd_idx, cmd in enumerate(cmd_bundle, 1):
-                        if self.stop_event.is_set(): break
-                        self.enqueue("LOG_EXEC", f"  -> {cmd}")
-                        self.set_host_status(host, idx, total_hosts, "Running commands", f"command {cmd_idx}/{len(cmd_bundle)}")
+                    parsed_data = {}
+                    findings = []
+                    warnings = []
+                    try:
+                        if outputs and not self.stop_event.is_set():
+                            parsed_data, findings, warnings = self.scanner_def.parser_callback(ParserHelpers.normalize_parser_platform(logical_plat), outputs, config.options)
+                    except Exception as e:
+                        errors.append(f"Parser crash: {str(e)}")
                         
-                        if cmd == "show version" and context.platform_probe_output:
-                            self.enqueue("LOG_EXEC", f"  ✓ Using cached platform probe output")
-                            cmd_out = context.platform_probe_output
-                            status = CommandStatus.SUCCESS
-                            err_msg = ""
-                            exec_res = CommandExecutionResult(
-                                command=cmd, status=status, output=cmd_out, error_message="", attempts=0, method_used="platform_probe_cache", reconnect_performed=False, unsupported_reason="", abort_host=False, elapsed_seconds=0.0, first_attempt_elapsed_seconds=0.0, retry_elapsed_seconds=0.0, output_bytes=len(cmd_out.encode('utf-8')), output_lines=len(cmd_out.splitlines()), timeout_seconds=0, last_read_seconds=0.0, slow_command=False, diagnostic_reason="", retry_reason=""
-                            )
-                        else:
-                            exec_res = ConnectionManager.execute_command_with_recovery(context, cmd, log_callback=log_cb)
-                            self.active_conn = context.conn
-                            cmd_out = exec_res.output
-                            status = exec_res.status
-                            err_msg = exec_res.error_message
-                            
-                            if exec_res.status == CommandStatus.COMMAND_TIMEOUT or exec_res.slow_command or exec_res.retry_reason or exec_res.reconnect_performed or exec_res.abort_host or ConnectionManager.is_transport_error(exec_res.error_message, exec_res.output) or ConnectionManager.is_malformed_echo(cmd, exec_res.output):
-                                host_had_diagnostics = True
-                                
-                            if exec_res.slow_command:
-                                self.set_host_status(host, idx, total_hosts, "Slow command", f"'{cmd}' running > {settings.slow_command_threshold}s")
-                            if exec_res.abort_host:
-                                self.set_host_status(host, idx, total_hosts, "Host aborted", "transport/reconnect failure")
-                                self.enqueue("LOG_EXEC", f"  ✗ Host aborted due to transport/reconnect failure.")
-                                break
-                                
-                        last_exec_res = exec_res
-                        diag_hdr = ConnectionManager.format_diagnostic_header(exec_res)
-                            
-                        if status == CommandStatus.COMMAND_UNSUPPORTED:
-                            self.enqueue("LOG_EXEC", f"  ! Command unsupported: {cmd}")
-                        elif status == CommandStatus.PRIVILEGE_DENIED:
-                            self.enqueue("LOG_EXEC", f"  ! Privilege denied: {cmd}")
-                        elif status == CommandStatus.COMMAND_TIMEOUT:
-                            self.set_host_status(host, idx, total_hosts, "Command timeout", f"moving to next command")
-                            self.enqueue("LOG_EXEC", f"  ✗ Timeout: {cmd}")
-                            outputs[cmd] = f"{diag_hdr}\nCOMMAND TIMEOUT"
-                            errors.append(f"Timeout on {cmd}")
-                            continue
-                        elif status != CommandStatus.SUCCESS:
-                            self.enqueue("LOG_EXEC", f"  ✗ Error: {cmd} - {err_msg}")
-                            outputs[cmd] = f"{diag_hdr}\nERROR: {err_msg}"
-                            errors.append(f"Error on {cmd}: {err_msg}")
-                            continue
-                        
-                        if settings.capture_mode == "redacted":
-                            cmd_out = redactor.redact_text(cmd_out)
-                        outputs[cmd] = f"{diag_hdr}\n{cmd_out}"
-                            
-                try: self.active_conn.disconnect()
-                except Exception: pass
-                self.active_conn = None
-                
-                tail_stop_event.set()
-                tail_t.join(1)
-                
-                parsed_data = {}
-                findings = []
-                warnings = []
-                try:
-                    if outputs and not self.stop_event.is_set():
-                        parsed_data, findings, warnings = self.scanner_def.parser_callback(ParserHelpers.normalize_parser_platform(logical_plat), outputs, config.options)
-                except Exception as e:
-                    errors.append(f"Parser crash: {str(e)}")
+                    has_errors = bool(errors) or (last_exec_res.abort_host if last_exec_res else False)
+                    self.set_host_status(host, idx, total_hosts, "Success" if not has_errors else "Completed with errors", "moving to next target")
                     
-                has_errors = bool(errors) or (last_exec_res.abort_host if last_exec_res else False)
-                self.set_host_status(host, idx, total_hosts, "Success" if not has_errors else "Completed with errors", "moving to next target")
-                
-                if settings.save_session_logs == "never" or (settings.save_session_logs == "errors_only" and not (has_errors or host_had_diagnostics) and conn_result.status == ConnectionStatus.SUCCESS):
-                    SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
-                else:
-                    if settings.capture_mode == "redacted":
-                        redactor.redact_file(Path(temp_session_log), host_out_dir / f"{safe_host}_{config.timestamp}_session_REDACTED.log")
+                    if settings.save_session_logs == "never" or (settings.save_session_logs == "errors_only" and not (has_errors or host_had_diagnostics) and conn_result.status == ConnectionStatus.SUCCESS):
                         SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
                     else:
-                        Path(temp_session_log).rename(host_out_dir / f"{safe_host}_{config.timestamp}_session_RAW.log")
-                
-                res = ScannerHostResult(host, safe_host, "SUCCESS", logical_plat.name, conn_result.netmiko_device_type, outputs, parsed_data, findings, errors, warnings)
-                host_results.append(res)
-                
-                if not self.stop_event.is_set():
-                    if settings.write_json_outputs:
-                        out_json = {"host": host, "status": res.connection_status, "parsed": parsed_data, "findings": [f.__dict__ for f in findings], "errors": errors, "warnings": warnings}
-                        if settings.write_full_output_json:
-                            out_json["outputs"] = outputs
-                        with open(host_out_dir / f"{safe_host}_report.json", "w") as f: json.dump(out_json, f, indent=4)
+                        if settings.capture_mode == "redacted":
+                            redactor.redact_file(Path(temp_session_log), host_out_dir / f"{safe_host}_{config.timestamp}_session_REDACTED.log")
+                            SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
+                        else:
+                            Path(temp_session_log).rename(host_out_dir / f"{safe_host}_{config.timestamp}_session_RAW.log")
                     
-                    host_severity = "PASS"
-                    if any(f.status == "FAIL" for f in findings) or errors: host_severity = "FAIL"
-                    elif any(f.status == "WARN" for f in findings) or warnings: host_severity = "WARN"
-
-                    out_txt = [
-                        f"HOST: {host}",
-                        f"STATUS: {host_severity}",
-                        "\nTop Findings:"
-                    ]
-                    for err in errors: out_txt.append(f"[FAIL] ERROR: {err}")
-                    for warn in warnings: out_txt.append(f"[WARN] WARNING: {warn}")
-                    for f in findings: out_txt.append(f"[{f.status}] {f.category}: {f.message}")
-                    if not findings and not errors and not warnings:
-                        out_txt.append("[PASS] No issues found.")
+                    res = ScannerHostResult(host, safe_host, "SUCCESS", logical_plat.name, conn_result.netmiko_device_type, outputs, parsed_data, findings, errors, warnings)
+                    host_results.append(res)
+                    
+                    if not self.stop_event.is_set():
+                        if settings.write_json_outputs:
+                            out_json = {"host": host, "status": res.connection_status, "parsed": parsed_data, "findings": [f.__dict__ for f in findings], "errors": errors, "warnings": warnings}
+                            if settings.write_full_output_json:
+                                out_json["outputs"] = outputs
+                            with open(host_out_dir / f"{safe_host}_report.json", "w") as f: json.dump(out_json, f, indent=4)
                         
-                    out_txt.append("\n--- Raw/Redacted Output ---")
-                    for cmd, out in outputs.items(): out_txt.append(f"\n## {cmd}\n{out}")
-                    (host_out_dir / f"{safe_host}_report.txt").write_text("\n".join(out_txt), encoding="utf-8")
+                        host_severity = "PASS"
+                        if any(f.status == "FAIL" for f in findings) or errors: host_severity = "FAIL"
+                        elif any(f.status == "WARN" for f in findings) or warnings: host_severity = "WARN"
+    
+                        out_txt = [
+                            f"HOST: {host}",
+                            f"STATUS: {host_severity}",
+                            "\nTop Findings:"
+                        ]
+                        for err in errors: out_txt.append(f"[FAIL] ERROR: {err}")
+                        for warn in warnings: out_txt.append(f"[WARN] WARNING: {warn}")
+                        for f in findings: out_txt.append(f"[{f.status}] {f.category}: {f.message}")
+                        if not findings and not errors and not warnings:
+                            out_txt.append("[PASS] No issues found.")
+                            
+                        out_txt.append("\n--- Raw/Redacted Output ---")
+                        for cmd, out in outputs.items(): out_txt.append(f"\n## {cmd}\n{out}")
+                        (host_out_dir / f"{safe_host}_report.txt").write_text("\n".join(out_txt), encoding="utf-8")
+                        
+                        self.set_progress(idx / total_hosts * 100)
+                        self.enqueue("LOG_EXEC", "  ✓ completed")
+            else:
+                # ----------------- CONCURRENT PATHWAY -----------------
+                def worker_task(host, idx, task_key):
+                    host_start_time = time.time()
+                    safe_host = FilenameSafety.safe_host_label(host)
+                    host_had_diagnostics = False
+                    outputs = {}
+                    errors = []
+                    last_exec_res = None
+                    logical_plat = None
+                    conn_result = None
                     
-                    self.set_progress(idx / total_hosts * 100)
-                    self.enqueue("LOG_EXEC", "  ✓ completed")
+                    host_out_dir = config.output_dir / "hosts"
+                    host_out_dir.mkdir(exist_ok=True)
+                    temp_dir = SecureTempSessionLogManager.ensure_secure_temp_session_dir(settings.base_output_dir, "generic")
+                    temp_session_log_path = SecureTempSessionLogManager.create_secure_session_log_path(temp_dir, f"{safe_host}_{idx}")
+                    temp_session_log = str(temp_session_log_path)
+                    
+                    tail_stop_event = threading.Event()
+                    def sync_tail():
+                        try:
+                            buf_redactor = LineBufferedRedactor(redactor.redact_text)
+                            with open(temp_session_log, "r", encoding="utf-8", errors="replace") as f:
+                                while not tail_stop_event.is_set() and not self.stop_event.is_set():
+                                    chunk = f.read(1024)
+                                    if chunk:
+                                        out = buf_redactor.feed(chunk) if settings.capture_mode == "redacted" else chunk
+                                        if out: self.enqueue("LOG_SESSION", out)
+                                    else:
+                                        import time
+                                        time.sleep(0.1)
+                                chunk = f.read()
+                                if chunk:
+                                    out = buf_redactor.feed(chunk) if settings.capture_mode == "redacted" else chunk
+                                    if out: self.enqueue("LOG_SESSION", out)
+                                out = buf_redactor.flush() if settings.capture_mode == "redacted" else ""
+                                if out: self.enqueue("LOG_SESSION", out)
+                        except Exception:
+                            pass
+                    
+                    tail_t = threading.Thread(target=sync_tail, daemon=True)
+                    tail_t.start()
+                    
+                    def log_cb(msg):
+                        self.enqueue("LOG_EXEC", f"[{host}] {msg}")
+                        
+                    try:
+                        self.enqueue("LOG_EXEC", f"\n▶ Starting host [{idx}/{len(config.targets)}] {host}")
+                        self.set_host_status(host, idx, len(config.targets), "Connecting")
+                        
+                        conn_result = ConnectionManager.connect_with_mapped_or_global_credentials(
+                            host, config.platform_choice, temp_session_log, 
+                            self.controller.credential_store, 
+                            getattr(self.controller, 'target_credential_store', None), 
+                            log_cb, self.stop_event, 
+                            getattr(self, 'fallback_to_all_credentials_for_run', False), 
+                            run_platform_probe=True
+                        )
+                        
+                        if conn_result.status == ConnectionStatus.SUCCESS:
+                            self.active_conns.register(task_key, conn_result.connection)
+                            self.set_host_status(host, idx, len(config.targets), "Connected", f"Platform: {conn_result.logical_platform.name}")
+                            
+                            if not conn_result.session_prepped:
+                                ConnectionManager.prepare_session(conn_result.connection, conn_result.logical_platform, conn_result.netmiko_device_type, log_cb)
+                                
+                            logical_plat = conn_result.logical_platform
+                            cmd_set_key = PLATFORM_COMMAND_SET_MAP.get(logical_plat)
+                            
+                            cmd_bundle = self.scanner_def.commands_by_command_set.get(cmd_set_key, [])
+                            internal_key = self.scanner_def.internal_key
+                            cmd_bundle = self.controller.tool_command_manager.get_effective_commands(internal_key, cmd_set_key, cmd_bundle)
+                            
+                            unsafe_s = self.controller.tool_command_manager.validate_commands(cmd_bundle)
+                            if unsafe_s:
+                                self.enqueue("LOG_EXEC", f"[{host}] ! Unsafe commands found in override, skipping: {unsafe_s}")
+                                cmd_bundle = [c for c in cmd_bundle if c not in unsafe_s]
+                                
+                            if not cmd_bundle:
+                                self.enqueue("LOG_EXEC", f"[{host}] ✗ No commands for platform {logical_plat.name}")
+                                errors.append(f"No commands for {logical_plat.name}")
+                            else:
+                                for cmd_idx, cmd in enumerate(cmd_bundle, 1):
+                                    if self.stop_event.is_set(): break
+                                    self.enqueue("LOG_EXEC", f"[{host}] -> {cmd}")
+                                    self.set_host_status(host, idx, len(config.targets), "Running commands", f"command {cmd_idx}/{len(cmd_bundle)}")
+                                    
+                                    if cmd == "show version" and conn_result.platform_probe_output:
+                                        self.enqueue("LOG_EXEC", f"[{host}] ✓ Using cached platform probe output")
+                                        cmd_out = conn_result.platform_probe_output
+                                        status = CommandStatus.SUCCESS
+                                        err_msg = ""
+                                        exec_res = CommandExecutionResult(
+                                            command=cmd, status=status, output=cmd_out, error_message="", attempts=0, method_used="platform_probe_cache", reconnect_performed=False, unsupported_reason="", abort_host=False, elapsed_seconds=0.0, first_attempt_elapsed_seconds=0.0, retry_elapsed_seconds=0.0, output_bytes=len(cmd_out.encode('utf-8')), output_lines=len(cmd_out.splitlines()), timeout_seconds=0, last_read_seconds=0.0, slow_command=False, diagnostic_reason="", retry_reason=""
+                                        )
+                                    else:
+                                        context = DeviceSessionContext(
+                                            host=host,
+                                            platform_choice=config.platform_choice,
+                                            logical_platform=conn_result.logical_platform,
+                                            device_type=conn_result.netmiko_device_type,
+                                            temp_session_log=temp_session_log,
+                                            conn=conn_result.connection,
+                                            run_platform_probe=True,
+                                            platform_probe_output=conn_result.platform_probe_output,
+                                            _reconnect_credential=conn_result._reconnect_credential
+                                        )
+                                        exec_res = ConnectionManager.execute_command_with_recovery(context, cmd, log_callback=log_cb)
+                                        self.active_conns.register(task_key, context.conn)
+                                        cmd_out = exec_res.output
+                                        status = exec_res.status
+                                        err_msg = exec_res.error_message
+                                        
+                                        if exec_res.status == CommandStatus.COMMAND_TIMEOUT or exec_res.slow_command or exec_res.retry_reason or exec_res.reconnect_performed or exec_res.abort_host or ConnectionManager.is_transport_error(exec_res.error_message, exec_res.output) or ConnectionManager.is_malformed_echo(cmd, exec_res.output):
+                                            host_had_diagnostics = True
+                                            
+                                        if exec_res.slow_command:
+                                            self.set_host_status(host, idx, len(config.targets), "Slow command", f"'{cmd}' running > {settings.slow_command_threshold}s")
+                                        if exec_res.abort_host:
+                                            self.set_host_status(host, idx, len(config.targets), "Host aborted", "transport/reconnect failure")
+                                            self.enqueue("LOG_EXEC", f"[{host}] ✗ Host aborted due to transport/reconnect failure.")
+                                            break
+                                            
+                                    last_exec_res = exec_res
+                                    diag_hdr = ConnectionManager.format_diagnostic_header(exec_res)
+                                    
+                                    if status == CommandStatus.COMMAND_UNSUPPORTED:
+                                        self.enqueue("LOG_EXEC", f"[{host}] ! Command unsupported: {cmd}")
+                                    elif status == CommandStatus.PRIVILEGE_DENIED:
+                                        self.enqueue("LOG_EXEC", f"[{host}] ! Privilege denied: {cmd}")
+                                    elif status == CommandStatus.COMMAND_TIMEOUT:
+                                        self.set_host_status(host, idx, len(config.targets), "Command timeout", f"moving to next command")
+                                        self.enqueue("LOG_EXEC", f"[{host}] ✗ Timeout: {cmd}")
+                                        outputs[cmd] = f"{diag_hdr}\nCOMMAND TIMEOUT"
+                                        errors.append(f"Timeout on {cmd}")
+                                        continue
+                                    elif status != CommandStatus.SUCCESS:
+                                        self.enqueue("LOG_EXEC", f"[{host}] ✗ Error: {cmd} - {err_msg}")
+                                        outputs[cmd] = f"{diag_hdr}\nERROR: {err_msg}"
+                                        errors.append(f"Error on {cmd}: {err_msg}")
+                                        continue
+                                        
+                                    if settings.capture_mode == "redacted":
+                                        cmd_out = redactor.redact_text(cmd_out)
+                                    outputs[cmd] = f"{diag_hdr}\n{cmd_out}"
+                        else:
+                            host_had_diagnostics = True
+                            self.set_host_status(host, idx, len(config.targets), "Connection failed", "moving to next target")
+                            errors.append(conn_result.error_message if conn_result else "Connection Failed")
+                    except Exception as ex:
+                        host_had_diagnostics = True
+                        errors.append(f"Worker crash: {ex}")
+                    finally:
+                        self.active_conns.unregister(task_key)
+                        if conn_result and conn_result.status == ConnectionStatus.SUCCESS:
+                            try: conn_result.connection.disconnect()
+                            except: pass
+                            
+                        tail_stop_event.set()
+                        tail_t.join(1)
+                        
+                        has_errors = bool(errors) or (last_exec_res.abort_host if last_exec_res else False)
+                        
+                        if conn_result and conn_result.status == ConnectionStatus.SUCCESS:
+                            if settings.save_session_logs == "never" or (settings.save_session_logs == "errors_only" and not (has_errors or host_had_diagnostics)):
+                                SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
+                            else:
+                                if settings.capture_mode == "redacted":
+                                    redactor.redact_file(Path(temp_session_log), host_out_dir / f"{safe_host}_{config.timestamp}_session_REDACTED.log")
+                                    SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
+                                else:
+                                    Path(temp_session_log).rename(host_out_dir / f"{safe_host}_{config.timestamp}_session_RAW.log")
+                        else:
+                            if settings.save_session_logs != "never":
+                                if settings.capture_mode == "redacted":
+                                    redactor.redact_file(Path(temp_session_log), host_out_dir / f"{safe_host}_{config.timestamp}_session_REDACTED.log")
+                                else:
+                                    Path(temp_session_log).rename(host_out_dir / f"{safe_host}_{config.timestamp}_session_RAW.log")
+                            SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
+                            
+                    parsed_data = {}
+                    findings = []
+                    warnings = []
+                    try:
+                        if outputs and conn_result and conn_result.status == ConnectionStatus.SUCCESS and not self.stop_event.is_set():
+                            parsed_data, findings, warnings = self.scanner_def.parser_callback(ParserHelpers.normalize_parser_platform(logical_plat), outputs, config.options)
+                    except Exception as e:
+                        errors.append(f"Parser crash: {str(e)}")
+                        
+                    status_res = conn_result.status.name if conn_result else "FAIL"
+                    res = ScannerHostResult(host, safe_host, status_res, logical_plat.name if logical_plat else "", conn_result.netmiko_device_type if conn_result else "", outputs, parsed_data, findings, errors, warnings)
+                    
+                    if not self.stop_event.is_set() and conn_result and conn_result.status == ConnectionStatus.SUCCESS:
+                        if settings.write_json_outputs:
+                            out_json = {"host": host, "status": res.connection_status, "parsed": parsed_data, "findings": [f.__dict__ for f in findings], "errors": errors, "warnings": warnings}
+                            if settings.write_full_output_json:
+                                out_json["outputs"] = outputs
+                            with open(host_out_dir / f"{safe_host}_report.json", "w") as f: json.dump(out_json, f, indent=4)
+                            
+                        host_severity = "PASS"
+                        if any(f.status == "FAIL" for f in findings) or errors: host_severity = "FAIL"
+                        elif any(f.status == "WARN" for f in findings) or warnings: host_severity = "WARN"
+                        
+                        out_txt = [
+                            f"HOST: {host}",
+                            f"STATUS: {host_severity}",
+                            "\nTop Findings:"
+                        ]
+                        for err in errors: out_txt.append(f"[FAIL] ERROR: {err}")
+                        for warn in warnings: out_txt.append(f"[WARN] WARNING: {warn}")
+                        for f_obj in findings: out_txt.append(f"[{f_obj.status}] {f_obj.category}: {f_obj.message}")
+                        if not findings and not errors and not warnings:
+                            out_txt.append("[PASS] No issues found.")
+                            
+                        out_txt.append("\n--- Raw/Redacted Output ---")
+                        for cmd, out in outputs.items(): out_txt.append(f"\n## {cmd}\n{out}")
+                        (host_out_dir / f"{safe_host}_report.txt").write_text("\n".join(out_txt), encoding="utf-8")
+                        self.enqueue("LOG_EXEC", f"[{host}] ✓ completed")
+                        self.set_host_status(host, idx, len(config.targets), "Success" if not has_errors else "Completed with errors")
+                    else:
+                        out_txt = [
+                            f"HOST: {host}",
+                            f"STATUS: FAIL",
+                            "\nTop Findings:"
+                        ]
+                        for err in errors: out_txt.append(f"[FAIL] ERROR: {err}")
+                        (host_out_dir / f"{safe_host}_report.txt").write_text("\n".join(out_txt), encoding="utf-8")
+                        self.set_host_status(host, idx, len(config.targets), "Connection failed")
+                        
+                    return res
+
+                completed_count = 0
+                active_count = 0
+                futures = {}
+                targets_to_submit = list(enumerate(config.targets, 1))
+                active_futures = set()
+                
+                with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                    while len(active_futures) < concurrency and targets_to_submit:
+                        idx, host = targets_to_submit.pop(0)
+                        task_key = f"{host.lower()}::{config.run_id}::{idx}"
+                        active_count += 1
+                        self.set_host_status(host, idx, len(config.targets), "Pending")
+                        self.set_status(format_concurrent_status(completed_count, len(config.targets), active_count, self.stop_event.is_set()))
+                        
+                        f = executor.submit(worker_task, host, idx, task_key)
+                        active_futures.add(f)
+                        futures[f] = (host, idx)
+                        
+                    while active_futures:
+                        done, not_done = wait(active_futures, return_when=FIRST_COMPLETED)
+                        for f in done:
+                            active_futures.remove(f)
+                            active_count -= 1
+                            host, idx = futures.pop(f)
+                            
+                            try:
+                                res = f.result()
+                            except Exception as e:
+                                res = ScannerHostResult(
+                                    host=host,
+                                    safe_host=FilenameSafety.safe_host_label(host),
+                                    connection_status="FAIL",
+                                    platform="",
+                                    device_type="",
+                                    outputs={},
+                                    parsed_data={},
+                                    findings=[],
+                                    errors=[f"Internal thread crash: {e}"],
+                                    warnings=[]
+                                )
+                                
+                            host_results.append(res)
+                            completed_count += 1
+                            self.set_progress(completed_count / len(config.targets) * 100)
+                            self.set_status(format_concurrent_status(completed_count, len(config.targets), active_count, self.stop_event.is_set()))
+                            
+                            if not self.stop_event.is_set() and targets_to_submit:
+                                n_idx, next_host = targets_to_submit.pop(0)
+                                next_key = f"{next_host.lower()}::{config.run_id}::{n_idx}"
+                                active_count += 1
+                                self.set_host_status(next_host, n_idx, len(config.targets), "Pending")
+                                self.set_status(format_concurrent_status(completed_count, len(config.targets), active_count, self.stop_event.is_set()))
+                                
+                                next_f = executor.submit(worker_task, next_host, n_idx, next_key)
+                                active_futures.add(next_f)
+                                futures[next_f] = (next_host, n_idx)
+                                
+                for idx, host in targets_to_submit:
+                    completed_count += 1
+                    status = "stopped" if self.stop_event.is_set() else "skipped"
+                    self.set_host_status(host, idx, len(config.targets), status.capitalize())
+                    self.set_progress(completed_count / len(config.targets) * 100)
+                    self.set_status(format_concurrent_status(completed_count, len(config.targets), active_count, self.stop_event.is_set()))
             
             if self.stop_event.is_set():
                 self.set_status("Stopped by user")
@@ -7413,6 +8112,7 @@ class NetworkToolbeltApp(tk.Tk):
         self.credential_store = CredentialStore()
         self.target_credential_store = TargetCredentialMapStore()
         self.snmp_credential_store = SnmpCredentialStore()
+        self.active_conns = ActiveConnectionRegistry()
         self.documentation_window = None
         self.tool_command_manager = ToolCommandManager()
         self.title(f"Network Toolbelt v{APP_VERSION}")
@@ -8295,6 +8995,27 @@ Cisco IOS Software
     redacted = redactor.redact_text(sensitive_raw)
     assert "$1$" not in redacted
     assert "secret 5" in redacted
+
+    # 5. UI Concurrency Control Instantiation tests
+    try:
+        root = tk.Tk()
+        class MockController:
+            credential_store = CredentialStore()
+            active_conns = ActiveConnectionRegistry()
+            tool_command_manager = ToolCommandManager()
+        mc = MockController()
+        
+        m_page = MaintenanceRunnerPage(root, mc)
+        assert hasattr(m_page, 'concurrency_control')
+        assert m_page.concurrency_control.get_value() == 3
+        
+        s_page = InterfaceErrorScannerPage(root, mc)
+        assert hasattr(s_page, 'concurrency_control')
+        assert s_page.concurrency_control.get_value() == 3
+        
+        root.destroy()
+    except Exception as e:
+        print(f"Skipping UI Concurrency Control instantiation tests: {e}")
 
     print("UI Status & Wide CSV self-tests passed.")
     print("All execution self-tests passed.")

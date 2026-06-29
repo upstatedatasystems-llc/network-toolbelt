@@ -1,6 +1,6 @@
 # Network Toolbelt System Manifest
 
-**Version:** 3.2  
+**Version:** 3.3  
 **Primary Application File:** `network-toolbelt.pyw`  
 **Project Name:** Network Toolbelt  
 **Current Focus:** Cisco/Netmiko-optimized network operations utility and SNMP OID Scanner  
@@ -248,6 +248,8 @@ Important classes include:
 - `CredentialManagerPage`
 - `CredentialStatusPanel`
 - `TargetPanel`
+- `ConcurrentHostsControl`
+- `ActiveConnectionRegistry`
 - `BaseRunnerPage`
 - `MaintenanceRunnerPage`
 - `CommandRunnerPage`
@@ -326,7 +328,7 @@ This reduces accidental path traversal or invalid filesystem characters.
 
 ---
 
-## 7. Threading and UI Queue Model
+## 7. Threading, Concurrency, and UI Queue Model
 
 Tkinter must not be updated directly from background threads.
 
@@ -342,6 +344,18 @@ Network Toolbelt uses a queue-based UI update pattern:
 8. Main thread updates logs, buttons, status, and progress safely.
 
 This pattern is used by runner pages, scanner pages, and mapper workflows.
+
+### Concurrent Host Execution (v3.3)
+
+All SSH-based runner and scanner pages support concurrent host execution using `ThreadPoolExecutor` with bounded submission:
+
+- A `ConcurrentHostsControl` spinbox (range 1–20, default 3) lets users select parallelism.
+- Hosts are submitted to worker threads up to `max_workers`, with new hosts dispatched as previous ones complete using `wait(return_when=FIRST_COMPLETED)`.
+- Each worker creates its own Netmiko session — no sessions are shared across threads.
+- Active connections are tracked in `ActiveConnectionRegistry` for thread-safe STOP teardown.
+- When concurrency is set to 1, the original sequential pathway is used unchanged.
+- Credential Mapper defaults to 3 concurrent hosts to protect AAA servers.
+- SNMP Scanner defaults to 5 concurrent hosts.
 
 ---
 
@@ -657,10 +671,14 @@ Then verify:
 
 ## 16. Current Version Summary
 
-Network Toolbelt v3.2 includes:
+Network Toolbelt v3.3 includes:
 
-- **Static UI Status Prefix**: Added a visible static `Status:` prefix label before runner and mapper status messages.
-- **Improved Mapping Progress**: Standardized and improved credential mapping execution progress, ensuring completed counts show finished hosts, and showing the host currently mapping.
-- **On-the-fly Wide CSV Streaming**: Generates `command_outputs_wide.csv` on the fly as hosts complete Generic Command Runner execution, with columns mapped by command index to prevent duplicate command header collisions.
-- **Spreadsheet Formula Safety**: Protections against formula injection (`=`, `+`, `-`, `@`) for metadata/error cells, while keeping command outputs intact after redaction.
-- **Wide CSV Self-Tests**: Automated self-tests verifying status formatting, unique duplicate headers, formula safety, row quoting, and redaction verification.
+- **Concurrent Host Execution**: All SSH-based runners, scanners, and the credential mapper support parallel host connections via `ThreadPoolExecutor` with bounded submission and `FIRST_COMPLETED` wait.
+- **ConcurrentHostsControl Widget**: Spinbox control (1–20, default 3) integrated into Maintenance Runner, all SSH Scanners, and Credential Mapper sidebars.
+- **ActiveConnectionRegistry**: Thread-safe connection tracking with `register()`, `unregister()`, and `disconnect_all()` for clean STOP teardown.
+- **Host-Prefixed Logging**: Concurrent execution logs are tagged with `[host_ip]` for per-host visibility.
+- **Sequential Preservation**: Setting concurrency to 1 routes through the original sequential pathway.
+- **SNMP Concurrency**: SNMP OID Scanner uses the same concurrency pattern with a default of 5.
+- **Static UI Status Prefix**: Visible static `Status:` prefix label before runner and mapper status messages.
+- **On-the-fly Wide CSV Streaming**: Generates `command_outputs_wide.csv` on the fly as hosts complete Generic Command Runner execution.
+- **Spreadsheet Formula Safety**: Protections against formula injection for metadata/error cells.
