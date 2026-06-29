@@ -6,6 +6,22 @@ Network Toolbelt is currently a single-file Python/Tkinter desktop utility optim
 
 ---
 
+## v2.94 - Export Overhaul and Run Filtering
+
+### Summary
+
+v2.94 introduces a comprehensive overhaul of the file export system. All export options are now grouped under a nested "Export Operations" submenu. Added three new run session export features allowing filtering by Run ID, including zipping single sessions, merging single sessions, and extracting host command outputs only.
+
+### Added
+
+- **Export Operations Submenu**: Grouped all export actions under a single, nested `File -> Export Operations` cascade menu.
+- **Run Session Selection Dialog**: Added a high-quality dialog using `ttk.Treeview` listing all completed runs inside the output directory sorted by modification time.
+- **Export Selected Run (ZIP)**: Bulk exports all generated logs and outputs of a single chosen run session as a ZIP.
+- **Export Selected Run (Unified TXT)**: Merges all output files belonging to a chosen run session into one text file.
+- **Export Command Outputs Only**: Extracts only the host command execution outputs (excluding internal logs/summaries) from a chosen run session, presenting them cleanly sorted by host with clear border dividers.
+
+---
+
 ## v2.93 - UI Polish and Cleanups
 
 ### Summary

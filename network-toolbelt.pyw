@@ -209,7 +209,7 @@ class ScannerDefinition:
 # Constants and Settings
 # ============================================================
 
-APP_VERSION = "2.93"
+APP_VERSION = "2.94"
 
 @dataclass
 class DocumentationSection:
@@ -5758,6 +5758,105 @@ class SmallMappingProgressDialog(tk.Toplevel):
             if self.is_running:
                 self.after(100, self.process_queue)
 
+def find_run_sessions(base_dir: Path):
+    sessions = []
+    if not base_dir.exists():
+        return sessions
+    
+    # 1. Command_Runner
+    cr_dir = base_dir / "Command_Runner"
+    if cr_dir.is_dir():
+        for p in cr_dir.iterdir():
+            if p.is_dir() and not p.name.startswith("."):
+                sessions.append(("Generic Command Runner", p.name, p))
+                
+    # 2. Maintenance_Runner
+    mr_dir = base_dir / "Maintenance_Runner"
+    if mr_dir.is_dir():
+        for p in mr_dir.iterdir():
+            if p.is_dir() and not p.name.startswith("."):
+                sessions.append(("Maintenance Runner", p.name, p))
+                
+    # 3. Scanners
+    sc_dir = base_dir / "Scanners"
+    if sc_dir.is_dir():
+        for scanner_dir in sc_dir.iterdir():
+            if scanner_dir.is_dir() and not scanner_dir.name.startswith("."):
+                for p in scanner_dir.iterdir():
+                    if p.is_dir() and not p.name.startswith("."):
+                        sessions.append((f"Scanner: {scanner_dir.name}", p.name, p))
+                        
+    # Sort sessions by modified time descending (newest first)
+    try:
+        sessions.sort(key=lambda s: s[2].stat().st_mtime, reverse=True)
+    except Exception:
+        pass
+    return sessions
+
+class RunSessionSelectionDialog(tk.Toplevel):
+    def __init__(self, parent, sessions):
+        super().__init__(parent)
+        self.title("Select Run Session")
+        self.geometry("650x400")
+        self.transient(parent)
+        self.grab_set()
+        self.sessions = sessions
+        self.selected_session = None
+        
+        if hasattr(parent, "apply_theme_to_widget"):
+            parent.apply_theme_to_widget(self)
+            
+        tk.Label(self, text="Select a Run Session for Export:", font=("Arial", 12, "bold")).pack(pady=10)
+        
+        tree_frame = tk.Frame(self)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=5)
+        
+        columns = ("tool", "run_id", "mtime")
+        self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
+        self.tree.heading("tool", text="Tool / Scanner")
+        self.tree.heading("run_id", text="Run ID")
+        self.tree.heading("mtime", text="Last Modified")
+        
+        self.tree.column("tool", width=250, anchor="w")
+        self.tree.column("run_id", width=200, anchor="center")
+        self.tree.column("mtime", width=150, anchor="center")
+        
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
+        
+        for idx, (tool, run_id, path) in enumerate(self.sessions):
+            try:
+                mtime_epoch = path.stat().st_mtime
+                mtime_str = datetime.fromtimestamp(mtime_epoch).strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                mtime_str = "Unknown"
+            self.tree.insert("", "end", iid=str(idx), values=(tool, run_id, mtime_str))
+            
+        self.tree.bind("<Double-1>", lambda event: self.do_select())
+            
+        btn_frame = tk.Frame(self)
+        btn_frame.pack(pady=15)
+        
+        tk.Button(btn_frame, text="Select", width=12, command=self.do_select).pack(side=tk.LEFT, padx=10)
+        tk.Button(btn_frame, text="Cancel", width=12, command=self.destroy).pack(side=tk.LEFT, padx=10)
+        
+    def do_select(self):
+        selected_item = self.tree.selection()
+        if selected_item:
+            idx = int(selected_item[0])
+            self.selected_session = self.sessions[idx]
+            self.destroy()
+        else:
+            messagebox.showwarning("Selection Required", "Please select a run session from the list.")
+
 # ============================================================
 # Main App
 # ============================================================
@@ -5805,8 +5904,15 @@ class NetworkToolbeltApp(tk.Tk):
         file_menu.add_command(label="Credential Manager & Library", command=lambda: self.show_frame("CredentialManagerLibraryPage"))
 
         file_menu.add_separator()
-        file_menu.add_command(label="Export Output Folder as ZIP...", command=self.export_zip)
-        file_menu.add_command(label="Export Text Outputs as Merged TXT...", command=self.export_merged_txt)
+        
+        export_menu = tk.Menu(file_menu, tearoff=0)
+        export_menu.add_command(label="Bulk Export: Output Directory (ZIP)", command=self.export_zip)
+        export_menu.add_command(label="Bulk Export: Output Directory (Unified TXT)", command=self.export_merged_txt)
+        export_menu.add_command(label="Session Export: Selected Run (ZIP)", command=self.export_run_zip)
+        export_menu.add_command(label="Session Export: Selected Run (Unified TXT)", command=self.export_run_unified_txt)
+        export_menu.add_command(label="Session Export: Command Outputs Only", command=self.export_run_command_outputs_only)
+        
+        file_menu.add_cascade(label="Export Operations", menu=export_menu)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.quit)
         menubar.add_cascade(label="File", menu=file_menu)
@@ -5958,6 +6064,202 @@ class NetworkToolbeltApp(tk.Tk):
             messagebox.showinfo("Success", f"Merged TXT exported successfully to:\n{save_path}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to create Merged TXT:\n{str(e)}")
+
+    def get_selected_run_session(self):
+        sessions = find_run_sessions(settings.base_output_dir)
+        if not sessions:
+            messagebox.showinfo("No Sessions Found", "No tool run sessions were found in the output directory.")
+            return None
+        
+        dlg = RunSessionSelectionDialog(self, sessions)
+        self.wait_window(dlg)
+        return dlg.selected_session
+
+    def export_run_zip(self):
+        selected = self.get_selected_run_session()
+        if not selected:
+            return
+        
+        tool_name, run_id, path = selected
+        
+        warn = f"Security Warning: The run session folder may contain sensitive data.\n\nAre you sure you want to export the run '{run_id}' ({tool_name}) to a ZIP?"
+        if not messagebox.askyesno("Export Warning", warn):
+            return
+            
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".zip",
+            filetypes=[("ZIP files", "*.zip")],
+            title="Save Run Session as ZIP",
+            initialfile=f"NetworkToolbelt_Run_{run_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        )
+        
+        if not save_path: return
+        
+        import zipfile
+        try:
+            target_save_path = Path(save_path).resolve()
+            with zipfile.ZipFile(save_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for root, dirs, files in os.walk(path):
+                    if '__pycache__' in dirs: dirs.remove('__pycache__')
+                    if '.temp_sessions' in dirs: dirs.remove('.temp_sessions')
+                    for f in files:
+                        if f == '.DS_Store' or f.startswith('.tmp_'): continue
+                        fpath = Path(root) / f
+                        if fpath.resolve() == target_save_path: continue
+                        arcname = fpath.relative_to(path)
+                        zf.write(fpath, arcname)
+            messagebox.showinfo("Success", f"Run session exported successfully to:\n{save_path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create ZIP:\n{str(e)}")
+
+    def export_run_unified_txt(self):
+        selected = self.get_selected_run_session()
+        if not selected:
+            return
+            
+        tool_name, run_id, path = selected
+        
+        warn = f"Security Warning: The run session folder may contain sensitive data.\n\nAre you sure you want to export the run '{run_id}' ({tool_name}) as a merged text file?"
+        if not messagebox.askyesno("Export Warning", warn):
+            return
+            
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt")],
+            title="Save Run Session Unified TXT",
+            initialfile=f"NetworkToolbelt_Run_{run_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        )
+        
+        if not save_path: return
+        
+        ext_to_include = {".txt", ".csv", ".md", ".log"}
+        
+        try:
+            target_save_path = Path(save_path).resolve()
+            with open(save_path, 'w', encoding="utf-8", errors="replace") as out:
+                out.write(f"===== NETWORK TOOLBELT UNIFIED RUN EXPORT =====\n")
+                out.write(f"Run ID: {run_id}\n")
+                out.write(f"Tool: {tool_name}\n")
+                out.write(f"Exported At: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                
+                for root, dirs, files in os.walk(path):
+                    if '__pycache__' in dirs: dirs.remove('__pycache__')
+                    if '.temp_sessions' in dirs: dirs.remove('.temp_sessions')
+                    for f in files:
+                        if f == '.DS_Store' or f.startswith('.tmp_'): continue
+                        fpath = Path(root) / f
+                        if fpath.resolve() == target_save_path: continue
+                        if fpath.suffix.lower() not in ext_to_include: continue
+                        
+                        mtime = datetime.fromtimestamp(fpath.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+                        rel_path = fpath.relative_to(path)
+                        
+                        out.write(f"##### BEGIN {rel_path} | file timestamp {mtime} #####\n")
+                        try:
+                            content = fpath.read_text(encoding="utf-8", errors="replace")
+                            out.write(content)
+                            if not content.endswith('\n'):
+                                out.write('\n')
+                        except Exception as e:
+                            out.write(f"[Error reading file: {str(e)}]\n")
+                        out.write(f"##### END {rel_path} | file timestamp {mtime} #####\n\n")
+                        
+            messagebox.showinfo("Success", f"Run session unified TXT exported successfully to:\n{save_path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create Unified TXT:\n{str(e)}")
+
+    def export_run_command_outputs_only(self):
+        selected = self.get_selected_run_session()
+        if not selected:
+            return
+            
+        tool_name, run_id, path = selected
+        
+        warn = f"Security Warning: The export file will contain command outputs which may contain sensitive data.\n\nAre you sure you want to export only the command outputs of the run '{run_id}' ({tool_name})?"
+        if not messagebox.askyesno("Export Warning", warn):
+            return
+            
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt")],
+            title="Save Command Outputs Only",
+            initialfile=f"NetworkToolbelt_Run_{run_id}_CommandOutputs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        )
+        
+        if not save_path: return
+        
+        try:
+            # Discover all host text files
+            host_files = []
+            for root, dirs, files in os.walk(path):
+                if '__pycache__' in dirs: dirs.remove('__pycache__')
+                if '.temp_sessions' in dirs: dirs.remove('.temp_sessions')
+                for f in files:
+                    if f.endswith(".txt") and f not in ("summary.txt", "index.txt", "scanner_summary.txt"):
+                        host_files.append(Path(root) / f)
+            
+            if not host_files:
+                messagebox.showinfo("No Command Outputs", "No host command output files (.txt) were found in this run session.")
+                return
+                
+            # Sort files so they are in alphabetical order of host names
+            # Helper to extract clean host label for sorting
+            import re
+            def get_sort_key(fpath):
+                rel = fpath.relative_to(path)
+                name = fpath.stem.replace("_RAW", "").replace("_REDACTED", "")
+                parts = list(rel.parts)
+                if len(parts) > 1 and parts[0] in ("pre", "post"):
+                    name = name.replace("-pre", "").replace("-post", "")
+                elif len(parts) > 1 and parts[0] == "hosts":
+                    name = name.replace("_report", "")
+                m = re.match(r"(.+)_\d{6}$", name)
+                if m:
+                    name = m.group(1)
+                return name.lower()
+                
+            host_files.sort(key=get_sort_key)
+            
+            with open(save_path, 'w', encoding="utf-8", errors="replace") as out:
+                out.write(f"===== NETWORK TOOLBELT COMMAND OUTPUTS ONLY =====\n")
+                out.write(f"Run ID: {run_id}\n")
+                out.write(f"Tool: {tool_name}\n")
+                out.write(f"Exported At: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                out.write(f"Total Hosts: {len(host_files)}\n")
+                out.write(f"=================================================\n\n")
+                
+                for fpath in host_files:
+                    rel = fpath.relative_to(path)
+                    name = fpath.stem.replace("_RAW", "").replace("_REDACTED", "")
+                    parts = list(rel.parts)
+                    category_label = ""
+                    if len(parts) > 1 and parts[0] in ("pre", "post"):
+                        name = name.replace("-pre", "").replace("-post", "")
+                        category_label = f" ({parts[0]})"
+                    elif len(parts) > 1 and parts[0] == "hosts":
+                        name = name.replace("_report", "")
+                    else:
+                        m = re.match(r"(.+)_\d{6}$", name)
+                        if m:
+                            name = m.group(1)
+                            
+                    host_label = f"{name}{category_label}"
+                    
+                    out.write(f"============================================================\n")
+                    out.write(f"HOST: {host_label}\n")
+                    out.write(f"============================================================\n")
+                    try:
+                        content = fpath.read_text(encoding="utf-8", errors="replace")
+                        out.write(content)
+                        if not content.endswith('\n'):
+                            out.write('\n')
+                    except Exception as e:
+                        out.write(f"[Error reading output: {str(e)}]\n")
+                    out.write("\n\n")
+                    
+            messagebox.showinfo("Success", f"Command outputs exported successfully to:\n{save_path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export command outputs:\n{str(e)}")
 
     def show_general_info(self):
         self.open_documentation("General Information")
