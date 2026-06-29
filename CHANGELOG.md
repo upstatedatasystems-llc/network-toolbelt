@@ -6,6 +6,27 @@ Network Toolbelt is currently a single-file Python/Tkinter desktop utility optim
 
 ---
 
+## v3.1 - SNMP OID Scanner Integration
+
+### Summary
+
+v3.1 introduces a new SNMP OID Scanner page and SNMP Credential Manager page utilizing PySNMP 7. This allows read-only OID scanning over a list of host targets using multiple volatile credential types (SNMPv1, SNMPv2c, and SNMPv3) with dynamic credential testing/probing. Redactor rules were corrected and expanded to securely mask SNMP community configurations and SNMPv3 keys. Added spec-based PyInstaller build configuration with automated validation script.
+
+### Added
+
+- **SNMP OID Scanner Page**: Direct runner page allowing target inputs, OIDs (numeric validation), version selection (Dynamic / Auto or Force mode), and dynamic order prioritization.
+- **SNMP Credential Manager Page**: Full CRUD manager for volatile SNMPv1, SNMPv2c, and SNMPv3 credentials. Password and protocol keys are masked and safely preserved on edit.
+- **Dynamic Credential Probing**: Automatically probes credentials against `sysObjectID.0` (1.3.6.1.2.1.1.2.0) and `sysUpTime.0` (1.3.6.1.2.1.1.3.0) to dynamically select the best working configuration.
+- **PyInstaller spec-based build path**: Hidden imports collect submodules for `pysnmp`, `pyasn1`, and `cryptography` automatically for standalone releases.
+- **Build script (`build.ps1`)**: Handles PyInstaller spec execution, portable ZIP packaging, and post-build verification tests.
+
+### Fixed
+
+- **Redactor regex replacements**: Corrected replacement backreferences in `tacacs_radius_nested`, `snmpv3_auth_priv`, and `snmpv3_auth_only` rules where control characters were used instead of regex backreferences.
+- **Expanded SNMP Redaction**: Added rules to securely mask community strings and authentication/privacy keys from captured config files and logs.
+
+---
+
 ## v2.94 - Export Overhaul and Run Filtering
 
 ### Summary

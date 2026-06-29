@@ -46,6 +46,8 @@ Long-term direction:
 - Python 3.14.2 or compatible Python 3.x.
 - Tkinter.
 - Netmiko.
+- PySNMP (for SNMP scanning).
+- Cryptography.
 - SSH reachability to target devices.
 
 Install dependencies:
@@ -54,10 +56,10 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-If a requirements file is not present, install Netmiko directly:
+If a requirements file is not present, install Netmiko and PySNMP directly:
 
 ```bash
-pip install netmiko
+pip install netmiko pysnmp cryptography
 ```
 
 Run the app:

@@ -35,6 +35,250 @@ except ImportError:
     sys.exit(1)
 
 
+# --- SNMP (optional) ---------------------------------------------------
+_PYSNMP_AVAILABLE = False
+try:
+    from pysnmp.hlapi.v3arch.asyncio import (
+        get_cmd,
+        SnmpEngine,
+        CommunityData,
+        UsmUserData,
+        UdpTransportTarget,
+        ContextData,
+        ObjectType,
+        ObjectIdentity,
+        USM_AUTH_NONE,
+        USM_AUTH_HMAC96_MD5,
+        USM_AUTH_HMAC96_SHA,
+        USM_AUTH_HMAC128_SHA224,
+        USM_AUTH_HMAC192_SHA256,
+        USM_AUTH_HMAC256_SHA384,
+        USM_AUTH_HMAC384_SHA512,
+        USM_PRIV_NONE,
+        USM_PRIV_CBC56_DES,
+        USM_PRIV_CFB128_AES,
+        USM_PRIV_CFB192_AES,
+        USM_PRIV_CFB256_AES,
+    )
+    _PYSNMP_AVAILABLE = True
+except ImportError:
+    pass
+
+AUTH_PROTOCOLS = {
+    "NONE": USM_AUTH_NONE if _PYSNMP_AVAILABLE else None,
+    "MD5 (legacy)": USM_AUTH_HMAC96_MD5 if _PYSNMP_AVAILABLE else None,
+    "SHA": USM_AUTH_HMAC96_SHA if _PYSNMP_AVAILABLE else None,
+    "SHA224": USM_AUTH_HMAC128_SHA224 if _PYSNMP_AVAILABLE else None,
+    "SHA256": USM_AUTH_HMAC192_SHA256 if _PYSNMP_AVAILABLE else None,
+    "SHA384": USM_AUTH_HMAC256_SHA384 if _PYSNMP_AVAILABLE else None,
+    "SHA512": USM_AUTH_HMAC384_SHA512 if _PYSNMP_AVAILABLE else None,
+}
+
+PRIV_PROTOCOLS = {
+    "NONE": USM_PRIV_NONE if _PYSNMP_AVAILABLE else None,
+    "DES (legacy)": USM_PRIV_CBC56_DES if _PYSNMP_AVAILABLE else None,
+    "AES": USM_PRIV_CFB128_AES if _PYSNMP_AVAILABLE else None,
+    "AES128": USM_PRIV_CFB128_AES if _PYSNMP_AVAILABLE else None,
+    "AES192": USM_PRIV_CFB192_AES if _PYSNMP_AVAILABLE else None,
+    "AES256": USM_PRIV_CFB256_AES if _PYSNMP_AVAILABLE else None,
+}
+
+_OID_PATTERN = re.compile(r"^\.?[0-9]+(\.[0-9]+)+$")
+
+def validate_snmp_oid(oid: str) -> Tuple[bool, str]:
+    oid = oid.strip()
+    if not oid:
+        return False, "OID is empty"
+    if not _OID_PATTERN.match(oid):
+        return False, f"Invalid OID: {oid!r} — only numeric dotted notation accepted"
+    if not oid.startswith("."):
+        oid = "." + oid
+    return True, oid
+
+@dataclass
+class SnmpCredentialRecord:
+    id: str
+    label: str
+    version: str              # "v1", "v2c", "v3"
+    security_level: str       # "community", "noAuthNoPriv", "authNoPriv", "authPriv"
+    community: str = ""       # v1/v2c only — SENSITIVE
+    username: str = ""        # v3 only
+    auth_key: str = ""        # v3 authNoPriv/authPriv — SENSITIVE
+    priv_key: str = ""        # v3 authPriv — SENSITIVE
+    auth_protocol: str = ""   # "MD5 (legacy)", "SHA", etc.
+    priv_protocol: str = ""   # "DES (legacy)", "AES", etc.
+    port: int = 161
+    timeout: float = 2.0
+    retries: int = 1
+    enabled: bool = True
+    created_at: str = ""
+
+    def safe_display(self) -> str:
+        status_str = "enabled" if self.enabled else "disabled"
+        if self.version in ("v1", "v2c"):
+            return f"{self.label} — SNMP{self.version} — port {self.port} — {status_str}"
+        else:
+            proto_info = ""
+            if self.security_level == "authNoPriv":
+                proto_info = f" — {self.auth_protocol.split()[0]}"
+            elif self.security_level == "authPriv":
+                proto_info = f" — {self.auth_protocol.split()[0]}/{self.priv_protocol.split()[0]}"
+            return f"{self.label} — SNMPv3 {self.security_level} — user {self.username}{proto_info} — port {self.port} — {status_str}"
+
+    def sort_priority(self) -> int:
+        if self.version == "v3":
+            if self.security_level == "authPriv":
+                return 1
+            if self.security_level == "authNoPriv":
+                return 2
+            return 3
+        if self.version == "v2c":
+            return 4
+        return 5
+
+@dataclass
+class SnmpOidResult:
+    oid: str
+    status: str            # "success", "error", "timeout", "noSuchObject", "noSuchInstance"
+    value: str = ""
+    value_type: str = ""
+    error_message: str = ""
+    error_category: str = ""  # "transport", "auth", "timeout", "snmp_error", "oid_missing", "exception"
+    raw_error_safe: str = ""
+    elapsed_seconds: float = 0.0
+
+@dataclass
+class SnmpHostResult:
+    host: str
+    host_status: str         # "success", "partial", "failed", "skipped", "stopped"
+    snmp_mode: str
+    snmp_version_used: str   # "v1", "v2c", "v3", or ""
+    security_level_used: str
+    credential_label: str
+    credential_id: str
+    oid_results: List[SnmpOidResult] = field(default_factory=list)
+    error_message: str = ""
+    elapsed_seconds: float = 0.0
+
+class SnmpCredentialStore:
+    def __init__(self):
+        self._credentials: List[SnmpCredentialRecord] = []
+
+    def count(self) -> int:
+        return len(self._credentials)
+
+    def enabled_count(self) -> int:
+        return sum(1 for c in self._credentials if c.enabled)
+
+    def add_v1_v2c(self, label, version, community, port=161, timeout=2.0, retries=1, enabled=True) -> SnmpCredentialRecord:
+        import uuid
+        cred = SnmpCredentialRecord(
+            id=str(uuid.uuid4()),
+            label=label,
+            version=version,
+            security_level="community",
+            community=community,
+            port=port,
+            timeout=timeout,
+            retries=retries,
+            enabled=enabled,
+            created_at=datetime.now().isoformat()
+        )
+        self._credentials.append(cred)
+        return cred
+
+    def add_v3(self, label, username, security_level, auth_key="", priv_key="",
+               auth_protocol="", priv_protocol="", port=161, timeout=2.0, retries=1, enabled=True) -> SnmpCredentialRecord:
+        import uuid
+        cred = SnmpCredentialRecord(
+            id=str(uuid.uuid4()),
+            label=label,
+            version="v3",
+            security_level=security_level,
+            username=username,
+            auth_key=auth_key,
+            priv_key=priv_key,
+            auth_protocol=auth_protocol,
+            priv_protocol=priv_protocol,
+            port=port,
+            timeout=timeout,
+            retries=retries,
+            enabled=enabled,
+            created_at=datetime.now().isoformat()
+        )
+        self._credentials.append(cred)
+        return cred
+
+    def update(self, cred_id, **kwargs) -> bool:
+        cred = self.get_by_id(cred_id)
+        if not cred:
+            return False
+        for k, v in kwargs.items():
+            if k in ("community", "auth_key", "priv_key") and v == "":
+                continue
+            if hasattr(cred, k):
+                setattr(cred, k, v)
+        return True
+
+    def delete(self, cred_id) -> bool:
+        for idx, c in enumerate(self._credentials):
+            if c.id == cred_id:
+                self._credentials.pop(idx)
+                return True
+        return False
+
+    def clear(self):
+        self._credentials.clear()
+
+    def get_by_id(self, cred_id) -> Optional[SnmpCredentialRecord]:
+        for c in self._credentials:
+            if c.id == cred_id:
+                return c
+        return None
+
+    def index_of_id(self, cred_id) -> int:
+        for idx, c in enumerate(self._credentials):
+            if c.id == cred_id:
+                return idx
+        return -1
+
+    def list_safe(self) -> List[str]:
+        return [c.safe_display() for c in self._credentials]
+
+    def all_safe_records(self) -> List[dict]:
+        records = []
+        for c in self._credentials:
+            records.append({
+                "id": c.id,
+                "label": c.label,
+                "version": c.version,
+                "security_level": c.security_level,
+                "port": c.port,
+                "timeout": c.timeout,
+                "retries": c.retries,
+                "enabled": c.enabled,
+                "display": c.safe_display(),
+            })
+        return records
+
+    def get_eligible_credentials(self, snmp_mode, dynamic_order_mode="security_preferred") -> List[SnmpCredentialRecord]:
+        eligible = []
+        for c in self._credentials:
+            if not c.enabled:
+                continue
+            if snmp_mode == "Force SNMPv1" and c.version == "v1":
+                eligible.append(c)
+            elif snmp_mode == "Force SNMPv2c" and c.version == "v2c":
+                eligible.append(c)
+            elif snmp_mode == "Force SNMPv3" and c.version == "v3":
+                eligible.append(c)
+            elif snmp_mode == "Dynamic / Auto":
+                eligible.append(c)
+        if dynamic_order_mode == "security_preferred":
+            eligible.sort(key=lambda c: c.sort_priority())
+        return eligible
+
+
 # ============================================================
 # Data Models
 # ============================================================
@@ -209,7 +453,7 @@ class ScannerDefinition:
 # Constants and Settings
 # ============================================================
 
-APP_VERSION = "2.94"
+APP_VERSION = "3.1"
 
 @dataclass
 class DocumentationSection:
@@ -828,9 +1072,9 @@ class Redactor:
             RedactionRule("pem_certificate", re.compile(r"(?s)-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----"), r"-----BEGIN CERTIFICATE-----\n<REDACTED>\n-----END CERTIFICATE-----"),
             RedactionRule("wireless_psk", re.compile(r"(?im)^(\s*wpa-psk\s+(?:ascii\s+)?(?:\d\s+)?)(.*)$"), r"\1<REDACTED>"),
             RedactionRule("generic_catchall", re.compile(r"(?im)^.*(?:password|secret|community|key-string|pre-shared-key|server-key).*$"), lambda m: re.sub(r"(\s+(?:password|secret|community|key-string|pre-shared-key|server-key|key)\s+(?:\d\s+)?)(?![\s\n])(\S+)", r"\1<REDACTED>", m.group(0))),
-            RedactionRule("tacacs_radius_nested", re.compile(r"(?im)^(\s*(?:key(?:word)?)\s+(?:\d\s+)?)(?![\s\n])(\S+)(.*)$"), r"<REDACTED>"),
-            RedactionRule("snmpv3_auth_priv", re.compile(r"(?im)^(\s*snmp-server\s+user\s+\S+\s+\S+\s+v3\s+auth\s+(?:md5|sha|sha-256)\s+)(\S+)(\s+priv\s+(?:des|3des|aes|aes\s+\d+)\s+)(\S+)(.*)$"), r"<REDACTED><REDACTED>"),
-            RedactionRule("snmpv3_auth_only", re.compile(r"(?im)^(\s*snmp-server\s+user\s+\S+\s+\S+\s+v3\s+auth\s+(?:md5|sha|sha-256)\s+)(\S+)(\s*)$"), r"<REDACTED>"),
+            RedactionRule("tacacs_radius_nested", re.compile(r"(?im)^(\s*(?:key(?:word)?)\s+(?:\d\s+)?)(?![\s\n])(\S+)(.*)$"), r"\1<REDACTED>\3"),
+            RedactionRule("snmpv3_auth_priv", re.compile(r"(?im)^(\s*snmp-server\s+user\s+\S+\s+\S+\s+v3\s+auth\s+(?:md5|sha|sha-224|sha-256|sha-384|sha-512)\s+)(\S+)(\s+priv\s+(?:aes\s+\d+|des|3des|aes)\s+)(\S+)(.*)$"), r"\1<REDACTED>\3<REDACTED>\5"),
+            RedactionRule("snmpv3_auth_only", re.compile(r"(?im)^(\s*snmp-server\s+user\s+\S+\s+\S+\s+v3\s+auth\s+(?:md5|sha|sha-224|sha-256|sha-384|sha-512)\s+)(\S+)(.*)$"), r"\1<REDACTED>\3"),
             RedactionRule("password_colon", re.compile(r"(?im)^((?:.*[pP]assword|.*[pP]asscode)\s*:\s*)(.*)$"), lambda m: m.group(1) + "<REDACTED>" if m.group(2).strip() else m.group(0))
         ]
 
@@ -1460,6 +1704,243 @@ class ParserHelpers:
     @staticmethod
     def add_finding(findings_list, category, status, message, pre_val=None, post_val=None):
         findings_list.append(CompareFinding(category, status, message, pre_val, post_val))
+
+class SnmpClient:
+    @staticmethod
+    def _get_auth_data(cred: SnmpCredentialRecord) -> Any:
+        if cred.version == "v1":
+            return CommunityData(cred.community, mpModel=0)
+        elif cred.version == "v2c":
+            return CommunityData(cred.community, mpModel=1)
+        elif cred.version == "v3":
+            if cred.security_level == "noAuthNoPriv":
+                return UsmUserData(cred.username)
+            
+            auth_proto = AUTH_PROTOCOLS.get(cred.auth_protocol)
+            priv_proto = PRIV_PROTOCOLS.get(cred.priv_protocol)
+            
+            # Key validation constraints: PySNMP USM typically expects >= 8 chars if key is present
+            auth_key = cred.auth_key if len(cred.auth_key) >= 8 else None
+            priv_key = cred.priv_key if len(cred.priv_key) >= 8 else None
+            
+            if cred.security_level == "authNoPriv":
+                if not auth_key:
+                    raise ValueError("SNMPv3 authNoPriv requires authKey >= 8 chars")
+                return UsmUserData(cred.username, authKey=auth_key, authProtocol=auth_proto)
+            elif cred.security_level == "authPriv":
+                if not auth_key or not priv_key:
+                    raise ValueError("SNMPv3 authPriv requires authKey and privKey >= 8 chars")
+                return UsmUserData(
+                    cred.username,
+                    authKey=auth_key,
+                    authProtocol=auth_proto,
+                    privKey=priv_key,
+                    privProtocol=priv_proto
+                )
+        raise ValueError(f"Unknown SNMP version/security level: {cred.version} / {cred.security_level}")
+
+    @staticmethod
+    async def _async_get(snmp_engine: SnmpEngine, host: str, cred: SnmpCredentialRecord, oid: str) -> SnmpOidResult:
+        t0 = time.perf_counter()
+        result = SnmpOidResult(oid=oid, status="error")
+        
+        try:
+            auth_data = SnmpClient._get_auth_data(cred)
+            transport = await UdpTransportTarget.create(
+                (host, cred.port),
+                timeout=cred.timeout,
+                retries=cred.retries
+            )
+        except Exception as e:
+            elapsed = time.perf_counter() - t0
+            result.status = "error"
+            result.error_category = "auth" if "auth" in str(e).lower() else "exception"
+            result.error_message = f"Setup failed: {str(e)}"
+            result.raw_error_safe = f"Setup failed: {type(e).__name__}"
+            result.elapsed_seconds = elapsed
+            return result
+
+        try:
+            error_indication, error_status, error_index, var_binds = await get_cmd(
+                snmp_engine,
+                auth_data,
+                transport,
+                ContextData(),
+                ObjectType(ObjectIdentity(oid)),
+                lookupMib=False
+            )
+            
+            elapsed = time.perf_counter() - t0
+            result.elapsed_seconds = elapsed
+            
+            if error_indication:
+                err_str = str(error_indication).lower()
+                result.status = "error"
+                result.error_message = str(error_indication)
+                result.raw_error_safe = type(error_indication).__name__
+                if "timeout" in err_str or "expired" in err_str:
+                    result.status = "timeout"
+                    result.error_category = "timeout"
+                elif "auth" in err_str or "security" in err_str:
+                    result.error_category = "auth"
+                else:
+                    result.error_category = "transport"
+            elif error_status:
+                result.status = "error"
+                result.error_category = "snmp_error"
+                result.error_message = f"{error_status.prettyPrint()} at {error_index and var_binds[int(error_index) - 1][0] or '?'}"
+                result.raw_error_safe = f"SNMP Error: {error_status.prettyPrint()}"
+            else:
+                for var_bind in var_binds:
+                    name, val = var_bind
+                    val_str = str(val)
+                    if "noSuchObject" in val_str or val_str == "NoSuchObject":
+                        result.status = "noSuchObject"
+                        result.error_category = "oid_missing"
+                        result.value = val_str
+                    elif "noSuchInstance" in val_str or val_str == "NoSuchInstance":
+                        result.status = "noSuchInstance"
+                        result.error_category = "oid_missing"
+                        result.value = val_str
+                    else:
+                        result.status = "success"
+                        result.value = val_str
+                        result.value_type = type(val).__name__
+        except Exception as e:
+            elapsed = time.perf_counter() - t0
+            result.status = "error"
+            result.error_category = "exception"
+            result.error_message = str(e)
+            result.raw_error_safe = type(e).__name__
+            result.elapsed_seconds = elapsed
+            
+        return result
+
+    @staticmethod
+    def snmp_get(snmp_engine: SnmpEngine, host: str, cred: SnmpCredentialRecord, oid: str, stop_event=None) -> SnmpOidResult:
+        if stop_event and stop_event.is_set():
+            return SnmpOidResult(oid=oid, status="error", error_message="Run stopped by user", error_category="exception", raw_error_safe="StoppedByUser")
+        
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(SnmpClient._async_get(snmp_engine, host, cred, oid))
+        finally:
+            loop.close()
+
+
+class SnmpScannerEngine:
+    @staticmethod
+    def try_credentials_for_host(host: str, credentials: List[SnmpCredentialRecord], stop_event=None, enqueue=None) -> Tuple[Optional[SnmpCredentialRecord], Optional[SnmpOidResult]]:
+        probes = [".1.3.6.1.2.1.1.2.0", ".1.3.6.1.2.1.1.3.0"]
+        
+        for cred in credentials:
+            if stop_event and stop_event.is_set():
+                break
+            
+            if enqueue:
+                enqueue("LOG_EXEC", f"  Trying SNMP credential: {cred.safe_display()}")
+                
+            snmp_engine = SnmpEngine()
+            try:
+                for probe_oid in probes:
+                    if stop_event and stop_event.is_set():
+                        break
+                    
+                    res = SnmpClient.snmp_get(snmp_engine, host, cred, probe_oid, stop_event)
+                    if res.status == "success":
+                        if enqueue:
+                            enqueue("LOG_EXEC", f"  ✓ SNMP credential succeeded: {cred.label}")
+                        return cred, res
+            except Exception as e:
+                if enqueue:
+                    enqueue("LOG_EXEC", f"  Debug: Exception during credential probe: {type(e).__name__}")
+            finally:
+                try:
+                    snmp_engine.close_dispatcher()
+                except Exception:
+                    pass
+                    
+        return None, None
+
+    @staticmethod
+    def scan_host(host: str, credentials: List[SnmpCredentialRecord], oids: List[str], snmp_mode: str, stop_event=None, enqueue=None) -> SnmpHostResult:
+        t0 = time.perf_counter()
+        
+        if enqueue:
+            enqueue("LOG_EXEC", f"▶ Starting SNMP scan for host {host}")
+            
+        host_result = SnmpHostResult(
+            host=host,
+            host_status="failed",
+            snmp_mode=snmp_mode,
+            snmp_version_used="",
+            security_level_used="",
+            credential_label="",
+            credential_id="",
+            oid_results=[]
+        )
+        
+        if not _PYSNMP_AVAILABLE:
+            host_result.error_message = "Missing dependency: pysnmp"
+            host_result.elapsed_seconds = time.perf_counter() - t0
+            if enqueue:
+                enqueue("LOG_EXEC", f"  ✗ Failed: Missing dependency (pysnmp)")
+            return host_result
+
+        working_cred, probe_res = SnmpScannerEngine.try_credentials_for_host(host, credentials, stop_event, enqueue)
+        
+        if not working_cred:
+            host_result.error_message = "All eligible SNMP credentials failed probe"
+            host_result.elapsed_seconds = time.perf_counter() - t0
+            if enqueue:
+                enqueue("LOG_EXEC", f"  ✗ Failed: No working credentials found")
+            return host_result
+            
+        host_result.credential_id = working_cred.id
+        host_result.credential_label = working_cred.label
+        host_result.snmp_version_used = working_cred.version
+        host_result.security_level_used = working_cred.security_level
+        
+        snmp_engine = SnmpEngine()
+        success_count = 0
+        total_count = len(oids)
+        
+        try:
+            for oid in oids:
+                if stop_event and stop_event.is_set():
+                    break
+                
+                res = SnmpClient.snmp_get(snmp_engine, host, working_cred, oid, stop_event)
+                host_result.oid_results.append(res)
+                
+                if res.status in ("success", "noSuchObject", "noSuchInstance"):
+                    success_count += 1
+                    if enqueue:
+                        val_display = res.value if len(res.value) < 100 else res.value[:100] + "..."
+                        enqueue("LOG_EXEC", f"  ✓ GET {oid} succeeded: ({res.status}) {val_display}")
+                else:
+                    if enqueue:
+                        enqueue("LOG_EXEC", f"  ✗ GET {oid} failed: {res.error_message}")
+        finally:
+            try:
+                snmp_engine.close_dispatcher()
+            except Exception:
+                pass
+                
+        if stop_event and stop_event.is_set():
+            host_result.host_status = "stopped"
+        elif success_count == total_count:
+            host_result.host_status = "success"
+        elif success_count > 0:
+            host_result.host_status = "partial"
+        else:
+            host_result.host_status = "failed"
+            
+        host_result.elapsed_seconds = time.perf_counter() - t0
+        return host_result
+
 
 class ParserEngine:
     @staticmethod
@@ -2820,6 +3301,37 @@ If you used Raw Capture mode, these exports may contain sensitive data (password
 - Added Generic Command Runner.
 - Added output folder structure.
 - Added initial Netmiko connection handling.
+"""),
+    DocumentationSection("SNMP OID Scanner", """Overview:
+The SNMP OID Scanner performs read-only SNMP GET queries across a list of target IPs/hostnames using one or more configured SNMP credentials.
+
+Supported SNMP Versions and Modes:
+- SNMPv1: Uses Community String credentials (mpModel=0).
+- SNMPv2c: Uses Community String credentials (mpModel=1).
+- SNMPv3 (noAuthNoPriv): Username only.
+- SNMPv3 (authNoPriv): Username and authentication key.
+- SNMPv3 (authPriv): Username, auth key, and privacy key.
+- Dynamic / Auto: Probes and automatically tests eligible credentials.
+
+Credential Eligibility Rules:
+- Force SNMPv1: Only SNMPv1 community credentials.
+- Force SNMPv2c: Only SNMPv2c community credentials.
+- Force SNMPv3: Only SNMPv3 credentials.
+- Dynamic / Auto: All enabled SNMP credentials.
+
+Dynamic / Auto Probe Behavior:
+1. Tries eligible credentials against a dedicated probe OID: sysObjectID.0 (1.3.6.1.2.1.1.2.0), falling back to sysUpTime.0 (1.3.6.1.2.1.1.3.0).
+2. Uses security-preferred ordering by default: v3 authPriv -> v3 authNoPriv -> v3 noAuthNoPriv -> v2c -> v1. Optionally, check "Use credential list order instead".
+3. Once a credential successfully responds, it is cached and reused for all requested OIDs on that host.
+4. Active secrets (community strings or auth/priv keys) are NEVER logged or printed.
+
+Security Warning:
+SNMPv1 and SNMPv2c transmit community strings in cleartext across the network. They can be intercepted. Prefer SNMPv3 where available.
+
+Example OIDs:
+- 1.3.6.1.2.1.1.1.0 (sysDescr)
+- 1.3.6.1.2.1.1.5.0 (sysName)
+- 1.3.6.1.2.1.1.3.0 (sysUpTime)
 """)
 ]
 
@@ -3619,6 +4131,460 @@ class CredentialManagerLibraryPage(tk.Frame):
         self.stop_event.set()
         self.log_message("Stop mapping request sent.")
 
+
+class SnmpCredentialManagerPage(tk.Frame):
+    def __init__(self, parent, controller):
+        super().__init__(parent)
+        self.controller = controller
+        self.selected_cred_id = None
+        
+        # Base UI structure
+        nav_bar = tk.Frame(self, height=40, bg="#1e1e1e")
+        nav_bar.pack(fill="x", side="top")
+        
+        tk.Button(
+            nav_bar,
+            text="← Back to Dashboard",
+            command=lambda: self.controller.show_frame("LandingPage"),
+            bg="#3c3f41",
+            fg="white",
+            relief="flat",
+            padx=10
+        ).pack(side="left", padx=10, pady=8)
+        
+        # Title
+        title_lbl = tk.Label(self, text="SNMP Credential Manager", font=("Arial", 16, "bold"))
+        title_lbl.pack(pady=10)
+        
+        # Main area split into Left (form) and Right (list)
+        paned = tk.PanedWindow(self, orient="horizontal", sashrelief="raised", sashwidth=4)
+        paned.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        left_frame = tk.Frame(paned, padx=10)
+        right_frame = tk.Frame(paned, padx=10)
+        
+        paned.add(left_frame, minsize=400)
+        paned.add(right_frame, minsize=350)
+        
+        # Left Panel (CRUD form)
+        form_frame = tk.LabelFrame(left_frame, text="SNMP Credential Details", font=("Arial", 10, "bold"), padx=10, pady=10)
+        form_frame.pack(fill="both", expand=True)
+        
+        # Make grid layout
+        form_frame.columnconfigure(1, weight=1)
+        
+        # Label
+        tk.Label(form_frame, text="Label:", anchor="w").grid(row=0, column=0, sticky="w", pady=4)
+        self.label_ent = tk.Entry(form_frame)
+        self.label_ent.grid(row=0, column=1, sticky="ew", pady=4)
+        
+        # Enabled Checkbox
+        self.enabled_var = tk.BooleanVar(value=True)
+        self.enabled_chk = tk.Checkbutton(form_frame, text="Enabled", variable=self.enabled_var)
+        self.enabled_chk.grid(row=1, column=1, sticky="w", pady=4)
+        
+        # Version Dropdown
+        tk.Label(form_frame, text="SNMP Version:", anchor="w").grid(row=2, column=0, sticky="w", pady=4)
+        self.version_var = tk.StringVar(value="SNMPv2c")
+        self.version_cb = ttk.Combobox(
+            form_frame,
+            textvariable=self.version_var,
+            values=["SNMPv1", "SNMPv2c", "SNMPv3"],
+            state="readonly"
+        )
+        self.version_cb.grid(row=2, column=1, sticky="ew", pady=4)
+        self.version_cb.bind("<<ComboboxSelected>>", self._on_version_changed)
+        
+        # v1 / v2c Community Group
+        self.v1_v2c_frame = tk.Frame(form_frame)
+        self.v1_v2c_frame.columnconfigure(1, weight=1)
+        
+        tk.Label(self.v1_v2c_frame, text="Community String:", width=15, anchor="w").grid(row=0, column=0, sticky="w", pady=4)
+        self.community_ent = tk.Entry(self.v1_v2c_frame, show="*")
+        self.community_ent.grid(row=0, column=1, sticky="ew", pady=4)
+        
+        # v3 User details Group
+        self.v3_frame = tk.Frame(form_frame)
+        self.v3_frame.columnconfigure(1, weight=1)
+        
+        tk.Label(self.v3_frame, text="Username:", width=15, anchor="w").grid(row=0, column=0, sticky="w", pady=4)
+        self.username_ent = tk.Entry(self.v3_frame)
+        self.username_ent.grid(row=0, column=1, sticky="ew", pady=4)
+        
+        tk.Label(self.v3_frame, text="Security Level:", anchor="w").grid(row=1, column=0, sticky="w", pady=4)
+        self.sec_level_var = tk.StringVar(value="noAuthNoPriv")
+        self.sec_level_cb = ttk.Combobox(
+            self.v3_frame,
+            textvariable=self.sec_level_var,
+            values=["noAuthNoPriv", "authNoPriv", "authPriv"],
+            state="readonly"
+        )
+        self.sec_level_cb.grid(row=1, column=1, sticky="ew", pady=4)
+        self.sec_level_cb.bind("<<ComboboxSelected>>", self._on_sec_level_changed)
+        
+        tk.Label(self.v3_frame, text="Auth Protocol:", anchor="w").grid(row=2, column=0, sticky="w", pady=4)
+        self.auth_proto_var = tk.StringVar(value="SHA")
+        self.auth_proto_cb = ttk.Combobox(
+            self.v3_frame,
+            textvariable=self.auth_proto_var,
+            values=["MD5 (legacy)", "SHA", "SHA224", "SHA256", "SHA384", "SHA512"],
+            state="readonly"
+        )
+        self.auth_proto_cb.grid(row=2, column=1, sticky="ew", pady=4)
+        
+        tk.Label(self.v3_frame, text="Auth Key:", anchor="w").grid(row=3, column=0, sticky="w", pady=4)
+        self.auth_key_ent = tk.Entry(self.v3_frame, show="*")
+        self.auth_key_ent.grid(row=3, column=1, sticky="ew", pady=4)
+        
+        tk.Label(self.v3_frame, text="Priv Protocol:", anchor="w").grid(row=4, column=0, sticky="w", pady=4)
+        self.priv_proto_var = tk.StringVar(value="AES")
+        self.priv_proto_cb = ttk.Combobox(
+            self.v3_frame,
+            textvariable=self.priv_proto_var,
+            values=["DES (legacy)", "AES", "AES192", "AES256"],
+            state="readonly"
+        )
+        self.priv_proto_cb.grid(row=4, column=1, sticky="ew", pady=4)
+        
+        tk.Label(self.v3_frame, text="Priv Key:", anchor="w").grid(row=5, column=0, sticky="w", pady=4)
+        self.priv_key_ent = tk.Entry(self.v3_frame, show="*")
+        self.priv_key_ent.grid(row=5, column=1, sticky="ew", pady=4)
+        
+        # Common settings
+        self.common_frame = tk.Frame(form_frame)
+        self.common_frame.columnconfigure(1, weight=1)
+        
+        tk.Label(self.common_frame, text="Port:", width=15, anchor="w").grid(row=0, column=0, sticky="w", pady=4)
+        self.port_ent = tk.Entry(self.common_frame)
+        self.port_ent.insert(0, "161")
+        self.port_ent.grid(row=0, column=1, sticky="ew", pady=4)
+        
+        tk.Label(self.common_frame, text="Timeout (s):", anchor="w").grid(row=1, column=0, sticky="w", pady=4)
+        self.timeout_ent = tk.Entry(self.common_frame)
+        self.timeout_ent.insert(0, "2.0")
+        self.timeout_ent.grid(row=1, column=1, sticky="ew", pady=4)
+        
+        tk.Label(self.common_frame, text="Retries:", anchor="w").grid(row=2, column=0, sticky="w", pady=4)
+        self.retries_ent = tk.Entry(self.common_frame)
+        self.retries_ent.insert(0, "1")
+        self.retries_ent.grid(row=2, column=1, sticky="ew", pady=4)
+        
+        # Grid placing frames
+        self.v1_v2c_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=5)
+        self.v3_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=5)
+        self.common_frame.grid(row=5, column=0, columnspan=2, sticky="ew", pady=5)
+        
+        # Buttons
+        btn_frame = tk.Frame(form_frame)
+        btn_frame.grid(row=6, column=0, columnspan=2, sticky="ew", pady=10)
+        
+        self.add_btn = tk.Button(btn_frame, text="Add New", command=self._add_credential, bg="#4a4a4a", fg="white")
+        self.add_btn.pack(side="left", padx=2, expand=True, fill="x")
+        
+        self.update_btn = tk.Button(btn_frame, text="Update", command=self._update_credential, bg="#4a4a4a", fg="white", state="disabled")
+        self.update_btn.pack(side="left", padx=2, expand=True, fill="x")
+        
+        self.delete_btn = tk.Button(btn_frame, text="Delete", command=self._delete_credential, bg="#852222", fg="white", state="disabled")
+        self.delete_btn.pack(side="left", padx=2, expand=True, fill="x")
+        
+        self.clear_btn = tk.Button(btn_frame, text="Clear Fields", command=self._clear_form, bg="#4a4a4a", fg="white")
+        self.clear_btn.pack(side="left", padx=2, expand=True, fill="x")
+        
+        # Right Panel (List of credentials)
+        list_lbl = tk.Label(right_frame, text="Configured SNMP Credentials:", font=("Arial", 10, "bold"))
+        list_lbl.pack(anchor="w", pady=(0, 5))
+        
+        list_box_frame = tk.Frame(right_frame)
+        list_box_frame.pack(fill="both", expand=True)
+        
+        scrollbar = ttk.Scrollbar(list_box_frame)
+        scrollbar.pack(side="right", fill="y")
+        
+        self.cred_listbox = tk.Listbox(list_box_frame, yscrollcommand=scrollbar.set, font=("Consolas", 10))
+        self.cred_listbox.pack(fill="both", expand=True, side="left")
+        scrollbar.config(command=self.cred_listbox.yview)
+        self.cred_listbox.bind("<<ListboxSelect>>", self._on_listbox_select)
+        
+        # Logs window at the bottom
+        log_frame = tk.LabelFrame(self, text="Activity Logs", font=("Arial", 9, "bold"), height=100)
+        log_frame.pack(fill="x", padx=10, pady=(0, 10))
+        
+        log_scrollbar = ttk.Scrollbar(log_frame)
+        log_scrollbar.pack(side="right", fill="y")
+        self.log_text = tk.Text(log_frame, height=4, yscrollcommand=log_scrollbar.set, bg="#1e1e1e", fg="#ffffff", font=("Consolas", 9))
+        self.log_text.pack(fill="both", expand=True, side="left")
+        log_scrollbar.config(command=self.log_text.yview)
+        
+        # Set initial visibility
+        self._on_version_changed()
+        self.refresh_list()
+        
+    def log_message(self, message: str):
+        self.log_text.insert("end", f"[{datetime.now().strftime('%H:%M:%S')}] {message}\n")
+        self.log_text.see("end")
+        
+    def _on_version_changed(self, event=None):
+        version = self.version_var.get()
+        if version in ("SNMPv1", "SNMPv2c"):
+            self.v1_v2c_frame.grid()
+            self.v3_frame.grid_remove()
+        else:
+            self.v1_v2c_frame.grid_remove()
+            self.v3_frame.grid()
+            self._on_sec_level_changed()
+            
+    def _on_sec_level_changed(self, event=None):
+        sec_level = self.sec_level_var.get()
+        if sec_level == "noAuthNoPriv":
+            self.auth_proto_cb.configure(state="disabled")
+            self.auth_key_ent.configure(state="disabled")
+            self.priv_proto_cb.configure(state="disabled")
+            self.priv_key_ent.configure(state="disabled")
+        elif sec_level == "authNoPriv":
+            self.auth_proto_cb.configure(state="readonly")
+            self.auth_key_ent.configure(state="normal")
+            self.priv_proto_cb.configure(state="disabled")
+            self.priv_key_ent.configure(state="disabled")
+        elif sec_level == "authPriv":
+            self.auth_proto_cb.configure(state="readonly")
+            self.auth_key_ent.configure(state="normal")
+            self.priv_proto_cb.configure(state="readonly")
+            self.priv_key_ent.configure(state="normal")
+            
+    def _clear_form(self):
+        self.label_ent.delete(0, "end")
+        self.enabled_var.set(True)
+        self.community_ent.delete(0, "end")
+        self.username_ent.delete(0, "end")
+        self.auth_key_ent.delete(0, "end")
+        self.priv_key_ent.delete(0, "end")
+        self.port_ent.delete(0, "end")
+        self.port_ent.insert(0, "161")
+        self.timeout_ent.delete(0, "end")
+        self.timeout_ent.insert(0, "2.0")
+        self.retries_ent.delete(0, "end")
+        self.retries_ent.insert(0, "1")
+        self.selected_cred_id = None
+        self.cred_listbox.selection_clear(0, "end")
+        self.add_btn.configure(state="normal")
+        self.update_btn.configure(state="disabled")
+        self.delete_btn.configure(state="disabled")
+        
+    def refresh_list(self):
+        self.cred_listbox.delete(0, "end")
+        records = self.controller.snmp_credential_store.all_safe_records()
+        for r in records:
+            self.cred_listbox.insert("end", r["display"])
+            
+    def _on_listbox_select(self, event=None):
+        selection = self.cred_listbox.curselection()
+        if not selection:
+            return
+        idx = selection[0]
+        records = self.controller.snmp_credential_store.all_safe_records()
+        if idx >= len(records):
+            return
+        
+        safe_rec = records[idx]
+        self.selected_cred_id = safe_rec["id"]
+        
+        cred = self.controller.snmp_credential_store.get_by_id(self.selected_cred_id)
+        if not cred:
+            return
+            
+        self._clear_form()
+        self.selected_cred_id = cred.id
+        self.label_ent.insert(0, cred.label)
+        self.enabled_var.set(cred.enabled)
+        self.version_var.set("SNMPv1" if cred.version == "v1" else ("SNMPv2c" if cred.version == "v2c" else "SNMPv3"))
+        self._on_version_changed()
+        
+        if cred.version == "v3":
+            self.username_ent.insert(0, cred.username)
+            self.sec_level_var.set(cred.security_level)
+            self._on_sec_level_changed()
+            self.auth_proto_var.set(cred.auth_protocol or "SHA")
+            self.priv_proto_var.set(cred.priv_protocol or "AES")
+            
+        self.port_ent.delete(0, "end")
+        self.port_ent.insert(0, str(cred.port))
+        self.timeout_ent.delete(0, "end")
+        self.timeout_ent.insert(0, str(cred.timeout))
+        self.retries_ent.delete(0, "end")
+        self.retries_ent.insert(0, str(cred.retries))
+        
+        self.add_btn.configure(state="disabled")
+        self.update_btn.configure(state="normal")
+        self.delete_btn.configure(state="normal")
+
+    def _validate_form_inputs(self, is_update=False) -> bool:
+        label = self.label_ent.get().strip()
+        if not label:
+            messagebox.showerror("Validation Error", "Label is required.", parent=self)
+            return False
+            
+        version = self.version_var.get()
+        if version == "SNMPv3":
+            username = self.username_ent.get().strip()
+            if not username:
+                messagebox.showerror("Validation Error", "Username is required for SNMPv3.", parent=self)
+                return False
+                
+            sec_level = self.sec_level_var.get()
+            if sec_level in ("authNoPriv", "authPriv"):
+                auth_key = self.auth_key_ent.get()
+                if not is_update or auth_key:
+                    if len(auth_key) < 8 or len(auth_key) > 32:
+                        messagebox.showerror("Validation Error", "Auth key must be between 8 and 32 characters.", parent=self)
+                        return False
+            if sec_level == "authPriv":
+                priv_key = self.priv_key_ent.get()
+                if not is_update or priv_key:
+                    if len(priv_key) < 8 or len(priv_key) > 32:
+                        messagebox.showerror("Validation Error", "Priv key must be between 8 and 32 characters.", parent=self)
+                        return False
+        else:
+            community = self.community_ent.get()
+            if not is_update and not community:
+                messagebox.showerror("Validation Error", "Community string is required.", parent=self)
+                return False
+                
+        try:
+            port = int(self.port_ent.get().strip())
+            if port <= 0 or port > 65535:
+                raise ValueError()
+        except ValueError:
+            messagebox.showerror("Validation Error", "Port must be a valid integer between 1 and 65535.", parent=self)
+            return False
+            
+        try:
+            timeout = float(self.timeout_ent.get().strip())
+            if timeout <= 0:
+                raise ValueError()
+        except ValueError:
+            messagebox.showerror("Validation Error", "Timeout must be a positive number.", parent=self)
+            return False
+            
+        try:
+            retries = int(self.retries_ent.get().strip())
+            if retries < 0:
+                raise ValueError()
+        except ValueError:
+            messagebox.showerror("Validation Error", "Retries must be a non-negative integer.", parent=self)
+            return False
+            
+        return True
+
+    def _add_credential(self):
+        if not self._validate_form_inputs(is_update=False):
+            return
+            
+        label = self.label_ent.get().strip()
+        version = self.version_var.get()
+        enabled = self.enabled_var.get()
+        port = int(self.port_ent.get().strip())
+        timeout = float(self.timeout_ent.get().strip())
+        retries = int(self.retries_ent.get().strip())
+        
+        if version in ("SNMPv1", "SNMPv2c"):
+            v_code = "v1" if version == "SNMPv1" else "v2c"
+            community = self.community_ent.get()
+            cred = self.controller.snmp_credential_store.add_v1_v2c(
+                label=label,
+                version=v_code,
+                community=community,
+                port=port,
+                timeout=timeout,
+                retries=retries,
+                enabled=enabled
+            )
+        else:
+            username = self.username_ent.get().strip()
+            sec_level = self.sec_level_var.get()
+            auth_proto = self.auth_proto_var.get()
+            auth_key = self.auth_key_ent.get()
+            priv_proto = self.priv_proto_var.get()
+            priv_key = self.priv_key_ent.get()
+            
+            cred = self.controller.snmp_credential_store.add_v3(
+                label=label,
+                username=username,
+                security_level=sec_level,
+                auth_key=auth_key,
+                priv_key=priv_key,
+                auth_protocol=auth_proto,
+                priv_protocol=priv_proto,
+                port=port,
+                timeout=timeout,
+                retries=retries,
+                enabled=enabled
+            )
+            
+        self.log_message(f"Added SNMP credential: {cred.safe_display()}")
+        self._clear_form()
+        self.refresh_list()
+        
+    def _update_credential(self):
+        if not self.selected_cred_id:
+            return
+        if not self._validate_form_inputs(is_update=True):
+            return
+            
+        label = self.label_ent.get().strip()
+        version = self.version_var.get()
+        enabled = self.enabled_var.get()
+        port = int(self.port_ent.get().strip())
+        timeout = float(self.timeout_ent.get().strip())
+        retries = int(self.retries_ent.get().strip())
+        
+        kwargs = {
+            "label": label,
+            "enabled": enabled,
+            "port": port,
+            "timeout": timeout,
+            "retries": retries
+        }
+        
+        if version in ("SNMPv1", "SNMPv2c"):
+            kwargs["version"] = "v1" if version == "SNMPv1" else "v2c"
+            kwargs["security_level"] = "community"
+            community = self.community_ent.get()
+            if community:
+                kwargs["community"] = community
+        else:
+            kwargs["version"] = "v3"
+            kwargs["username"] = self.username_ent.get().strip()
+            kwargs["security_level"] = self.sec_level_var.get()
+            kwargs["auth_protocol"] = self.auth_proto_var.get()
+            kwargs["priv_protocol"] = self.priv_proto_var.get()
+            
+            auth_key = self.auth_key_ent.get()
+            priv_key = self.priv_key_ent.get()
+            if auth_key:
+                kwargs["auth_key"] = auth_key
+            if priv_key:
+                kwargs["priv_key"] = priv_key
+                
+        success = self.controller.snmp_credential_store.update(self.selected_cred_id, **kwargs)
+        if success:
+            cred = self.controller.snmp_credential_store.get_by_id(self.selected_cred_id)
+            self.log_message(f"Updated SNMP credential: {cred.safe_display()}")
+        self._clear_form()
+        self.refresh_list()
+        
+    def _delete_credential(self):
+        if not self.selected_cred_id:
+            return
+        cred = self.controller.snmp_credential_store.get_by_id(self.selected_cred_id)
+        label = cred.safe_display() if cred else self.selected_cred_id
+        
+        success = self.controller.snmp_credential_store.delete(self.selected_cred_id)
+        if success:
+            self.log_message(f"Deleted SNMP credential: {label}")
+        self._clear_form()
+        self.refresh_list()
+
+
 class CredentialStatusPanel(tk.LabelFrame):
     def __init__(self, parent, controller, **kwargs):
         super().__init__(parent, text="Credentials (Temp)", font=("Arial", 10, "bold"), **kwargs)
@@ -3632,6 +4598,34 @@ class CredentialStatusPanel(tk.LabelFrame):
     def refresh(self):
         count = len(self.controller.credential_store.records)
         self.status_lbl.config(text=f"Credentials loaded: {count}")
+
+
+class SnmpCredentialStatusPanel(tk.LabelFrame):
+    def __init__(self, parent, controller, **kwargs):
+        super().__init__(parent, text="SNMP Credentials (Volatile)", font=("Arial", 10, "bold"), **kwargs)
+        self.controller = controller
+        
+        self.status_lbl = tk.Label(self, text="SNMP Credentials: 0 configured, 0 enabled", font=("Arial", 10))
+        self.status_lbl.pack(pady=5, padx=5, anchor="w")
+        
+        tk.Button(
+            self,
+            text="Manage SNMP Credentials",
+            command=lambda: self.controller.show_frame("SnmpCredentialManagerPage")
+        ).pack(pady=5, padx=5, fill="x")
+        self.refresh()
+        
+    def refresh(self):
+        store = getattr(self.controller, "snmp_credential_store", None)
+        if store:
+            configured = store.count()
+            enabled = store.enabled_count()
+            self.status_lbl.config(
+                text=f"SNMP Credentials: {configured} configured, {enabled} enabled"
+            )
+        else:
+            self.status_lbl.config(text="SNMP Credentials: Store unavailable")
+
 
 
 
@@ -4649,6 +5643,338 @@ class CommandRunnerPage(BaseRunnerPage):
             self.fallback_to_all_credentials_for_run = False
 
 
+class SnmpOidScannerPage(BaseRunnerPage):
+    def __init__(self, parent, controller):
+        super().__init__(parent, controller, title_text="SNMP OID Scanner")
+        
+    def _setup_page_ui(self):
+        # Override to build SNMP-specific widgets on the left panel canvas
+        # Clear default widgets if any, but BaseRunnerPage has a scrollable left canvas we pack into.
+        # BaseRunnerPage setup places canvas in left_panel.
+        pass
+
+    # We can customize left_panel after BaseRunnerPage init
+    def tkraise(self, *args, **kwargs):
+        super().tkraise(*args, **kwargs)
+        if hasattr(self, "cred_panel"):
+            self.cred_panel.refresh()
+        if hasattr(self, "target_panel"):
+            self.target_panel.refresh_session_counts()
+
+    def clear_page_fields(self, retain_targets=False, retain_credentials=False):
+        if not retain_targets and hasattr(self, "target_panel"):
+            self.target_panel.targets_text.delete("1.0", "end")
+        self.oids_text.delete("1.0", "end")
+        
+    def _setup_base_ui(self):
+        super()._setup_base_ui()
+        
+        # Override "Back" button behavior by destroying/replacing or updating back button action
+        # Let's inspect BaseRunnerPage layout:
+        # BaseRunnerPage has navigation bar nav_bar with Back button.
+        # We can find the back button and update command to go to ScannerLandingPage.
+        for child in self.winfo_children():
+            if isinstance(child, tk.Frame) and child.cget("bg") == "#1e1e1e": # nav_bar matching colors
+                for btn in child.winfo_children():
+                    if isinstance(btn, tk.Button) and "Back" in btn.cget("text"):
+                        btn.configure(command=lambda: self.controller.show_frame("ScannerLandingPage"))
+
+        # Build fields on left panel
+        self.cred_panel = SnmpCredentialStatusPanel(self.left_panel, self.controller)
+        self.cred_panel.pack(fill="x", padx=5, pady=5)
+        
+        self.target_panel = TargetPanel(self.left_panel, self.controller)
+        self.target_panel.pack(fill="x", padx=5, pady=5)
+        
+        # Run ID
+        run_id_frame = tk.LabelFrame(self.left_panel, text="Run ID (Optional)", font=("Arial", 9, "bold"))
+        run_id_frame.pack(fill="x", padx=5, pady=5)
+        self.run_id_ent = tk.Entry(run_id_frame)
+        self.run_id_ent.pack(fill="x", padx=5, pady=5)
+        
+        # Mode Selection
+        mode_frame = tk.LabelFrame(self.left_panel, text="SNMP Scanner Options", font=("Arial", 9, "bold"))
+        mode_frame.pack(fill="x", padx=5, pady=5)
+        
+        tk.Label(mode_frame, text="SNMP Mode:", anchor="w").pack(fill="x", padx=5, pady=2)
+        self.snmp_mode_var = tk.StringVar(value="Dynamic / Auto")
+        self.snmp_mode_cb = ttk.Combobox(
+            mode_frame,
+            textvariable=self.snmp_mode_var,
+            values=["Dynamic / Auto", "Force SNMPv1", "Force SNMPv2c", "Force SNMPv3"],
+            state="readonly"
+        )
+        self.snmp_mode_cb.pack(fill="x", padx=5, pady=2)
+        
+        self.list_order_var = tk.BooleanVar(value=False)
+        self.list_order_chk = tk.Checkbutton(
+            mode_frame,
+            text="Use credential list order instead",
+            variable=self.list_order_var
+        )
+        self.list_order_chk.pack(anchor="w", padx=5, pady=2)
+        
+        # OID inputs
+        oids_frame = tk.LabelFrame(self.left_panel, text="OIDs to Scan (one per line)", font=("Arial", 9, "bold"))
+        oids_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        text_frame = ttk.Frame(oids_frame)
+        text_frame.pack(fill="both", expand=True, padx=5, pady=2)
+        
+        scrollbar = ttk.Scrollbar(text_frame)
+        scrollbar.pack(side="right", fill="y")
+        self.oids_text = tk.Text(text_frame, height=5, yscrollcommand=scrollbar.set)
+        self.oids_text.pack(fill="both", expand=True, side="left")
+        scrollbar.config(command=self.oids_text.yview)
+        
+        # Helper OID Buttons
+        helpers_frame = tk.Frame(oids_frame)
+        helpers_frame.pack(fill="x", padx=5, pady=2)
+        
+        tk.Button(helpers_frame, text="+ sysDescr", font=("Arial", 8), command=lambda: self._add_oid("1.3.6.1.2.1.1.1.0")).pack(side="left", padx=2, expand=True, fill="x")
+        tk.Button(helpers_frame, text="+ sysName", font=("Arial", 8), command=lambda: self._add_oid("1.3.6.1.2.1.1.5.0")).pack(side="left", padx=2, expand=True, fill="x")
+        tk.Button(helpers_frame, text="+ sysUpTime", font=("Arial", 8), command=lambda: self._add_oid("1.3.6.1.2.1.1.3.0")).pack(side="left", padx=2, expand=True, fill="x")
+        
+        # Run / Stop controls
+        actions_frame = tk.Frame(self.left_panel)
+        actions_frame.pack(fill="x", padx=5, pady=10)
+        
+        self.run_btn = tk.Button(actions_frame, text="RUN SCANNER", bg="#2e5c2e", fg="white", font=("Arial", 10, "bold"), command=self.start_execution)
+        self.run_btn.pack(side="left", fill="x", expand=True, padx=(0, 2))
+        
+        self.stop_btn = tk.Button(actions_frame, text="STOP", bg="#852222", fg="white", font=("Arial", 10, "bold"), state="disabled", command=self.stop_execution)
+        self.stop_btn.pack(side="left", fill="x", expand=True, padx=(2, 2))
+        
+        self.clear_btn = tk.Button(actions_frame, text="Clear Session", bg="#4a4a4a", fg="white", font=("Arial", 10), command=self.clear_current_session)
+        self.clear_btn.pack(side="left", fill="x", expand=True, padx=(2, 0))
+
+    def _add_oid(self, oid: str):
+        existing = self.oids_text.get("1.0", "end").strip()
+        if oid in existing:
+            return
+        if existing:
+            self.oids_text.insert("end", f"\n{oid}")
+        else:
+            self.oids_text.insert("end", oid)
+
+    def start_execution(self):
+        # 1. Target check
+        targets_raw = self.target_panel.targets_text.get("1.0", "end").strip()
+        targets = [t.strip() for t in targets_raw.splitlines() if t.strip()]
+        if not targets:
+            messagebox.showerror("Validation Error", "No target hosts specified.", parent=self)
+            return
+            
+        # 2. OID checks
+        oids_raw = self.oids_text.get("1.0", "end").strip()
+        oids_list = [o.strip() for o in oids_raw.splitlines() if o.strip()]
+        if not oids_list:
+            messagebox.showerror("Validation Error", "Please specify at least one numeric OID.", parent=self)
+            return
+            
+        validated_oids = []
+        for oid in oids_list:
+            is_valid, norm_oid = validate_snmp_oid(oid)
+            if not is_valid:
+                messagebox.showerror("Validation Error", norm_oid, parent=self)
+                return
+            validated_oids.append(norm_oid)
+            
+        # 3. Dependency check
+        if not _PYSNMP_AVAILABLE:
+            messagebox.showerror("Missing Dependency", "Missing dependency: pip install pysnmp", parent=self)
+            return
+            
+        # 4. Credential selection
+        mode = self.snmp_mode_var.get()
+        order_mode = "list_order" if self.list_order_var.get() else "security_preferred"
+        eligible_creds = self.controller.snmp_credential_store.get_eligible_credentials(mode, order_mode)
+        
+        if not eligible_creds:
+            messagebox.showerror("Validation Error", f"No eligible SNMP credentials found for mode: {mode}", parent=self)
+            return
+            
+        # Standard BaseRunnerPage setup
+        self.stop_event.clear()
+        self.is_running = True
+        self.enqueue("CLEAR_LOGS")
+        self.enqueue("SET_BUTTONS", tk.DISABLED, tk.NORMAL)
+        self.set_status("Scanning...")
+        self.set_progress(0)
+        
+        self.sync_targets_to_session(targets)
+        
+        # Launch scanning thread
+        run_id = self.run_id_ent.get().strip()
+        if not run_id:
+            run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        safe_run_id = FilenameSafety.safe_run_id(run_id)
+        
+        threading.Thread(
+            target=self.execution_thread,
+            args=(targets, eligible_creds, validated_oids, mode, safe_run_id),
+            daemon=True
+        ).start()
+        
+    def execution_thread(self, targets, credentials, oids, mode, run_id):
+        try:
+            self.enqueue("LOG_EXEC", f"=== Starting SNMP Scanner ===")
+            self.enqueue("LOG_EXEC", f"Run ID: {run_id}")
+            self.enqueue("LOG_EXEC", f"SNMP Mode: {mode}")
+            self.enqueue("LOG_EXEC", f"OIDs to query: {', '.join(oids)}\n")
+            
+            output_dir = settings.base_output_dir / "SNMP_OID_Scanner" / run_id
+            hosts_dir = output_dir / "hosts"
+            hosts_dir.mkdir(parents=True, exist_ok=True)
+            
+            host_results = []
+            total_hosts = len(targets)
+            
+            for idx, host in enumerate(targets, 1):
+                if self.stop_event.is_set():
+                    self.enqueue("LOG_EXEC", "\n✗ Execution stopped by user.")
+                    break
+                    
+                self.set_progress(int((idx - 1) / total_hosts * 100))
+                self.set_status(f"Scanning {host} ({idx}/{total_hosts})...")
+                
+                # Perform the scan
+                res = SnmpScannerEngine.scan_host(
+                    host=host,
+                    credentials=credentials,
+                    oids=oids,
+                    snmp_mode=mode,
+                    stop_event=self.stop_event,
+                    enqueue=self.enqueue
+                )
+                host_results.append(res)
+                
+                # Write per-host text report
+                safe_host = FilenameSafety.safe_host_label(host)
+                report_txt_path = hosts_dir / f"{safe_host}_report.txt"
+                
+                with open(report_txt_path, "w", encoding="utf-8") as f:
+                    f.write("=========================================\n")
+                    f.write("SNMP OID Scanner Report\n")
+                    f.write("=========================================\n")
+                    f.write(f"Host: {res.host}\n")
+                    f.write(f"Status: {res.host_status}\n")
+                    f.write(f"SNMP Mode Selected: {res.snmp_mode}\n")
+                    f.write(f"SNMP Version Used: {res.snmp_version_used or 'N/A'}\n")
+                    f.write(f"Security Level: {res.security_level_used or 'N/A'}\n")
+                    f.write(f"Credential Label: {res.credential_label or 'N/A'}\n")
+                    f.write(f"Scan Duration: {res.elapsed_seconds:.2f}s\n")
+                    if res.error_message:
+                        f.write(f"Error: {res.error_message}\n")
+                    f.write("\nResults:\n")
+                    for o_res in res.oid_results:
+                        f.write(f"  OID: {o_res.oid}\n")
+                        f.write(f"    Status: {o_res.status}\n")
+                        if o_res.status in ("success", "noSuchObject", "noSuchInstance"):
+                            f.write(f"    Type: {o_res.value_type or 'N/A'}\n")
+                            f.write(f"    Value: {o_res.value}\n")
+                        else:
+                            f.write(f"    Category: {o_res.error_category}\n")
+                            f.write(f"    Message: {o_res.error_message}\n")
+                        f.write("\n")
+                
+                # Write per-host JSON report if enabled
+                if settings.write_json_outputs:
+                    import json
+                    report_json_path = hosts_dir / f"{safe_host}_report.json"
+                    
+                    json_data = {
+                        "host": res.host,
+                        "status": res.host_status,
+                        "snmp_mode": res.snmp_mode,
+                        "snmp_version": res.snmp_version_used,
+                        "security_level": res.security_level_used,
+                        "credential_label": res.credential_label,
+                        "elapsed_seconds": res.elapsed_seconds,
+                        "error_message": res.error_message,
+                        "oid_results": [
+                            {
+                                "oid": o.oid,
+                                "status": o.status,
+                                "value": o.value,
+                                "value_type": o.value_type,
+                                "error_category": o.error_category,
+                                "error_message": o.error_message
+                            } for o in res.oid_results
+                        ]
+                    }
+                    with open(report_json_path, "w", encoding="utf-8") as f:
+                        json.dump(json_data, f, indent=4)
+                        
+            # Write summary outputs
+            self.set_status("Writing summary reports...")
+            
+            # 1. snmp_summary.txt
+            summary_txt_path = output_dir / "snmp_summary.txt"
+            with open(summary_txt_path, "w", encoding="utf-8") as f:
+                f.write("=========================================\n")
+                f.write("SNMP OID Scan Summary\n")
+                f.write("=========================================\n")
+                f.write(f"Run ID: {run_id}\n")
+                f.write(f"Mode: {mode}\n")
+                f.write(f"Timestamp: {datetime.now().isoformat()}\n\n")
+                
+                for r in host_results:
+                    f.write(f"Host: {r.host} | Status: {r.host_status} | Version: {r.snmp_version_used or 'N/A'} | Credential: {r.credential_label or 'N/A'}\n")
+                    if r.error_message:
+                        f.write(f"  Error: {r.error_message}\n")
+                    for o in r.oid_results:
+                        f.write(f"  - {o.oid} ({o.status}): {o.value or o.error_message}\n")
+                    f.write("-" * 50 + "\n")
+                    
+            # 2. snmp_summary.csv if enabled
+            if settings.write_csv_summaries:
+                summary_csv_path = output_dir / "snmp_summary.csv"
+                with open(summary_csv_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        "Host", "Host Status", "SNMP Mode", "Version Used",
+                        "Security Level", "Credential Label", "OID",
+                        "Value Type", "Value", "Error"
+                    ])
+                    for r in host_results:
+                        if not r.oid_results:
+                            writer.writerow([
+                                r.host, r.host_status, r.snmp_mode, r.snmp_version_used,
+                                r.security_level_used, r.credential_label, "",
+                                "", "", r.error_message
+                            ])
+                        for o in r.oid_results:
+                            writer.writerow([
+                                r.host, r.host_status, r.snmp_mode, r.snmp_version_used,
+                                r.security_level_used, r.credential_label, o.oid,
+                                o.value_type, o.value, o.error_message
+                            ])
+                            
+            # 3. index.txt
+            index_path = output_dir / "index.txt"
+            with open(index_path, "w", encoding="utf-8") as f:
+                f.write(f"index of scans for run {run_id}\n")
+                for r in host_results:
+                    safe_h = FilenameSafety.safe_host_label(r.host)
+                    f.write(f"{r.host} - status={r.host_status} - report=hosts/{safe_h}_report.txt\n")
+                    
+            if self.stop_event.is_set():
+                self.set_status("Stopped by user")
+            else:
+                self.set_progress(100)
+                self.set_status("Done")
+                self.enqueue("LOG_EXEC", f"\n=== SCAN DONE ===")
+                self.enqueue("LOG_EXEC", f"Outputs written to: {output_dir}")
+                
+        except Exception as e:
+            self.set_status("Error")
+            self.enqueue("LOG_EXEC", f"\nERROR during scan: {str(e)}")
+        finally:
+            self.enqueue("SET_BUTTONS", tk.NORMAL, tk.DISABLED)
+            self.is_running = False
+
+
 class LandingPage(tk.Frame):
     def __init__(self, parent, controller):
         super().__init__(parent)
@@ -5476,6 +6802,7 @@ class ScannerLandingPage(tk.Frame):
         tk.Button(grid_frame, text="Device Inventory Scanner", width=30, height=2, command=lambda: controller.show_frame("DeviceInventoryScannerPage")).grid(row=2, column=0, padx=10, pady=10)
         tk.Button(grid_frame, text="Optics Scanner", width=30, height=2, command=lambda: controller.show_frame("OpticsScannerPage")).grid(row=2, column=1, padx=10, pady=10)
         tk.Button(grid_frame, text="BGP/Route Summary", width=30, height=2, command=lambda: controller.show_frame("RoutesAdvertisedReceivedScannerPage")).grid(row=3, column=0, columnspan=2, padx=10, pady=10)
+        tk.Button(grid_frame, text="SNMP OID Scanner", width=30, height=2, command=lambda: controller.show_frame("SnmpOidScannerPage")).grid(row=4, column=0, columnspan=2, padx=10, pady=10)
 
 
 
@@ -5865,6 +7192,7 @@ class NetworkToolbeltApp(tk.Tk):
         super().__init__()
         self.credential_store = CredentialStore()
         self.target_credential_store = TargetCredentialMapStore()
+        self.snmp_credential_store = SnmpCredentialStore()
         self.documentation_window = None
         self.tool_command_manager = ToolCommandManager()
         self.title(f"Network Toolbelt v{APP_VERSION}")
@@ -5880,7 +7208,7 @@ class NetworkToolbeltApp(tk.Tk):
 
         self.frames = {}
         
-        for F in (LandingPage, CredentialManagerLibraryPage, MaintenanceRunnerPage, CommandRunnerPage, ScannerLandingPage, InterfaceErrorScannerPage, PortChannelScannerPage, RoutingNeighborScannerPage, LogScannerPage, DeviceInventoryScannerPage, OpticsScannerPage, RoutesAdvertisedReceivedScannerPage, ConfigBackupStubPage, OutageSnapshotStubPage, ReachabilityStubPage, VlanTrunkStubPage, StpHealthStubPage):
+        for F in (LandingPage, CredentialManagerLibraryPage, MaintenanceRunnerPage, CommandRunnerPage, ScannerLandingPage, InterfaceErrorScannerPage, PortChannelScannerPage, RoutingNeighborScannerPage, LogScannerPage, DeviceInventoryScannerPage, OpticsScannerPage, RoutesAdvertisedReceivedScannerPage, ConfigBackupStubPage, OutageSnapshotStubPage, ReachabilityStubPage, VlanTrunkStubPage, StpHealthStubPage, SnmpCredentialManagerPage, SnmpOidScannerPage):
 
             page_name = F.__name__
             frame = F(parent=self.container, controller=self)
@@ -5901,7 +7229,9 @@ class NetworkToolbeltApp(tk.Tk):
         file_menu.add_command(label="Generic Command Runner", command=lambda: self.show_frame("CommandRunnerPage"))
         file_menu.add_command(label="Maintenance Pre/Post Runner", command=lambda: self.show_frame("MaintenanceRunnerPage"))
         file_menu.add_command(label="Network Scanners", command=lambda: self.show_frame("ScannerLandingPage"))
-        file_menu.add_command(label="Credential Manager & Library", command=lambda: self.show_frame("CredentialManagerLibraryPage"))
+        file_menu.add_command(label="SNMP OID Scanner", command=lambda: self.show_frame("SnmpOidScannerPage"))
+        file_menu.add_command(label="SSH Credential Manager", command=lambda: self.show_frame("CredentialManagerLibraryPage"))
+        file_menu.add_command(label="SNMP Credential Manager", command=lambda: self.show_frame("SnmpCredentialManagerPage"))
 
         file_menu.add_separator()
         
@@ -6582,6 +7912,89 @@ Cisco IOS Software
     except Exception as e:
         print(f"Skipping GUI test: {e}")
         
+    # --- SNMP SCANNER SELF-TESTS ---
+    print("Running SNMP Scanner Engine Self-Tests...")
+    
+    # 1. Dependency checks
+    assert _PYSNMP_AVAILABLE, "pysnmp must be available when running self-tests"
+    import cryptography
+    assert cryptography.__version__, "cryptography must be available"
+    
+    # 2. SNMP OID Validation checks
+    assert validate_snmp_oid("1.3.6.1.2.1.1.1.0") == (True, ".1.3.6.1.2.1.1.1.0")
+    assert validate_snmp_oid(".1.3.6.1.2.1.1.5.0") == (True, ".1.3.6.1.2.1.1.5.0")
+    assert validate_snmp_oid("sysDescr")[0] == False
+    assert validate_snmp_oid("1.3.6; rm -rf /")[0] == False
+    assert validate_snmp_oid("")[0] == False
+    
+    # 3. Credential Record Safe Display and Sort checks
+    c_v1 = SnmpCredentialRecord(id="1", label="TestV1", version="v1", security_level="community", community="secretv1")
+    assert "secretv1" not in c_v1.safe_display()
+    assert c_v1.sort_priority() == 5
+    
+    c_v2c = SnmpCredentialRecord(id="2", label="TestV2c", version="v2c", security_level="community", community="secretv2c")
+    assert "secretv2c" not in c_v2c.safe_display()
+    assert c_v2c.sort_priority() == 4
+    
+    c_v3 = SnmpCredentialRecord(
+        id="3", label="TestV3", version="v3", security_level="authPriv",
+        username="user3", auth_key="authpass123", priv_key="privpass123",
+        auth_protocol="SHA", priv_protocol="AES"
+    )
+    assert "authpass123" not in c_v3.safe_display()
+    assert "privpass123" not in c_v3.safe_display()
+    assert c_v3.sort_priority() == 1
+    
+    # 4. SnmpCredentialStore CRUD, list_safe, and filter checks
+    store = SnmpCredentialStore()
+    store.add_v1_v2c("L1", "v2c", "pub")
+    store.add_v3("L2", "usr", "authPriv", "authpass123", "privpass123", "SHA", "AES")
+    assert store.count() == 2
+    assert store.enabled_count() == 2
+    
+    recs = store.all_safe_records()
+    assert len(recs) == 2
+    for r in recs:
+        assert "community" not in r
+        assert "auth_key" not in r
+        assert "priv_key" not in r
+        
+    v2_el = store.get_eligible_credentials("Force SNMPv2c")
+    assert len(v2_el) == 1
+    assert v2_el[0].label == "L1"
+    
+    v3_el = store.get_eligible_credentials("Force SNMPv3")
+    assert len(v3_el) == 1
+    assert v3_el[0].label == "L2"
+    
+    # 5. CommunityData message_processing_model mappings
+    auth_v1 = SnmpClient._get_auth_data(SnmpCredentialRecord("1", "L", "v1", "community", "pub"))
+    assert auth_v1.message_processing_model == 0
+    auth_v2 = SnmpClient._get_auth_data(SnmpCredentialRecord("2", "L", "v2c", "community", "pub"))
+    assert auth_v2.message_processing_model == 1
+    
+    # 6. SNMPv3 UsmUserData protocol mappings
+    auth_v3_none = SnmpClient._get_auth_data(SnmpCredentialRecord("3", "L", "v3", "noAuthNoPriv", username="u"))
+    assert auth_v3_none.authentication_protocol == (1, 3, 6, 1, 6, 3, 10, 1, 1, 1) # usmNoAuthProtocol
+    
+    # 7. Redaction tests for SNMP
+    snmp_lines = [
+        "snmp-server community public RO",
+        "snmp-server community mySecret RW",
+        "snmp-server user monitor GROUP v3 auth sha authpass",
+        "snmp-server user monitor GROUP v3 auth sha authpass priv aes 128 privpass",
+        "snmp-server user monitor GROUP v3 auth sha authpass priv aes 256 privpass"
+    ]
+    for line in snmp_lines:
+        redacted = redactor.redact_text(line)
+        assert "public" not in redacted
+        assert "mySecret" not in redacted
+        assert "authpass" not in redacted
+        assert "privpass" not in redacted
+        # Verify it keeps structural parts
+        assert "snmp-server community" in redacted or "snmp-server user" in redacted
+        
+    print("All SNMP Scanner Engine self-tests passed.")
     print("All execution self-tests passed.")
 
 def main():
