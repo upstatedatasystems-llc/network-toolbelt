@@ -347,21 +347,14 @@ This pattern is used by runner pages, scanner pages, and mapper workflows.
 
 ## 8. Core Workflows
 
-### 8.1 Credential Setup
+### 8.1 Credential & Target Setup (Credential Manager & Library)
 
-1. Open Credential Manager.
-2. Add one or more credential sets.
-3. Return to Dashboard.
-4. Confirm loaded credential count.
-
-### 8.2 Target and Credential Mapping
-
-1. Open Set Target IPs & Credentials.
-2. Enter targets.
-3. Start credential mapping or test a single IP.
-4. Review mapping table and logs.
-5. Return to Dashboard.
-6. Open a tool; targets auto-populate when the tool target box is empty.
+1. Open **Credential Manager & Library** from the dashboard.
+2. Under **Add / Edit Credential**, fill in the label, username, and password/secret, then click **Save Credential**.
+3. Under **Target IP & Platform Mapping**, enter the targets in the targets list.
+4. Adjust fast mapping platform or probe settings if desired, then click **Start Credential Mapping** to verify access.
+5. Review library credentials in the **Credentials Library** list, and mapping progress in the mapping table and logs.
+6. When navigating to other tools, the mapped targets and credentials will auto-populate as needed.
 
 ### 8.3 Generic Command Run
 
@@ -456,18 +449,14 @@ Exports are user-selected save files and can include:
 
 ## 10. Implemented Tools
 
-### 10.1 Credential Manager
+### 10.1 Credential Manager & Library
 
-Loads, edits, deletes, and clears volatile credential records. Now fully inline instead of relying on popups.
+Unified inline in-app page that combines credential and target mapping workflows:
 
-### 10.2 Set Target IPs & Credentials
-
-Embedded in-app page for:
-
-- Managing session targets via an inline multiline text editor.
-- Mapping targets to credentials.
-- Testing a single IP.
-- Viewing mapping status and logs.
+- **Add / Edit Credential:** Form to input and save volatile credentials.
+- **Credentials Library:** Displays all active session credentials and allows deleting or clearing them.
+- **Target IP & Platform Mapping:** Inline multiline text editor to input targets, configure platforms, and initiate/stop mapping.
+- **Mapped Host List:** Interactive treeview display showing host, status, mapped credential, username, detected platform, and mapping result logs.
 
 ### 10.3 Generic Command Runner
 
@@ -656,8 +645,7 @@ Then verify:
 - App launches.
 - Dashboard opens.
 - Version/title are correct.
-- Credential Manager works.
-- Mapper page opens in-window.
+- Credential Manager & Library page opens and works.
 - Generic Command Runner works on one safe device.
 - Maintenance Pre/Post works on one safe device.
 - At least one scanner runs on one safe device.

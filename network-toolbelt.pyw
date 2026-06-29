@@ -3144,66 +3144,191 @@ class ToolCommandConfigWindow(tk.Toplevel):
                 return
         self.destroy()
 
-class CredentialManagerPage(tk.Frame):
+class CredentialManagerLibraryPage(tk.Frame):
     def __init__(self, parent, controller):
         super().__init__(parent)
+        self.title_text = "Credential Manager & Library"
         self.controller = controller
+        self.mapping_store = self.controller.target_credential_store
+        self.credential_store = self.controller.credential_store
         
-        tk.Button(self, text="← Back to Dashboard", command=lambda: controller.show_frame("LandingPage")).pack(anchor="w", pady=5, padx=10)
-        tk.Label(self, text="Credential Manager", font=("Arial", 18, "bold")).pack(pady=10)
+        self.ui_queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.is_running = False
+        self.current_edit_id = None
         
-        self.status_lbl = tk.Label(self, text="Credentials loaded: 0", font=("Arial", 12))
-        self.status_lbl.pack(pady=5)
+        self._setup_ui()
+        self.after(100, self.process_queue)
         
-        main_pane = tk.PanedWindow(self, orient=tk.HORIZONTAL)
-        main_pane.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+    def _setup_ui(self):
+        # 1. Nav Frame
+        nav_frame = tk.Frame(self)
+        nav_frame.pack(fill=tk.X, pady=5, padx=10)
+        tk.Button(nav_frame, text="← Back to Dashboard", command=lambda: self.controller.show_frame("LandingPage")).pack(side=tk.LEFT)
         
-        left_frame = tk.Frame(main_pane)
-        main_pane.add(left_frame, minsize=300)
+        # 2. Top Frame (Status & Progress)
+        top_frame = tk.Frame(self)
+        top_frame.pack(fill=tk.X, padx=10, pady=5)
         
-        right_frame = tk.Frame(main_pane)
-        main_pane.add(right_frame, minsize=300)
+        self.status_lbl = tk.Label(top_frame, text="Idle", font=("Arial", 12, "bold"))
+        self.status_lbl.pack(side=tk.LEFT)
         
-        self.listbox = tk.Listbox(left_frame, font=("Arial", 11))
+        self.progress = ttk.Progressbar(top_frame, orient=tk.HORIZONTAL, length=400, mode='determinate')
+        self.progress.pack(side=tk.RIGHT, padx=10)
+        
+        # 3. Main Pane (Vertical split: Upper Content, Lower Log)
+        main_pane = tk.PanedWindow(self, orient=tk.VERTICAL)
+        main_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        # Upper Frame containing Left and Right Columns
+        upper_frame = tk.Frame(main_pane)
+        main_pane.add(upper_frame, minsize=400)
+        
+        # --- LEFT COLUMN (Add/Edit Credential & Mapping Controls) ---
+        left_container = tk.Frame(upper_frame)
+        left_container.pack(side=tk.LEFT, fill=tk.Y, padx=5)
+        
+        # A. Add/Edit Credential LabelFrame
+        cred_form_frame = tk.LabelFrame(left_container, text="Add / Edit Credential", font=("Arial", 11, "bold"))
+        cred_form_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        tk.Label(cred_form_frame, text="Label:").pack(anchor=tk.W, padx=5, pady=(5,0))
+        self.lbl_var = tk.StringVar()
+        tk.Entry(cred_form_frame, textvariable=self.lbl_var, width=30).pack(fill=tk.X, padx=5, pady=2)
+        
+        tk.Label(cred_form_frame, text="Username:").pack(anchor=tk.W, padx=5, pady=(5,0))
+        self.user_var = tk.StringVar()
+        tk.Entry(cred_form_frame, textvariable=self.user_var, width=30).pack(fill=tk.X, padx=5, pady=2)
+        
+        tk.Label(cred_form_frame, text="Password (leave blank to keep existing):").pack(anchor=tk.W, padx=5, pady=(5,0))
+        self.pass_var = tk.StringVar()
+        tk.Entry(cred_form_frame, textvariable=self.pass_var, show="*", width=30).pack(fill=tk.X, padx=5, pady=2)
+        
+        tk.Label(cred_form_frame, text="Enable Secret (leave blank to keep existing):").pack(anchor=tk.W, padx=5, pady=(5,0))
+        self.sec_var = tk.StringVar()
+        tk.Entry(cred_form_frame, textvariable=self.sec_var, show="*", width=30).pack(fill=tk.X, padx=5, pady=2)
+        
+        form_btn_frame = tk.Frame(cred_form_frame)
+        form_btn_frame.pack(pady=10, fill=tk.X)
+        tk.Button(form_btn_frame, text="Save Credential", command=self.save_cred, width=15).pack(side=tk.LEFT, padx=5)
+        tk.Button(form_btn_frame, text="New / Clear", command=self.clear_form, width=12).pack(side=tk.LEFT, padx=5)
+        
+        # B. Mapping Controls LabelFrame
+        mapping_controls_frame = tk.LabelFrame(left_container, text="Target IP & Platform Mapping", font=("Arial", 11, "bold"))
+        mapping_controls_frame.pack(fill=tk.BOTH, expand=True)
+        
+        tk.Label(mapping_controls_frame, text="Targets (IP/Hostname):", font=("Arial", 10, "bold")).pack(anchor=tk.W, padx=5, pady=(5,0))
+        self.targets_text = tk.Text(mapping_controls_frame, height=6, width=30)
+        self.targets_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=2)
+        
+        tk.Label(mapping_controls_frame, text="Platform for Fast Mapping:").pack(anchor=tk.W, padx=5, pady=(5,0))
+        self.fast_platform_var = tk.StringVar(value="Cisco IOS/IOS-XE")
+        fast_platform_cb = ttk.Combobox(mapping_controls_frame, textvariable=self.fast_platform_var, values=["Cisco IOS/IOS-XE", "Cisco NX-OS", "Cisco ASA", "Auto Detect"])
+        fast_platform_cb.pack(fill=tk.X, padx=5, pady=2)
+        
+        self.probe_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(mapping_controls_frame, text="Run platform detection", variable=self.probe_var).pack(anchor=tk.W, padx=5)
+        
+        self.retest_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(mapping_controls_frame, text="Re-test already mapped", variable=self.retest_var).pack(anchor=tk.W, padx=5)
+        
+        map_btn_frame = tk.Frame(mapping_controls_frame)
+        map_btn_frame.pack(pady=5, fill=tk.X)
+        self.start_btn = tk.Button(map_btn_frame, text="Start Mapping", command=self.start_mapping, width=14)
+        self.start_btn.pack(side=tk.LEFT, padx=2)
+        self.stop_btn = tk.Button(map_btn_frame, text="STOP", command=self.stop_mapping, state=tk.DISABLED, width=6)
+        self.stop_btn.pack(side=tk.LEFT, padx=2)
+        tk.Button(map_btn_frame, text="Clear Session", command=self.clear_session, width=12).pack(side=tk.LEFT, padx=2)
+        
+        self.stats_lbl = tk.Label(mapping_controls_frame, text="", justify=tk.LEFT)
+        self.stats_lbl.pack(anchor=tk.W, padx=5, pady=5)
+        
+        # --- RIGHT COLUMN (Credentials Listbox & Mapped Hosts Treeview) ---
+        right_container = tk.Frame(upper_frame)
+        right_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
+        
+        # A. Credentials Library LabelFrame
+        cred_library_frame = tk.LabelFrame(right_container, text="Credentials Library", font=("Arial", 11, "bold"))
+        cred_library_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
+        
+        lib_content = tk.Frame(cred_library_frame)
+        lib_content.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        list_frame = tk.Frame(lib_content)
+        list_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        self.listbox = tk.Listbox(list_frame, font=("Arial", 11), height=6)
         self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
-        scroll = tk.Scrollbar(left_frame, command=self.listbox.yview)
+        scroll = tk.Scrollbar(list_frame, command=self.listbox.yview)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.listbox.config(yscrollcommand=scroll.set)
         
         self.listbox.bind('<<ListboxSelect>>', self.on_select)
         
-        btn_frame = tk.Frame(self)
-        btn_frame.pack(pady=10)
+        lib_btn_frame = tk.Frame(lib_content)
+        lib_btn_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=10, pady=5)
         
-        tk.Button(btn_frame, text="Delete Selected", command=self.delete_cred).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Clear All", command=self.clear_creds).pack(side=tk.LEFT, padx=5)
+        tk.Button(lib_btn_frame, text="Delete Selected", command=self.delete_cred, width=18).pack(pady=5)
+        tk.Button(lib_btn_frame, text="Clear Library", command=self.clear_creds, width=18).pack(pady=5)
         
-        tk.Label(right_frame, text="Add / Edit Credential", font=("Arial", 14, "bold")).pack(pady=10)
+        # B. Mapped Host List LabelFrame
+        host_mapping_frame = tk.LabelFrame(right_container, text="Mapped Host List", font=("Arial", 11, "bold"))
+        host_mapping_frame.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
         
-        tk.Label(right_frame, text="Label:").pack(pady=(10,0))
-        self.lbl_var = tk.StringVar()
-        tk.Entry(right_frame, textvariable=self.lbl_var, width=30).pack()
+        cols = ("Host", "Status", "Mapped Credential", "Username", "Platform", "Last Tested", "Result")
+        self.tree = ttk.Treeview(host_mapping_frame, columns=cols, show="headings")
+        for c in cols:
+            self.tree.heading(c, text=c)
+            self.tree.column(c, width=110)
+        self.tree.column("Host", width=130)
+        self.tree.column("Mapped Credential", width=130)
+        self.tree.column("Result", width=200)
         
-        tk.Label(right_frame, text="Username:").pack(pady=(10,0))
-        self.user_var = tk.StringVar()
-        tk.Entry(right_frame, textvariable=self.user_var, width=30).pack()
+        yscroll = ttk.Scrollbar(host_mapping_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscroll=yscroll.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5,0), pady=5)
+        yscroll.pack(side=tk.RIGHT, fill=tk.Y, pady=5, padx=(0,5))
         
-        tk.Label(right_frame, text="Password (leave blank to keep existing):").pack(pady=(10,0))
-        self.pass_var = tk.StringVar()
-        tk.Entry(right_frame, textvariable=self.pass_var, show="*", width=30).pack()
+        # --- LOWER PANEL (Execution & Session Logs) ---
+        log_frame = tk.Frame(main_pane)
+        main_pane.add(log_frame, minsize=200)
         
-        tk.Label(right_frame, text="Enable Secret (leave blank to keep existing):").pack(pady=(10,0))
-        self.sec_var = tk.StringVar()
-        tk.Entry(right_frame, textvariable=self.sec_var, show="*", width=30).pack()
+        exec_frame = tk.Frame(log_frame)
+        exec_frame.pack(fill=tk.BOTH, expand=True)
+        tk.Label(exec_frame, text="Execution Log").pack(anchor=tk.W)
+        self.exec_log = tk.Text(exec_frame, height=5)
+        self.exec_log.pack(fill=tk.BOTH, expand=True)
         
-        self.current_edit_id = None
+        sess_frame = tk.Frame(log_frame)
+        sess_frame.pack(fill=tk.BOTH, expand=False)
         
-        form_btn_frame = tk.Frame(right_frame)
-        form_btn_frame.pack(pady=20)
+        self.sess_container = tk.Frame(sess_frame)
         
-        tk.Button(form_btn_frame, text="Save Credential", command=self.save_cred).pack(side=tk.LEFT, padx=5)
-        tk.Button(form_btn_frame, text="New / Clear", command=self.clear_form).pack(side=tk.LEFT, padx=5)
+        def toggle_session_log():
+            if self.sess_container.winfo_manager():
+                self.sess_container.pack_forget()
+                self.toggle_sess_btn.config(text="Show Session Log ▶")
+            else:
+                self.sess_container.pack(fill=tk.BOTH, expand=True)
+                self.toggle_sess_btn.config(text="Hide Session Log ▼")
+                
+        self.toggle_sess_btn = tk.Button(sess_frame, text="Show Session Log ▶", command=toggle_session_log)
+        self.toggle_sess_btn.pack(anchor=tk.W)
+        
+        self.sess_lbl = tk.Label(self.sess_container, text="Session Log")
+        self.sess_lbl.pack(anchor=tk.W)
+        self.sess_log = tk.Text(self.sess_container, height=5)
+        self.sess_log.pack(fill=tk.BOTH, expand=True)
+        
+        self.refresh_targets_text()
+        self.refresh_list()
+        self.update_stats()
+        
+    def log_message(self, message):
+        ts = datetime.now().strftime('%H:%M:%S')
+        self.exec_log.insert(tk.END, f"[{ts}] {message}\n")
+        self.exec_log.see(tk.END)
         
     def on_select(self, event):
         sel = self.listbox.curselection()
@@ -3246,6 +3371,10 @@ class CredentialManagerPage(tk.Frame):
             password_changed = p != ""
             secret_changed = s != ""
             self.controller.credential_store.update(record.id, l, u, p, s)
+            
+            has_secret = "yes" if (s or record.secret) else "no"
+            self.log_message(f"Updated credential: label='{l}', username='{u}', enable_secret='{has_secret}'")
+            
             if (username_changed or password_changed or secret_changed) and hasattr(self.controller, "target_credential_store"):
                 self.controller.target_credential_store.mark_stale_for_credential(record.id)
             elif hasattr(self.controller, "target_credential_store"):
@@ -3254,9 +3383,13 @@ class CredentialManagerPage(tk.Frame):
                         m.credential_label = l
         else:
             self.controller.credential_store.add(l, u, p, s)
+            has_secret = "yes" if s else "no"
+            self.log_message(f"Added new credential: label='{l}', username='{u}', enable_secret='{has_secret}'")
             
         self.refresh_list()
         self.clear_form()
+        self.refresh_table_from_store()
+        self.update_stats()
         if "LandingPage" in self.controller.frames:
             self.controller.frames["LandingPage"].refresh_credential_status()
 
@@ -3265,18 +3398,24 @@ class CredentialManagerPage(tk.Frame):
         safe_list = self.controller.credential_store.list_safe()
         for item in safe_list:
             self.listbox.insert(tk.END, item)
-        self.status_lbl.config(text=f"Credentials loaded: {len(self.controller.credential_store.records)}")
-        
+            
     def delete_cred(self):
         sel = self.listbox.curselection()
         if not sel: return
         idx = sel[0]
         record = self.controller.credential_store.records[idx]
         self.controller.credential_store.delete(record.id)
+        
+        self.log_message(f"Deleted credential: label='{record.label}', username='{record.username}'")
+        
         if hasattr(self.controller, "target_credential_store"):
             self.controller.target_credential_store.mark_stale_for_credential(record.id)
         self.refresh_list()
         self.clear_form()
+        self.refresh_table_from_store()
+        self.update_stats()
+        if hasattr(self.controller, "frames") and "LandingPage" in self.controller.frames:
+            self.controller.frames["LandingPage"].refresh_credential_status()
         
     def clear_creds(self):
         if messagebox.askyesno("Clear All", "Are you sure you want to clear all credentials?"):
@@ -3286,10 +3425,199 @@ class CredentialManagerPage(tk.Frame):
                     m.last_tested = ""
                     m.error_message = "Credential store was cleared"
             self.controller.credential_store.clear()
+            
+            self.log_message("Cleared all credentials from library.")
+            
             self.refresh_list()
             self.clear_form()
+            self.refresh_table_from_store()
+            self.update_stats()
             if hasattr(self.controller, "frames") and "LandingPage" in self.controller.frames:
                 self.controller.frames["LandingPage"].refresh_credential_status()
+
+    def refresh_targets_text(self):
+        self.targets_text.delete("1.0", tk.END)
+        targets = self.mapping_store.get_targets()
+        if targets:
+            self.targets_text.insert(tk.END, "\n".join(targets))
+            
+    def tkraise(self, *args, **kwargs):
+        super().tkraise(*args, **kwargs)
+        self.refresh_targets_text()
+        self.refresh_list()
+        self.refresh_table_from_store()
+        self.update_stats()
+        
+    def has_active_run(self):
+        return self.is_running
+        
+    def stop_and_clear_for_navigation(self, retain_targets=True, retain_credentials=True):
+        if self.is_running:
+            self.stop_event.set()
+        self.is_running = False
+        self.start_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
+        self.status_lbl.config(text="Idle")
+        self.progress["value"] = 0
+        if not retain_targets:
+            self.mapping_store.clear_targets()
+            self.mapping_store.clear_mappings()
+        if not retain_credentials:
+            for m in self.mapping_store.mappings.values():
+                m.status = "STALE"
+                m.last_tested = ""
+                m.error_message = "Credential store was cleared"
+        self.refresh_table_from_store()
+        self.refresh_list()
+        self.update_stats()
+        
+    def update_stats(self):
+        c_count = len(self.credential_store.records)
+        t_count = len(self.mapping_store.targets)
+        m_count = self.mapping_store.mapped_count_for_current_targets()
+        self.stats_lbl.config(text=f"Credentials loaded: {c_count}\nTargets loaded: {t_count}\nMapped targets: {m_count}/{t_count}")
+        
+    def refresh_table_from_store(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+            
+        seen_iids = set()
+        for host in self.mapping_store.targets:
+            iid = host.strip().lower()
+            if iid in seen_iids:
+                continue  # skip duplicate — already in tree
+            seen_iids.add(iid)
+            m = self.mapping_store.get_mapping(host)
+            if m:
+                self.tree.insert("", "end", iid=iid, values=(m.host, m.status, m.credential_label, m.username, m.detected_platform, m.last_tested, m.error_message))
+            else:
+                self.tree.insert("", "end", iid=iid, values=(host, "UNMAPPED", "", "", "", "", ""))
+                
+    def clear_session(self):
+        if messagebox.askyesno("Clear", "Clear all mapping session data?", parent=self):
+            self.mapping_store.clear_all()
+            self.log_message("Cleared mapping session data (targets & mappings).")
+            self.refresh_table_from_store()
+            self.update_stats()
+            self.refresh_list()
+            self.controller.frames["LandingPage"].refresh_credential_status()
+            self.exec_log.delete("1.0", tk.END)
+            
+    def process_queue(self):
+        try:
+            while True:
+                msg_type, data = self.ui_queue.get_nowait()
+                if msg_type == "LOG":
+                    self.exec_log.insert(tk.END, data + "\n")
+                    self.exec_log.see(tk.END)
+                elif msg_type == "STATUS_ROW":
+                    host, status, cred, user, plat, last, err = data
+                    iid = host.strip().lower()
+                    if self.tree.exists(iid):
+                        self.tree.item(iid, values=(host, status, cred, user, plat, last, err))
+                    else:
+                        self.tree.insert("", "end", iid=iid, values=(host, status, cred, user, plat, last, err))
+                elif msg_type == "PROGRESS":
+                    idx, total = data
+                    self.progress["maximum"] = total
+                    self.progress["value"] = idx
+                elif msg_type == "SESS_LOG":
+                    self.sess_log.insert(tk.END, data)
+                    self.sess_log.see(tk.END)
+                elif msg_type == "DONE":
+                    self.is_running = False
+                    self.start_btn.config(state=tk.NORMAL)
+                    self.stop_btn.config(state=tk.DISABLED)
+                    if self.stop_event.is_set():
+                        self.status_lbl.config(text="Stopped by user")
+                    else:
+                        self.status_lbl.config(text="Done")
+                        self.progress["value"] = self.progress["maximum"]
+                    self.update_stats()
+                    self.controller.frames["LandingPage"].refresh_credential_status()
+        except queue.Empty:
+            pass
+        finally:
+            if self.winfo_exists():
+                self.after(100, self.process_queue)
+                
+    def _run_mapping(self, targets):
+        if not self.credential_store.records:
+            messagebox.showerror("Error", "No credentials loaded. Add credentials in Credential Manager first.", parent=self)
+            return
+        if not targets:
+            messagebox.showerror("Error", "No target IPs to test.", parent=self)
+            return
+            
+        self.is_running = True
+        self.stop_event.clear()
+        self.start_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.status_lbl.config(text="Mapping...")
+        self.progress["value"] = 0
+        
+        self.sess_lbl.config(text="Session Log", fg=THEMES[settings.current_theme]["fg"])
+        self.sess_log.delete("1.0", tk.END)
+        self.exec_log.delete("1.0", tk.END)
+
+        def _log(msg): self.ui_queue.put(("LOG", msg))
+        def _stat(h, s, c, u, p, l, e): self.ui_queue.put(("STATUS_ROW", (h, s, c, u, p, l, e)))
+        def _prog(i, t): self.ui_queue.put(("PROGRESS", (i, t)))
+        def _sess_log(msg): self.ui_queue.put(("SESS_LOG", msg))
+        
+        callbacks = {"log_cb": _log, "status_cb": _stat, "progress_cb": _prog, "sess_log_cb": _sess_log}
+        
+        platform_name = self.fast_platform_var.get().strip()
+        if platform_name == "Auto Detect":
+            platform_choice = "Auto Detect"
+        elif platform_name == "Cisco IOS/IOS-XE":
+            platform_choice = "Cisco IOS"
+        elif platform_name == "Cisco NX-OS":
+            platform_choice = "Cisco NX-OS"
+        elif platform_name == "Cisco ASA":
+            platform_choice = "Cisco ASA"
+        else:
+            platform_choice = "Auto Detect"
+            
+        run_probe = self.probe_var.get()
+
+        def run():
+            CredentialMappingRunner.map_targets(
+                targets, self.credential_store, self.mapping_store, platform_choice,
+                callbacks, self.stop_event, self.retest_var.get(), True, "redacted", run_probe
+            )
+            self.ui_queue.put(("DONE", None))
+            
+        threading.Thread(target=run, daemon=True).start()
+
+    def start_mapping(self):
+        try:
+            lines = self.targets_text.get("1.0", "end").splitlines()
+            hosts = []
+            for line in lines:
+                line = line.strip()
+                if not line: continue
+                if "," in line:
+                    for part in line.split(","):
+                        if part.strip(): hosts.append(part.strip())
+                else:
+                    hosts.append(line)
+            self.mapping_store.set_targets(hosts)  # deduplicates internally
+            self.refresh_table_from_store()
+            
+            targets = self.mapping_store.get_targets()
+            if not targets:
+                messagebox.showerror("Error", "No targets to map. Please enter targets first.", parent=self)
+                return
+                
+            self.log_message(f"Starting target credential mapping for {len(targets)} host(s)...")
+            self._run_mapping(targets)
+        except Exception as e:
+            messagebox.showerror("Mapping Error", f"Failed to start mapping:\n{type(e).__name__}: {e}", parent=self)
+        
+    def stop_mapping(self):
+        self.stop_event.set()
+        self.log_message("Stop mapping request sent.")
 
 class CredentialStatusPanel(tk.LabelFrame):
     def __init__(self, parent, controller, **kwargs):
@@ -3299,7 +3627,7 @@ class CredentialStatusPanel(tk.LabelFrame):
         self.status_lbl = tk.Label(self, text="Credentials loaded: 0", font=("Arial", 10))
         self.status_lbl.pack(pady=5, padx=5, anchor="w")
         
-        tk.Button(self, text="Manage Credentials", command=lambda: self.controller.show_frame("CredentialManagerPage")).pack(pady=5, padx=5, anchor="w")
+        tk.Button(self, text="Manage Credentials & Library", command=lambda: self.controller.show_frame("CredentialManagerLibraryPage")).pack(pady=5, padx=5, anchor="w")
         
     def refresh(self):
         count = len(self.controller.credential_store.records)
@@ -4348,8 +4676,7 @@ class LandingPage(tk.Frame):
 
         self.cred_status_lbl = tk.Label(col2, text="Credentials loaded: 0", font=("Arial", 12))
         self.cred_status_lbl.pack(pady=(20, 10))
-        tk.Button(col2, text="Credential Manager", width=30, height=2, font=("Arial", 14), command=lambda: controller.show_frame("CredentialManagerPage")).pack(pady=10, padx=20)
-        tk.Button(col2, text="Set Target IPs & Credentials", width=30, height=2, font=("Arial", 14), command=lambda: controller.open_target_credential_mapper()).pack(pady=10, padx=20)
+        tk.Button(col2, text="Credential Manager & Library", width=30, height=2, font=("Arial", 14), command=lambda: controller.show_frame("CredentialManagerLibraryPage")).pack(pady=10, padx=20)
         tk.Button(col2, text="Help & Documentation", width=30, height=2, font=("Arial", 14), command=lambda: controller.open_documentation()).pack(pady=10, padx=20)
 
     def tkraise(self, *args, **kwargs):
@@ -5311,298 +5638,7 @@ class CredentialMappingRunner:
             log_cb("\n[Mapping Session Complete]")
 
 
-class TargetCredentialMapperPage(tk.Frame):
-    def __init__(self, parent, controller):
-        super().__init__(parent)
-        self.title_text = "Set Target IPs & Credentials"
-        self.controller = controller
-        self.mapping_store = self.controller.target_credential_store
-        self.credential_store = self.controller.credential_store
-        
-        self.ui_queue = queue.Queue()
-        self.stop_event = threading.Event()
-        self.is_running = False
-        
-        self._setup_ui()
-        self.after(100, self.process_queue)
-        
-    def _setup_ui(self):
-        nav_frame = tk.Frame(self)
-        nav_frame.pack(fill=tk.X, pady=5, padx=10)
-        tk.Button(nav_frame, text="← Back to Dashboard", command=lambda: self.controller.show_frame("LandingPage")).pack(side=tk.LEFT)
-        
-        top_frame = tk.Frame(self)
-        top_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        self.status_lbl = tk.Label(top_frame, text="Idle", font=("Arial", 12, "bold"))
-        self.status_lbl.pack(side=tk.LEFT)
-        
-        self.progress = ttk.Progressbar(top_frame, orient=tk.HORIZONTAL, length=400, mode='determinate')
-        self.progress.pack(side=tk.RIGHT, padx=10)
-        
-        main_pane = tk.PanedWindow(self, orient=tk.VERTICAL)
-        main_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        
-        upper_frame = tk.Frame(main_pane)
-        main_pane.add(upper_frame, minsize=300)
-        
-        control_frame = tk.Frame(upper_frame)
-        control_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5)
-        
-        tk.Label(control_frame, text="Targets (IP/Hostname):", font=("Arial", 10, "bold")).pack(anchor=tk.W)
-        self.targets_text = tk.Text(control_frame, height=5, width=30)
-        self.targets_text.pack(pady=2)
-        
-        tk.Label(control_frame, text="Platform for Fast Mapping:").pack(anchor=tk.W)
-        self.fast_platform_var = tk.StringVar(value="Cisco IOS/IOS-XE")
-        fast_platform_cb = ttk.Combobox(control_frame, textvariable=self.fast_platform_var, values=["Cisco IOS/IOS-XE", "Cisco NX-OS", "Cisco ASA", "Auto Detect"])
-        fast_platform_cb.pack(fill=tk.X, pady=2)
-        
-        self.probe_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(control_frame, text="Run platform detection during mapping", variable=self.probe_var).pack(anchor=tk.W, pady=2)
-        
-        self.start_btn = tk.Button(control_frame, text="Start Credential Mapping", command=self.start_mapping, width=25)
-        self.start_btn.pack(pady=5)
-        
-        self.stop_btn = tk.Button(control_frame, text="STOP", command=self.stop_mapping, width=25, state=tk.DISABLED, fg="red")
-        self.stop_btn.pack(pady=2)
-        tk.Button(control_frame, text="Clear Mapping Session", command=self.clear_session, width=25).pack(pady=2)
-        
-        self.retest_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(control_frame, text="Re-test already mapped", variable=self.retest_var).pack(anchor=tk.W, pady=2)
-        
-        self.stats_lbl = tk.Label(control_frame, text="", justify=tk.LEFT)
-        self.stats_lbl.pack(anchor=tk.W, pady=5)
-        self.update_stats()
-        
-        table_frame = tk.Frame(upper_frame)
-        table_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        cols = ("Host", "Status", "Mapped Credential", "Username", "Platform", "Last Tested", "Result")
-        self.tree = ttk.Treeview(table_frame, columns=cols, show="headings")
-        for c in cols:
-            self.tree.heading(c, text=c)
-            self.tree.column(c, width=120)
-        self.tree.column("Host", width=150)
-        self.tree.column("Mapped Credential", width=150)
-        self.tree.column("Result", width=200)
-        
-        yscroll = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscroll=yscroll.set)
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        yscroll.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        log_frame = tk.Frame(main_pane)
-        main_pane.add(log_frame, minsize=200)
-        
-        # Vertical stacking
-        exec_frame = tk.Frame(log_frame)
-        exec_frame.pack(fill=tk.BOTH, expand=True)
-        tk.Label(exec_frame, text="Execution Log").pack(anchor=tk.W)
-        self.exec_log = tk.Text(exec_frame, height=5)
-        self.exec_log.pack(fill=tk.BOTH, expand=True)
-        
-        sess_frame = tk.Frame(log_frame)
-        sess_frame.pack(fill=tk.BOTH, expand=False)
-        
-        self.sess_container = tk.Frame(sess_frame)
-        
-        def toggle_session_log():
-            if self.sess_container.winfo_manager():
-                self.sess_container.pack_forget()
-                self.toggle_sess_btn.config(text="Show Session Log ▶")
-            else:
-                self.sess_container.pack(fill=tk.BOTH, expand=True)
-                self.toggle_sess_btn.config(text="Hide Session Log ▼")
-                
-        self.toggle_sess_btn = tk.Button(sess_frame, text="Show Session Log ▶", command=toggle_session_log)
-        self.toggle_sess_btn.pack(anchor=tk.W)
-        
-        self.sess_lbl = tk.Label(self.sess_container, text="Session Log")
-        self.sess_lbl.pack(anchor=tk.W)
-        self.sess_log = tk.Text(self.sess_container, height=5)
-        self.sess_log.pack(fill=tk.BOTH, expand=True)
-        
-        # Hydrate targets_text with existing targets
-        self.refresh_targets_text()
-        
-    def refresh_targets_text(self):
-        self.targets_text.delete("1.0", tk.END)
-        targets = self.mapping_store.get_targets()
-        if targets:
-            self.targets_text.insert(tk.END, "\n".join(targets))
-        
-    def tkraise(self, *args, **kwargs):
-        super().tkraise(*args, **kwargs)
-        self.refresh_targets_text()
-        self.refresh_table_from_store()
-        self.update_stats()
-        
-    def has_active_run(self):
-        return self.is_running
-        
-    def stop_and_clear_for_navigation(self, retain_targets=True, retain_credentials=True):
-        if self.is_running:
-            self.stop_event.set()
-        self.is_running = False
-        self.start_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.DISABLED)
-        self.status_lbl.config(text="Idle")
-        self.progress["value"] = 0
-        if not retain_targets:
-            self.mapping_store.clear_targets()
-            self.mapping_store.clear_mappings()
-        if not retain_credentials:
-            for m in self.mapping_store.mappings.values():
-                m.status = "STALE"
-                m.last_tested = ""
-                m.error_message = "Credential store was cleared"
-        self.refresh_table_from_store()
-        self.update_stats()
-            
-    def update_stats(self):
-        c_count = len(self.credential_store.records)
-        t_count = len(self.mapping_store.targets)
-        m_count = self.mapping_store.mapped_count_for_current_targets()
-        self.stats_lbl.config(text=f"Credentials loaded: {c_count}   Targets loaded: {t_count}   Mapped targets: {m_count}/{t_count}")
-        
-    def refresh_table_from_store(self):
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-            
-        seen_iids = set()
-        for host in self.mapping_store.targets:
-            iid = host.strip().lower()
-            if iid in seen_iids:
-                continue  # skip duplicate — already in tree
-            seen_iids.add(iid)
-            m = self.mapping_store.get_mapping(host)
-            if m:
-                self.tree.insert("", "end", iid=iid, values=(m.host, m.status, m.credential_label, m.username, m.detected_platform, m.last_tested, m.error_message))
-            else:
-                self.tree.insert("", "end", iid=iid, values=(host, "UNMAPPED", "", "", "", "", ""))
-                
-    def clear_session(self):
-        if messagebox.askyesno("Clear", "Clear all mapping session data?", parent=self):
-            self.mapping_store.clear_all()
-            self.refresh_table_from_store()
-            self.update_stats()
-            self.controller.frames["LandingPage"].refresh_credential_status()
-            self.exec_log.delete("1.0", tk.END)
-            
-    def process_queue(self):
-        try:
-            while True:
-                msg_type, data = self.ui_queue.get_nowait()
-                if msg_type == "LOG":
-                    self.exec_log.insert(tk.END, data + "\n")
-                    self.exec_log.see(tk.END)
-                elif msg_type == "STATUS_ROW":
-                    host, status, cred, user, plat, last, err = data
-                    iid = host.strip().lower()
-                    if self.tree.exists(iid):
-                        self.tree.item(iid, values=(host, status, cred, user, plat, last, err))
-                    else:
-                        self.tree.insert("", "end", iid=iid, values=(host, status, cred, user, plat, last, err))
-                elif msg_type == "PROGRESS":
-                    idx, total = data
-                    self.progress["maximum"] = total
-                    self.progress["value"] = idx
-                elif msg_type == "SESS_LOG":
-                    self.sess_log.insert(tk.END, data)
-                    self.sess_log.see(tk.END)
-                elif msg_type == "DONE":
-                    self.is_running = False
-                    self.start_btn.config(state=tk.NORMAL)
-                    self.stop_btn.config(state=tk.DISABLED)
-                    if self.stop_event.is_set():
-                        self.status_lbl.config(text="Stopped by user")
-                    else:
-                        self.status_lbl.config(text="Done")
-                        self.progress["value"] = self.progress["maximum"]
-                    self.update_stats()
-                    self.controller.frames["LandingPage"].refresh_credential_status()
-        except queue.Empty:
-            pass
-        finally:
-            if self.winfo_exists():
-                self.after(100, self.process_queue)
-                
-    def _run_mapping(self, targets):
-        if not self.credential_store.records:
-            messagebox.showerror("Error", "No credentials loaded. Add credentials in Credential Manager first.", parent=self)
-            return
-        if not targets:
-            messagebox.showerror("Error", "No target IPs to test.", parent=self)
-            return
-            
-        self.is_running = True
-        self.stop_event.clear()
-        self.start_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.NORMAL)
-        self.status_lbl.config(text="Mapping...")
-        self.progress["value"] = 0
-        
-        self.sess_lbl.config(text="Session Log", fg=THEMES[settings.current_theme]["fg"])
-        self.sess_log.delete("1.0", tk.END)
-        self.exec_log.delete("1.0", tk.END)
-
-        def _log(msg): self.ui_queue.put(("LOG", msg))
-        def _stat(h, s, c, u, p, l, e): self.ui_queue.put(("STATUS_ROW", (h, s, c, u, p, l, e)))
-        def _prog(i, t): self.ui_queue.put(("PROGRESS", (i, t)))
-        def _sess_log(msg): self.ui_queue.put(("SESS_LOG", msg))
-        
-        callbacks = {"log_cb": _log, "status_cb": _stat, "progress_cb": _prog, "sess_log_cb": _sess_log}
-        
-        platform_name = self.fast_platform_var.get().strip()
-        if platform_name == "Auto Detect":
-            platform_choice = "Auto Detect"
-        elif platform_name == "Cisco IOS/IOS-XE":
-            platform_choice = "Cisco IOS"
-        elif platform_name == "Cisco NX-OS":
-            platform_choice = "Cisco NX-OS"
-        elif platform_name == "Cisco ASA":
-            platform_choice = "Cisco ASA"
-        else:
-            platform_choice = "Auto Detect"
-            
-        run_probe = self.probe_var.get()
-
-        def run():
-            CredentialMappingRunner.map_targets(
-                targets, self.credential_store, self.mapping_store, platform_choice,
-                callbacks, self.stop_event, self.retest_var.get(), True, "redacted", run_probe
-            )
-            self.ui_queue.put(("DONE", None))
-            
-        threading.Thread(target=run, daemon=True).start()
-
-    def start_mapping(self):
-        try:
-            lines = self.targets_text.get("1.0", "end").splitlines()
-            hosts = []
-            for line in lines:
-                line = line.strip()
-                if not line: continue
-                if "," in line:
-                    for part in line.split(","):
-                        if part.strip(): hosts.append(part.strip())
-                else:
-                    hosts.append(line)
-            self.mapping_store.set_targets(hosts)  # deduplicates internally
-            self.refresh_table_from_store()
-            
-            targets = self.mapping_store.get_targets()
-            if not targets:
-                messagebox.showerror("Error", "No targets to map. Please enter targets first.", parent=self)
-                return
-                
-            self._run_mapping(targets)
-        except Exception as e:
-            messagebox.showerror("Mapping Error", f"Failed to start mapping:\n{type(e).__name__}: {e}", parent=self)
-        
-    def stop_mapping(self):
-        self.stop_event.set()
+# Legacy TargetCredentialMapperPage removed - functionality combined into CredentialManagerLibraryPage
 
 
 class MappingPromptDialog(tk.Toplevel):
@@ -5750,7 +5786,7 @@ class NetworkToolbeltApp(tk.Tk):
 
         self.frames = {}
         
-        for F in (LandingPage, CredentialManagerPage, MaintenanceRunnerPage, CommandRunnerPage, ScannerLandingPage, InterfaceErrorScannerPage, PortChannelScannerPage, RoutingNeighborScannerPage, LogScannerPage, DeviceInventoryScannerPage, OpticsScannerPage, RoutesAdvertisedReceivedScannerPage, ConfigBackupStubPage, OutageSnapshotStubPage, ReachabilityStubPage, VlanTrunkStubPage, StpHealthStubPage, TargetCredentialMapperPage):
+        for F in (LandingPage, CredentialManagerLibraryPage, MaintenanceRunnerPage, CommandRunnerPage, ScannerLandingPage, InterfaceErrorScannerPage, PortChannelScannerPage, RoutingNeighborScannerPage, LogScannerPage, DeviceInventoryScannerPage, OpticsScannerPage, RoutesAdvertisedReceivedScannerPage, ConfigBackupStubPage, OutageSnapshotStubPage, ReachabilityStubPage, VlanTrunkStubPage, StpHealthStubPage):
 
             page_name = F.__name__
             frame = F(parent=self.container, controller=self)
@@ -5762,7 +5798,7 @@ class NetworkToolbeltApp(tk.Tk):
 
 
     def open_target_credential_mapper(self):
-        self.show_frame("TargetCredentialMapperPage")
+        self.show_frame("CredentialManagerLibraryPage")
     def setup_menu(self):
         menubar = tk.Menu(self)
         

@@ -122,45 +122,15 @@ Internal tool command bundles are intended to remain read-only. The command conf
 
 ## Main Workflows
 
-### 1. Load Credentials
+### 1. Configure Credentials and Targets
 
-Open **Credential Manager** and add one or more credential sets.
+Open **Credential Manager & Library** from the dashboard. This page acts as your single control center for credential storage and target mapping:
 
-Each credential set includes:
+- **Library Setup:** Add credential sets by entering a label, username, and password/enable secret. These are listed under the **Credentials Library**.
+- **Mapping setup:** Enter your target IPs/hostnames in the targets input field, configure platforms, and click **Start Mapping** to test connection.
+- **Review Status:** Check mapping statuses (`MAPPED`, `FAILED`, `STALE`, `STOPPED`) and read connection logs directly within the inline panel.
 
-- Label.
-- Username.
-- Password.
-- Optional enable secret.
-
-Credential labels are used in logs and mapping tables. Passwords/secrets are not shown after entry.
-
----
-
-### 2. Set Target IPs & Credentials
-
-Open **Set Target IPs & Credentials** from the dashboard.
-
-This page lets you:
-
-- Enter session targets.
-- Test a single IP.
-- Map all targets to loaded credentials.
-- Review mapping results.
-- View redacted session logs.
-
-Credential mapping helps avoid repeated failed authentication attempts when multiple credential sets are loaded.
-
-Mapping statuses include:
-
-- `UNMAPPED`
-- `MAPPING`
-- `MAPPED`
-- `FAILED`
-- `STALE`
-- `STOPPED`
-
-Mappings are in-memory only and are cleared when the app closes.
+Credential mapping handles the association between devices and working credential sets in memory to avoid repeated failed login attempts. Closing the app clears all volatile data.
 
 ---
 
@@ -260,8 +230,7 @@ The dashboard has two main columns.
 
 ### Session & Help
 
-- Credential Manager.
-- Set Target IPs & Credentials.
+- Credential Manager & Library.
 - Help & Documentation.
 
 Dashboard status shows:
@@ -376,9 +345,8 @@ Before using broadly, test with one known-safe device.
 
 1. Start the app.
 2. Add one credential set.
-3. Open Set Target IPs & Credentials.
-4. Add one test target.
-5. Test Single IP or Start Credential Mapping.
+3. Open **Credential Manager & Library**.
+4. Add one test target and click **Start Mapping**.
 6. Open Generic Command Runner.
 7. Confirm target auto-populates.
 8. Run:
@@ -404,8 +372,7 @@ Before committing a release:
 
 - Confirm app launches.
 - Confirm dashboard version/title are correct.
-- Test Credential Manager.
-- Test Target IP & Credential Mapper.
+- Test Credential Manager & Library page.
 - Test one Generic Command Runner run.
 - Test one Maintenance Pre/Post run.
 - Test at least one scanner.
