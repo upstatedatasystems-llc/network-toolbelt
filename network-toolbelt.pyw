@@ -308,7 +308,15 @@ class TargetCredentialMapStore:
         return host.strip().lower()
 
     def set_targets(self, targets: List[str]):
-        self.targets = list(targets)
+        # Deduplicate while preserving order
+        seen = set()
+        cleaned = []
+        for t in targets:
+            key = self.normalize_host_key(t)
+            if key not in seen:
+                seen.add(key)
+                cleaned.append(t)
+        self.targets = cleaned
 
     def get_targets(self) -> List[str]:
         return list(self.targets)
@@ -3481,6 +3489,19 @@ class BaseRunnerPage(tk.Frame):
         self.is_running = False
         self.fallback_to_all_credentials_for_run = False
 
+    def sync_targets_to_session(self, targets):
+        """Push the current target list into the shared session store so other
+        pages see the same set when they are raised."""
+        store = getattr(self.controller, 'target_credential_store', None)
+        if store is not None:
+            seen = set()
+            cleaned = []
+            for t in targets:
+                if t not in seen:
+                    seen.add(t)
+                    cleaned.append(t)
+            store.set_targets(cleaned)
+
     def prompt_for_mapping_if_needed(self, targets, on_continue):
         if not targets:
             import tkinter.messagebox as mb
@@ -3549,9 +3570,9 @@ class BaseRunnerPage(tk.Frame):
         
         if hasattr(self, 'target_panel') and hasattr(self.controller, 'target_credential_store'):
             self.target_panel.refresh_session_counts()
-            current_text = self.target_panel.targets_text.get("1.0", "end-1c").strip()
             session_targets = self.controller.target_credential_store.targets
-            if not current_text and session_targets:
+            if session_targets:
+                self.target_panel.targets_text.delete("1.0", "end")
                 self.target_panel.targets_text.insert("1.0", "\n".join(session_targets))
 
     def update_session_log_label(self):
@@ -3789,6 +3810,7 @@ class MaintenanceRunnerPage(BaseRunnerPage):
             return
 
         targets = self.target_panel.get_targets()
+        self.sync_targets_to_session(targets)
         platform_choice = self.target_panel.get_platform()
         cred_sets = self.controller.credential_store.as_netmiko_dicts()
 
@@ -4104,6 +4126,7 @@ class CommandRunnerPage(BaseRunnerPage):
         self.clear_btn.pack(fill=tk.X, pady=5)
     def start_execution(self):
         targets = self.target_panel.get_targets()
+        self.sync_targets_to_session(targets)
         platform_choice = self.target_panel.get_platform()
         commands = [c.strip() for c in self.cmd_text.get("1.0", tk.END).splitlines() if c.strip()]
         cred_sets = self.controller.credential_store.as_netmiko_dicts()
@@ -4453,6 +4476,7 @@ class BaseScannerPage(BaseRunnerPage):
             return
             
         targets = self.target_panel.get_targets()
+        self.sync_targets_to_session(targets)
         platform_choice = self.target_panel.get_platform()
         cred_sets = self.controller.credential_store.as_netmiko_dicts()
         options = self.get_options()
@@ -5232,6 +5256,7 @@ class CredentialMappingRunner:
                 if stop_event.is_set():
                     break
                     
+                log_cb(f"  Trying credential set {i}/{len(creds_to_try)}: user={cred_record.username} ...")
                 cred_dict = {"username": cred_record.username, "password": cred_record.password, "secret": cred_record.secret}
                 res = ConnectionManager.connect(host, cred_dict, platform_choice, temp_session_log, run_platform_probe)
                 
@@ -5409,6 +5434,7 @@ class TargetCredentialMapperPage(tk.Frame):
         
     def tkraise(self, *args, **kwargs):
         super().tkraise(*args, **kwargs)
+        self.refresh_targets_text()
         self.refresh_table_from_store()
         self.update_stats()
         
@@ -5444,12 +5470,17 @@ class TargetCredentialMapperPage(tk.Frame):
         for item in self.tree.get_children():
             self.tree.delete(item)
             
+        seen_iids = set()
         for host in self.mapping_store.targets:
+            iid = host.strip().lower()
+            if iid in seen_iids:
+                continue  # skip duplicate — already in tree
+            seen_iids.add(iid)
             m = self.mapping_store.get_mapping(host)
             if m:
-                self.tree.insert("", "end", iid=host, values=(m.host, m.status, m.credential_label, m.username, m.detected_platform, m.last_tested, m.error_message))
+                self.tree.insert("", "end", iid=iid, values=(m.host, m.status, m.credential_label, m.username, m.detected_platform, m.last_tested, m.error_message))
             else:
-                self.tree.insert("", "end", iid=host, values=(host, "UNMAPPED", "", "", "", "", ""))
+                self.tree.insert("", "end", iid=iid, values=(host, "UNMAPPED", "", "", "", "", ""))
                 
     def clear_session(self):
         if messagebox.askyesno("Clear", "Clear all mapping session data?", parent=self):
@@ -5468,10 +5499,11 @@ class TargetCredentialMapperPage(tk.Frame):
                     self.exec_log.see(tk.END)
                 elif msg_type == "STATUS_ROW":
                     host, status, cred, user, plat, last, err = data
-                    if self.tree.exists(host):
-                        self.tree.item(host, values=(host, status, cred, user, plat, last, err))
+                    iid = host.strip().lower()
+                    if self.tree.exists(iid):
+                        self.tree.item(iid, values=(host, status, cred, user, plat, last, err))
                     else:
-                        self.tree.insert("", "end", iid=host, values=(host, status, cred, user, plat, last, err))
+                        self.tree.insert("", "end", iid=iid, values=(host, status, cred, user, plat, last, err))
                 elif msg_type == "PROGRESS":
                     idx, total = data
                     self.progress["maximum"] = total
@@ -5546,25 +5578,28 @@ class TargetCredentialMapperPage(tk.Frame):
         threading.Thread(target=run, daemon=True).start()
 
     def start_mapping(self):
-        lines = self.targets_text.get("1.0", "end").splitlines()
-        hosts = []
-        for line in lines:
-            line = line.strip()
-            if not line: continue
-            if "," in line:
-                for part in line.split(","):
-                    if part.strip(): hosts.append(part.strip())
-            else:
-                hosts.append(line)
-        self.mapping_store.set_targets(hosts)
-        self.refresh_table_from_store()
-        
-        targets = self.mapping_store.get_targets()
-        if not targets:
-            messagebox.showerror("Error", "No targets to map. Please enter targets first.", parent=self)
-            return
+        try:
+            lines = self.targets_text.get("1.0", "end").splitlines()
+            hosts = []
+            for line in lines:
+                line = line.strip()
+                if not line: continue
+                if "," in line:
+                    for part in line.split(","):
+                        if part.strip(): hosts.append(part.strip())
+                else:
+                    hosts.append(line)
+            self.mapping_store.set_targets(hosts)  # deduplicates internally
+            self.refresh_table_from_store()
             
-        self._run_mapping(targets)
+            targets = self.mapping_store.get_targets()
+            if not targets:
+                messagebox.showerror("Error", "No targets to map. Please enter targets first.", parent=self)
+                return
+                
+            self._run_mapping(targets)
+        except Exception as e:
+            messagebox.showerror("Mapping Error", f"Failed to start mapping:\n{type(e).__name__}: {e}", parent=self)
         
     def stop_mapping(self):
         self.stop_event.set()
