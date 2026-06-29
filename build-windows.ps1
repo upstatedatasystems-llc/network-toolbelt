@@ -5,7 +5,7 @@ Write-Host "=== 1. Starting Build Process ==="
 
 # Run PyInstaller with spec file
 Write-Host "Running PyInstaller on NetworkToolbelt.spec..."
-.venv\Scripts\pyinstaller --clean NetworkToolbelt.spec
+.venv\Scripts\pyinstaller --noconfirm --clean NetworkToolbelt.spec
 
 Write-Host "=== 2. Creating Portable ZIP ==="
 if (Test-Path "dist/NetworkToolbelt-portable.zip") {

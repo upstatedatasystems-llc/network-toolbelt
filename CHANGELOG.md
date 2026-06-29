@@ -6,6 +6,22 @@ Network Toolbelt is currently a single-file Python/Tkinter desktop utility optim
 
 ---
 
+## v3.2 - UI Status Prefixes and Wide CSV Outputs
+
+### Summary
+
+v3.2 introduces a standardized dynamic status prefix and improved progress tracking for the Credential Manager. It also adds a new wide-format CSV output (`command_outputs_wide.csv`) to the Generic Command Runner that streams command outputs per host, with unique column headers for duplicate commands, formula safety protection, and a suite of self-tests.
+
+### Added
+
+- **UI Status Prefix**: Added a visible static `Status:` label prefix before status messages on `BaseRunnerPage` and `CredentialManagerLibraryPage`.
+- **Wide-Format CSV**: Dynamically streams `command_outputs_wide.csv` on the fly for completed and skipped hosts in Generic Command Runner sessions.
+- **Formula Safety Protection**: Escapes metadata/error fields starting with `=`, `+`, `-`, or `@` with a leading single quote to prevent spreadsheet formula injection. Command outputs are preserved raw after redaction.
+- **Credential mapping status tracking**: Progress callback correctly counts finished hosts and shows the active mapping target.
+- **Wide CSV Self-Tests**: Added tests inside `_run_execution_self_tests()` covering status formatting, header generation, row formatting, and redaction verification.
+
+---
+
 ## v3.1 - SNMP OID Scanner Integration
 
 ### Summary
