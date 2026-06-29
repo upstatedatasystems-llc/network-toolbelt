@@ -1,6 +1,6 @@
 # Network Toolbelt System Manifest
 
-**Version:** 3.1  
+**Version:** 3.2  
 **Primary Application File:** `network-toolbelt.pyw`  
 **Project Name:** Network Toolbelt  
 **Current Focus:** Cisco/Netmiko-optimized network operations utility and SNMP OID Scanner  
@@ -657,13 +657,10 @@ Then verify:
 
 ## 16. Current Version Summary
 
-Network Toolbelt v2.92 includes:
+Network Toolbelt v3.2 includes:
 
-- Eliminated SSHDetect autodetect, which caused ~120-second delays on C9300 IOS-XE switch stacks by cycling through many device types before falling back to cisco_ios. The app now connects directly as cisco_ios and relies on the platform probe for classification.
-- Moved `prepare_session()` (terminal length/width setup) to run before the platform probe inside `connect()`, preventing `--More--` prompts during `show version` on devices with large output.
-- Added `session_prepped` flag to `ConnectionResult` to prevent redundant terminal setup calls across Maintenance Runner, Command Runner, and Scanner Engine.
-- Reduced `platform_probe_last_read` from 1.0s to 0.5s, cutting the mandatory silence-wait overhead during platform detection.
-- Added comprehensive per-phase connection debug logging with timing for SSH, enable, session prep, and platform probe phases.
-- Improved host start messages to `▶ Starting host [x/y] <ip>` for better readability.
-- Simplified Session Log label from "Session Log (creds etc redacted)" to "Session Log".
-- Reconnect path now respects `session_prepped` to avoid duplicate prep after transport-error recovery.
+- **Static UI Status Prefix**: Added a visible static `Status:` prefix label before runner and mapper status messages.
+- **Improved Mapping Progress**: Standardized and improved credential mapping execution progress, ensuring completed counts show finished hosts, and showing the host currently mapping.
+- **On-the-fly Wide CSV Streaming**: Generates `command_outputs_wide.csv` on the fly as hosts complete Generic Command Runner execution, with columns mapped by command index to prevent duplicate command header collisions.
+- **Spreadsheet Formula Safety**: Protections against formula injection (`=`, `+`, `-`, `@`) for metadata/error cells, while keeping command outputs intact after redaction.
+- **Wide CSV Self-Tests**: Automated self-tests verifying status formatting, unique duplicate headers, formula safety, row quoting, and redaction verification.

@@ -453,7 +453,7 @@ class ScannerDefinition:
 # Constants and Settings
 # ============================================================
 
-APP_VERSION = "3.1"
+APP_VERSION = "3.2"
 
 @dataclass
 class DocumentationSection:
@@ -2340,8 +2340,105 @@ class CompareEngine:
         return sum_txt_data
 
 
+def escape_formula(value) -> str:
+    if value is None:
+        return ""
+    val_str = str(value)
+    if val_str and val_str[0] in ('=', '+', '-', '@'):
+        return "'" + val_str
+    return val_str
+
+
+class StatusFormatter:
+    @staticmethod
+    def format_status(state: str, completed: int, total: int, current_host: str = None) -> str:
+        state_lower = state.lower()
+        if state_lower == "running":
+            if current_host:
+                return f"Running — {completed}/{total} complete — current host: {current_host}"
+            return f"Running — {completed}/{total} complete"
+        elif state_lower in ("complete", "done"):
+            return f"Complete — processed {completed} of {total} hosts"
+        elif state_lower in ("stopped", "cancelled"):
+            return f"Stopped — processed {completed} of {total} hosts"
+        elif state_lower == "stopping":
+            return "Stopping..."
+        elif state_lower in ("idle", "ready"):
+            return "Idle"
+        elif state_lower == "error":
+            return "Error"
+        elif "failed" in state_lower:
+            return state
+        return f"{state} — {completed}/{total} complete"
+
+
+class WideCsvWriter:
+    @staticmethod
+    def generate_headers(commands: List[str]) -> List[str]:
+        metadata_fields = ["Host", "Status", "Credential Label", "Platform", "Elapsed Seconds", "Error"]
+        cmd_headers = []
+        cmd_counts = {}
+        for cmd in commands:
+            if cmd not in cmd_counts:
+                cmd_counts[cmd] = 1
+                header_name = cmd
+            else:
+                cmd_counts[cmd] += 1
+                header_name = f"{cmd} [{cmd_counts[cmd]}]"
+            cmd_headers.append(header_name)
+        return metadata_fields + cmd_headers
+
+    def __init__(self, filepath: Path, commands: List[str]):
+        self.filepath = filepath
+        self.commands = commands
+        self.metadata_fields = ["Host", "Status", "Credential Label", "Platform", "Elapsed Seconds", "Error"]
+
+        
+        self.cmd_headers = []
+        self.cmd_index_to_header = {}
+        
+        cmd_counts = {}
+        for idx, cmd in enumerate(commands):
+            if cmd not in cmd_counts:
+                cmd_counts[cmd] = 1
+                header_name = cmd
+            else:
+                cmd_counts[cmd] += 1
+                header_name = f"{cmd} [{cmd_counts[cmd]}]"
+            
+            self.cmd_headers.append(header_name)
+            self.cmd_index_to_header[idx] = header_name
+            
+        self.fieldnames = self.metadata_fields + self.cmd_headers
+        
+    def write_header(self):
+        with open(self.filepath, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writeheader()
+            
+    def write_row(self, host: str, status: str, cred_label: str, platform: str, elapsed_seconds: float, error: str, cmd_results: Dict[int, str]):
+        row_dict = {
+            "Host": escape_formula(host),
+            "Status": escape_formula(status),
+            "Credential Label": escape_formula(cred_label),
+            "Platform": escape_formula(platform),
+            "Elapsed Seconds": escape_formula(str(elapsed_seconds)),
+            "Error": escape_formula(error),
+        }
+        
+        # Note: We preserve the raw command output exactly after redaction (do not apply escape_formula to command outputs)
+        # to ensure command output is not modified with a leading single quote, which would corrupt configuration or terminal output.
+        for idx in range(len(self.commands)):
+            header = self.cmd_index_to_header[idx]
+            row_dict[header] = cmd_results.get(idx, "SKIPPED")
+            
+        with open(self.filepath, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writerow(row_dict)
+
 
 # ============================================================
+
 # Documentation Content
 # ============================================================
 DOCUMENTATION_SECTIONS = [
@@ -3682,8 +3779,11 @@ class CredentialManagerLibraryPage(tk.Frame):
         top_frame = tk.Frame(self)
         top_frame.pack(fill=tk.X, padx=10, pady=5)
         
-        self.status_lbl = tk.Label(top_frame, text="Idle", font=("Arial", 12, "bold"))
-        self.status_lbl.pack(side=tk.LEFT)
+        status_lbl_prefix = tk.Label(top_frame, text="Status:", font=("Arial", 12, "bold"))
+        status_lbl_prefix.pack(side=tk.LEFT)
+        
+        self.status_lbl = tk.Label(top_frame, text="Idle", font=("Arial", 12))
+        self.status_lbl.pack(side=tk.LEFT, padx=(5, 0))
         
         self.progress = ttk.Progressbar(top_frame, orient=tk.HORIZONTAL, length=400, mode='determinate')
         self.progress.pack(side=tk.RIGHT, padx=10)
@@ -4030,9 +4130,10 @@ class CredentialManagerLibraryPage(tk.Frame):
                     else:
                         self.tree.insert("", "end", iid=iid, values=(host, status, cred, user, plat, last, err))
                 elif msg_type == "PROGRESS":
-                    idx, total = data
+                    idx, total, current_host = data
                     self.progress["maximum"] = total
                     self.progress["value"] = idx
+                    self.status_lbl.config(text=StatusFormatter.format_status("running", idx, total, current_host))
                 elif msg_type == "SESS_LOG":
                     self.sess_log.insert(tk.END, data)
                     self.sess_log.see(tk.END)
@@ -4040,10 +4141,12 @@ class CredentialManagerLibraryPage(tk.Frame):
                     self.is_running = False
                     self.start_btn.config(state=tk.NORMAL)
                     self.stop_btn.config(state=tk.DISABLED)
+                    completed = int(self.progress["value"])
+                    total = int(self.progress["maximum"])
                     if self.stop_event.is_set():
-                        self.status_lbl.config(text="Stopped by user")
+                        self.status_lbl.config(text=StatusFormatter.format_status("stopped", completed, total))
                     else:
-                        self.status_lbl.config(text="Done")
+                        self.status_lbl.config(text=StatusFormatter.format_status("complete", total, total))
                         self.progress["value"] = self.progress["maximum"]
                     self.update_stats()
                     self.controller.frames["LandingPage"].refresh_credential_status()
@@ -4056,16 +4159,18 @@ class CredentialManagerLibraryPage(tk.Frame):
     def _run_mapping(self, targets):
         if not self.credential_store.records:
             messagebox.showerror("Error", "No credentials loaded. Add credentials in Credential Manager first.", parent=self)
+            self.status_lbl.config(text="Failed — no credentials loaded")
             return
         if not targets:
             messagebox.showerror("Error", "No target IPs to test.", parent=self)
+            self.status_lbl.config(text="Failed — no target IPs to test")
             return
             
         self.is_running = True
         self.stop_event.clear()
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
-        self.status_lbl.config(text="Mapping...")
+        self.status_lbl.config(text=StatusFormatter.format_status("running", 0, len(targets), targets[0] if targets else None))
         self.progress["value"] = 0
         
         self.sess_lbl.config(text="Session Log", fg=THEMES[settings.current_theme]["fg"])
@@ -4074,7 +4179,7 @@ class CredentialManagerLibraryPage(tk.Frame):
 
         def _log(msg): self.ui_queue.put(("LOG", msg))
         def _stat(h, s, c, u, p, l, e): self.ui_queue.put(("STATUS_ROW", (h, s, c, u, p, l, e)))
-        def _prog(i, t): self.ui_queue.put(("PROGRESS", (i, t)))
+        def _prog(i, t, h=None): self.ui_queue.put(("PROGRESS", (i, t, h)))
         def _sess_log(msg): self.ui_queue.put(("SESS_LOG", msg))
         
         callbacks = {"log_cb": _log, "status_cb": _stat, "progress_cb": _prog, "sess_log_cb": _sess_log}
@@ -4120,15 +4225,18 @@ class CredentialManagerLibraryPage(tk.Frame):
             targets = self.mapping_store.get_targets()
             if not targets:
                 messagebox.showerror("Error", "No targets to map. Please enter targets first.", parent=self)
+                self.status_lbl.config(text="Failed — no targets to map")
                 return
                 
             self.log_message(f"Starting target credential mapping for {len(targets)} host(s)...")
             self._run_mapping(targets)
         except Exception as e:
             messagebox.showerror("Mapping Error", f"Failed to start mapping:\n{type(e).__name__}: {e}", parent=self)
+            self.status_lbl.config(text="Failed — start error")
         
     def stop_mapping(self):
         self.stop_event.set()
+        self.status_lbl.config(text=StatusFormatter.format_status("stopping", 0, 0))
         self.log_message("Stop mapping request sent.")
 
 
@@ -4905,7 +5013,7 @@ class BaseRunnerPage(tk.Frame):
                 self.session_frame.config(text="Session Log")
 
     def set_status(self, text):
-        self.enqueue("STATUS_UPDATE", f"Status: {text}")
+        self.enqueue("STATUS_UPDATE", text)
 
     def set_progress(self, value):
         self.enqueue("PROGRESS_UPDATE", value)
@@ -4918,14 +5026,17 @@ class BaseRunnerPage(tk.Frame):
         title = tk.Label(self, text=self.title_text, font=("Arial", 18, "bold"))
         title.pack(pady=(5,5))
         
-        self.status_var = tk.StringVar(value="Status: Idle")
+        self.status_var = tk.StringVar(value="Idle")
         self.progress_var = tk.DoubleVar(value=0)
         
         status_frame = tk.Frame(self)
         status_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
         
-        self.status_label = tk.Label(status_frame, textvariable=self.status_var, font=("Arial", 10, "bold"), anchor="w")
-        self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        status_lbl_prefix = tk.Label(status_frame, text="Status:", font=("Arial", 10, "bold"), anchor="w")
+        status_lbl_prefix.pack(side=tk.LEFT)
+        
+        self.status_label = tk.Label(status_frame, textvariable=self.status_var, font=("Arial", 10), anchor="w")
+        self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
         
         self.progress_bar = ttk.Progressbar(status_frame, variable=self.progress_var, maximum=100)
         self.progress_bar.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=5)
@@ -5019,7 +5130,7 @@ class BaseRunnerPage(tk.Frame):
     def stop_execution(self):
         self.stop_event.set()
         self.enqueue("LOG_EXEC", "\n[!] STOP requested. Aborting execution and severing connections...")
-        self.enqueue("STATUS_UPDATE", "Status: Stopped by user")
+        self.enqueue("STATUS_UPDATE", "Stopped by user")
         if self.active_conn:
             try: self.active_conn.disconnect()
             except Exception: pass
@@ -5510,11 +5621,26 @@ class CommandRunnerPage(BaseRunnerPage):
             log_dir.mkdir(parents=True, exist_ok=True)
             self.enqueue("LOG_EXEC", f"Logs will be saved to: {log_dir}")
             
+            wide_writer = None
+            if settings.write_csv_summaries:
+                wide_csv_path = log_dir / "command_outputs_wide.csv"
+                try:
+                    wide_writer = WideCsvWriter(wide_csv_path, commands)
+                    wide_writer.write_header()
+                except Exception as csv_init_err:
+                    self.enqueue("LOG_EXEC", f"Warning: Failed to initialize wide CSV: {str(csv_init_err)}")
+            
+            completed_hosts = set()
             total_hosts = len(targets)
+            
             for idx, host in enumerate(targets, 1):
+                host_start_time = time.time()
+                
+                if self.stop_event.is_set():
+                    break
+                    
                 self.set_host_status(host, idx, total_hosts, "Connecting")
                 self.set_progress((idx - 1) / total_hosts * 100)
-                if self.stop_event.is_set(): break
                 safe_host = FilenameSafety.safe_host_label(host)
                 self.enqueue("LOG_EXEC", f"\n▶ Starting host [{idx}/{len(targets)}] {host}")
                 self.active_conn = None
@@ -5527,6 +5653,7 @@ class CommandRunnerPage(BaseRunnerPage):
                 tail_t.start()
                 
                 host_had_diagnostics = False
+                cmd_results = {}
 
                 def log_cb(msg):
                     self.enqueue("LOG_EXEC", msg)
@@ -5538,8 +5665,22 @@ class CommandRunnerPage(BaseRunnerPage):
                 else:
                     host_had_diagnostics = True
                     self.set_host_status(host, idx, total_hosts, "Connection failed", "moving to next target")
-                    if not self.stop_event.is_set():
-                        pass # generic failure already logged by helper
+                    
+                    if wide_writer:
+                        try:
+                            wide_writer.write_row(
+                                host=host,
+                                status="failed",
+                                cred_label="None",
+                                platform="Unknown",
+                                elapsed_seconds=round(time.time() - host_start_time, 2),
+                                error=conn_result.error_message or "Connection failed",
+                                cmd_results={c_idx: "ERROR: connection failed" for c_idx in range(len(commands))}
+                            )
+                        except Exception as csv_err:
+                            self.enqueue("LOG_EXEC", f"Warning: Failed to write wide CSV row: {str(csv_err)}")
+                    completed_hosts.add(host)
+                    
                     tail_stop_event.set()
                     tail_t.join(1)
                     if settings.capture_mode == "redacted":
@@ -5565,8 +5706,11 @@ class CommandRunnerPage(BaseRunnerPage):
 
                 output_log = [f"===== Session started: {datetime.now()} =====\nHost: {host}\nCapture Mode: {settings.capture_mode.upper()}\n\n"]
                 has_errors = False
+                
                 for cmd_idx, cmd in enumerate(commands, 1):
-                    if self.stop_event.is_set(): break
+                    if self.stop_event.is_set():
+                        cmd_results[cmd_idx - 1] = "SKIPPED"
+                        continue
                     self.enqueue("LOG_EXEC", f"  -> {cmd}")
                     self.set_host_status(host, idx, total_hosts, "Running commands", f"command {cmd_idx}/{len(commands)}")
                     
@@ -5585,10 +5729,12 @@ class CommandRunnerPage(BaseRunnerPage):
                         self.set_host_status(host, idx, total_hosts, "Command timeout", f"moving to next command")
                         self.enqueue("LOG_EXEC", f"  ✗ Command timed out: {cmd}")
                         output_log.append(f"##### {cmd} #####\n{diag_hdr}\nCOMMAND TIMEOUT\n\n")
+                        cmd_results[cmd_idx - 1] = "ERROR: timeout"
                         has_errors = True
                     elif exec_res.status != CommandStatus.SUCCESS and exec_res.status != CommandStatus.COMMAND_UNSUPPORTED:
                         self.enqueue("LOG_EXEC", f"  ✗ Error running {cmd}: {exec_res.error_message}")
                         output_log.append(f"##### {cmd} #####\n{diag_hdr}\nERROR: {exec_res.error_message}\n\n")
+                        cmd_results[cmd_idx - 1] = f"ERROR: {exec_res.error_message or 'command failed'}"
                         has_errors = True
                     else:
                         cmd_out = exec_res.output
@@ -5597,10 +5743,15 @@ class CommandRunnerPage(BaseRunnerPage):
                         output_log.append(f"##### {cmd} #####\n{diag_hdr}\n{cmd_out}\n\n")
                         if exec_res.status == CommandStatus.COMMAND_UNSUPPORTED:
                             self.enqueue("LOG_EXEC", f"  ! Unsupported command: {cmd}")
+                            cmd_results[cmd_idx - 1] = "ERROR: command failed"
+                        else:
+                            cmd_results[cmd_idx - 1] = cmd_out
                             
                     if exec_res.abort_host:
                         self.set_host_status(host, idx, total_hosts, "Host aborted", "transport/reconnect failure")
                         self.enqueue("LOG_EXEC", f"  ✗ Host aborted due to transport/reconnect failure.")
+                        for rem_idx in range(cmd_idx, len(commands)):
+                            cmd_results[rem_idx] = "SKIPPED"
                         has_errors = True
                         break
 
@@ -5626,6 +5777,72 @@ class CommandRunnerPage(BaseRunnerPage):
                         SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
                     else:
                         Path(temp_session_log).rename(log_dir / f"{safe_host}_{run_ts}_session_RAW.log")
+
+                # Determine platform
+                platform = conn_result.logical_platform.name if conn_result.logical_platform else (conn_result.netmiko_device_type or "Unknown")
+                
+                # Determine credential label
+                cred_label = "None"
+                if getattr(self.controller, 'target_credential_store', None):
+                    m = self.controller.target_credential_store.get_mapping(host)
+                    if m and m.status == "MAPPED":
+                        cred_label = m.credential_label
+                if cred_label == "None" and conn_result._reconnect_credential:
+                    for r in self.controller.credential_store.records:
+                        if r.username == conn_result._reconnect_credential.get("username") and \
+                           r.password == conn_result._reconnect_credential.get("password") and \
+                           r.secret == conn_result._reconnect_credential.get("secret"):
+                            cred_label = r.label
+                            break
+                            
+                # Determine host overall status
+                if self.stop_event.is_set():
+                    host_status = "stopped"
+                elif has_errors:
+                    host_status = "partial"
+                else:
+                    host_status = "success"
+                    
+                error_str = conn_result.error_message or ""
+                if not error_str and has_errors:
+                    for c_idx in range(len(commands)):
+                        val = cmd_results.get(c_idx, "")
+                        if val.startswith("ERROR:"):
+                            error_str = val
+                            break
+                            
+                # Write row to wide CSV
+                if wide_writer:
+                    try:
+                        wide_writer.write_row(
+                            host=host,
+                            status=host_status,
+                            cred_label=cred_label,
+                            platform=platform,
+                            elapsed_seconds=round(time.time() - host_start_time, 2),
+                            error=error_str,
+                            cmd_results=cmd_results
+                        )
+                    except Exception as csv_err:
+                        self.enqueue("LOG_EXEC", f"Warning: Failed to write wide CSV row: {str(csv_err)}")
+                completed_hosts.add(host)
+
+            # Write rows for any remaining/skipped hosts
+            if wide_writer:
+                for host in targets:
+                    if host not in completed_hosts:
+                        try:
+                            wide_writer.write_row(
+                                host=host,
+                                status="stopped" if self.stop_event.is_set() else "skipped",
+                                cred_label="None",
+                                platform="Unknown",
+                                elapsed_seconds=0.0,
+                                error="Execution stopped by user" if self.stop_event.is_set() else "Skipped",
+                                cmd_results={}
+                            )
+                        except Exception:
+                            pass
 
             if self.stop_event.is_set():
                 self.set_status("Stopped by user")
@@ -6815,7 +7032,7 @@ class CredentialMappingRunner:
                     ui_callbacks, stop_event, retest_mapped=False, only_unmapped_or_stale=True, capture_mode="redacted", run_platform_probe: bool = True):
         log_cb = ui_callbacks.get("log_cb", lambda m: None)
         status_cb = ui_callbacks.get("status_cb", lambda host, status, m_cred, user, plat, last, err: None)
-        progress_cb = ui_callbacks.get("progress_cb", lambda idx, total: None)
+        progress_cb = ui_callbacks.get("progress_cb", lambda idx, total, host=None: None)
         
         total = len(targets)
         for idx, host in enumerate(targets):
@@ -6833,7 +7050,7 @@ class CredentialMappingRunner:
                 log_cb("\n[Mapping Stopped by User]")
                 break
                 
-            progress_cb(idx, total)
+            progress_cb(idx, total, host)
             log_cb(f"\nMapping {host} ...")
             
             mapping = mapping_store.get_mapping(host)
@@ -6955,7 +7172,7 @@ class CredentialMappingRunner:
             tail_t.join(1.0)
             SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
             
-        progress_cb(total, total)
+        progress_cb(total, total, None)
         if not stop_event.is_set():
             log_cb("\n[Mapping Session Complete]")
 
@@ -7048,7 +7265,7 @@ class SmallMappingProgressDialog(tk.Toplevel):
     def start_thread(self):
         def _log(msg): self.ui_queue.put(("LOG", msg))
         def _stat(h, s, c, u, p, l, e): pass
-        def _prog(i, t): self.ui_queue.put(("PROGRESS", (i, t)))
+        def _prog(i, t, h=None): self.ui_queue.put(("PROGRESS", (i, t, h)))
         
         cb = {"log_cb": _log, "status_cb": _stat, "progress_cb": _prog}
         
@@ -7073,7 +7290,10 @@ class SmallMappingProgressDialog(tk.Toplevel):
                     self.log_text.insert(tk.END, data + "\n")
                     self.log_text.see(tk.END)
                 elif msg_type == "PROGRESS":
-                    idx, total = data
+                    if len(data) == 3:
+                        idx, total, current_host = data
+                    else:
+                        idx, total = data
                     self.progress["maximum"] = total
                     self.progress["value"] = idx
                 elif msg_type == "DONE":
@@ -7995,6 +8215,88 @@ Cisco IOS Software
         assert "snmp-server community" in redacted or "snmp-server user" in redacted
         
     print("All SNMP Scanner Engine self-tests passed.")
+
+    # --- UI STATUS & WIDE CSV SELF-TESTS ---
+    print("Running UI Status & Wide CSV self-tests...")
+    
+    # 1. StatusFormatter tests
+    assert StatusFormatter.format_status("running", 3, 12, "10.10.10.5") == "Running — 3/12 complete — current host: 10.10.10.5"
+    assert StatusFormatter.format_status("complete", 12, 12) == "Complete — processed 12 of 12 hosts"
+    assert StatusFormatter.format_status("stopped", 5, 12) == "Stopped — processed 5 of 12 hosts"
+    assert StatusFormatter.format_status("stopping", 0, 0) == "Stopping..."
+    assert StatusFormatter.format_status("idle", 0, 0) == "Idle"
+    assert StatusFormatter.format_status("Failed - no credentials", 0, 0) == "Failed - no credentials"
+
+    # 2. WideCsvWriter header generation
+    headers1 = WideCsvWriter.generate_headers(["show version"])
+    assert headers1 == ["Host", "Status", "Credential Label", "Platform", "Elapsed Seconds", "Error", "show version"]
+
+    headers2 = WideCsvWriter.generate_headers(["show version", "show version", "show run"])
+    assert headers2 == ["Host", "Status", "Credential Label", "Platform", "Elapsed Seconds", "Error", "show version", "show version [2]", "show run"]
+
+    # 3. WideCsvWriter row generation and formula safety
+    import tempfile
+    fd, temp_csv_path = tempfile.mkstemp(suffix=".csv")
+    try:
+        writer = WideCsvWriter(Path(temp_csv_path), ["show version", "show version"])
+        writer.write_header()
+        
+        # Test row writing with formula symbols in metadata/error and multiline/duplicate output
+        # First row: =Host (formula symbol, should be escaped), normal outputs
+        writer.write_row(
+            host="=10.10.10.1", 
+            status="success", 
+            cred_label="Admin", 
+            platform="Cisco IOS", 
+            elapsed_seconds=1.23, 
+            error="+None", 
+            cmd_results={0: "Cisco IOS Software\nVersion 15.2", 1: "Cisco IOS Software\nVersion 15.2"}
+        )
+        
+        # Second row: normal metadata, timeout error cells
+        writer.write_row(
+            host="10.10.10.2", 
+            status="partial", 
+            cred_label="Admin", 
+            platform="Cisco IOS", 
+            elapsed_seconds=2.5, 
+            error="Command timeout", 
+            cmd_results={0: "ERROR: timeout", 1: "SKIPPED"}
+        )
+
+        with open(temp_csv_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+            
+            assert len(rows) == 3
+            # Check headers
+            assert rows[0] == ["Host", "Status", "Credential Label", "Platform", "Elapsed Seconds", "Error", "show version", "show version [2]"]
+            
+            # Check escaping of formula injection symbols in metadata/error
+            assert rows[1][0] == "'=10.10.10.1"
+            assert rows[1][1] == "success"
+            assert rows[1][5] == "'+None"
+            
+            # Check multiline output quoting and exact preservation (no formula escaping for command output)
+            assert rows[1][6] == "Cisco IOS Software\nVersion 15.2"
+            assert rows[1][7] == "Cisco IOS Software\nVersion 15.2"
+            
+            # Check error/skipped rows
+            assert rows[2][6] == "ERROR: timeout"
+            assert rows[2][7] == "SKIPPED"
+            
+    finally:
+        os.close(fd)
+        try: os.unlink(temp_csv_path)
+        except: pass
+
+    # 4. Redaction check for Wide CSV outputs
+    sensitive_raw = "username admin privilege 15 secret 5 $1$mERr$hx5TJy7IHGxZaOSmHQ3gB1"
+    redacted = redactor.redact_text(sensitive_raw)
+    assert "$1$" not in redacted
+    assert "secret 5" in redacted
+
+    print("UI Status & Wide CSV self-tests passed.")
     print("All execution self-tests passed.")
 
 def main():
