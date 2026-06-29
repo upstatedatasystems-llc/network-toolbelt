@@ -209,7 +209,7 @@ class ScannerDefinition:
 # Constants and Settings
 # ============================================================
 
-APP_VERSION = "2.92"
+APP_VERSION = "2.93"
 
 @dataclass
 class DocumentationSection:
@@ -3920,7 +3920,6 @@ class BaseRunnerPage(tk.Frame):
         nav_frame = tk.Frame(self)
         nav_frame.pack(fill=tk.X, padx=10, pady=(5,0))
         tk.Button(nav_frame, text="← Back to Dashboard", command=lambda: self.controller.show_frame("LandingPage")).pack(side=tk.LEFT)
-        tk.Button(nav_frame, text="[Help]", command=self.open_page_help).pack(side=tk.RIGHT)
         
         title = tk.Label(self, text=self.title_text, font=("Arial", 18, "bold"))
         title.pack(pady=(5,5))
@@ -4655,9 +4654,7 @@ class LandingPage(tk.Frame):
         super().__init__(parent)
         self.controller = controller
         label = tk.Label(self, text="Network Toolbelt Dashboard", font=("Arial", 24, "bold"))
-        label.pack(pady=20)
-        info = tk.Label(self, text="Temporary Session Only. Credentials are never saved.", font=("Arial", 10, "italic"))
-        info.pack(pady=(0, 20))
+        label.pack(pady=(20, 40))
         
         main_frame = tk.Frame(self)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=40, pady=10)
@@ -5460,9 +5457,12 @@ class StpHealthStubPage(StubPage):
 class ScannerLandingPage(tk.Frame):
     def __init__(self, parent, controller):
         super().__init__(parent)
+        
+        nav_frame = tk.Frame(self)
+        nav_frame.pack(fill=tk.X, padx=10, pady=(5,0))
+        tk.Button(nav_frame, text="← Back to Dashboard", command=lambda: controller.show_frame("LandingPage")).pack(side=tk.LEFT)
+        
         tk.Label(self, text="Network Scanners", font=("Arial", 24, "bold")).pack(pady=30)
-        tk.Button(self, text="← Back to Dashboard", command=lambda: controller.show_frame("LandingPage")).pack(pady=5)
-        tk.Button(self, text="[Help]", command=lambda: controller.open_documentation("Network Scanner Suite")).place(x=10, y=10)
         
         grid_frame = tk.Frame(self)
         grid_frame.pack(pady=20)
@@ -5475,12 +5475,7 @@ class ScannerLandingPage(tk.Frame):
         tk.Button(grid_frame, text="Log Scanner", width=30, height=2, command=lambda: controller.show_frame("LogScannerPage")).grid(row=1, column=1, padx=10, pady=10)
         tk.Button(grid_frame, text="Device Inventory Scanner", width=30, height=2, command=lambda: controller.show_frame("DeviceInventoryScannerPage")).grid(row=2, column=0, padx=10, pady=10)
         tk.Button(grid_frame, text="Optics Scanner", width=30, height=2, command=lambda: controller.show_frame("OpticsScannerPage")).grid(row=2, column=1, padx=10, pady=10)
-        tk.Button(grid_frame, text="BGP/Route Summary", width=30, height=2, command=lambda: controller.show_frame("RoutesAdvertisedReceivedScannerPage")).grid(row=3, column=0, padx=10, pady=10)
-        tk.Button(grid_frame, text="Config Backup / Diff Tool (Soon)", width=30, height=2, command=lambda: controller.show_frame("ConfigBackupStubPage")).grid(row=3, column=1, padx=10, pady=10)
-        tk.Button(grid_frame, text="Outage Snapshot Tool (Soon)", width=30, height=2, command=lambda: controller.show_frame("OutageSnapshotStubPage")).grid(row=4, column=0, padx=10, pady=10)
-        tk.Button(grid_frame, text="Reachability / Path Test (Soon)", width=30, height=2, command=lambda: controller.show_frame("ReachabilityStubPage")).grid(row=4, column=1, padx=10, pady=10)
-        tk.Button(grid_frame, text="VLAN / Trunk Consistency (Soon)", width=30, height=2, command=lambda: controller.show_frame("VlanTrunkStubPage")).grid(row=5, column=0, padx=10, pady=10)
-        tk.Button(grid_frame, text="STP Health Scanner (Soon)", width=30, height=2, command=lambda: controller.show_frame("StpHealthStubPage")).grid(row=5, column=1, padx=10, pady=10)
+        tk.Button(grid_frame, text="BGP/Route Summary", width=30, height=2, command=lambda: controller.show_frame("RoutesAdvertisedReceivedScannerPage")).grid(row=3, column=0, columnspan=2, padx=10, pady=10)
 
 
 
@@ -5804,13 +5799,14 @@ class NetworkToolbeltApp(tk.Tk):
         
         file_menu = tk.Menu(menubar, tearoff=0)
         file_menu.add_command(label="Home (Dashboard)", command=lambda: self.show_frame("LandingPage"))
+        file_menu.add_command(label="Generic Command Runner", command=lambda: self.show_frame("CommandRunnerPage"))
+        file_menu.add_command(label="Maintenance Pre/Post Runner", command=lambda: self.show_frame("MaintenanceRunnerPage"))
         file_menu.add_command(label="Network Scanners", command=lambda: self.show_frame("ScannerLandingPage"))
+        file_menu.add_command(label="Credential Manager & Library", command=lambda: self.show_frame("CredentialManagerLibraryPage"))
 
         file_menu.add_separator()
         file_menu.add_command(label="Export Output Folder as ZIP...", command=self.export_zip)
         file_menu.add_command(label="Export Text Outputs as Merged TXT...", command=self.export_merged_txt)
-        file_menu.add_separator()
-        file_menu.add_command(label="Toggle Dark/Light Mode", command=self.toggle_theme)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.quit)
         menubar.add_cascade(label="File", menu=file_menu)
@@ -5834,11 +5830,13 @@ class NetworkToolbeltApp(tk.Tk):
         policy_menu.add_radiobutton(label="Unsafe Allowed", variable=self.policy_mode_var, value="UNSAFE_ALLOWED", command=self.update_policy_mode)
         settings_menu.add_cascade(label="Command Policy", menu=policy_menu)
 
+        settings_menu.add_separator()
+        settings_menu.add_command(label="Toggle Dark/Light Mode", command=self.toggle_theme)
+
         menubar.add_cascade(label="Settings", menu=settings_menu)
 
         help_menu = tk.Menu(menubar, tearoff=0)
-        help_menu.add_command(label="General Information", command=self.show_general_info)
-        help_menu.add_command(label="How-To Instructions", command=self.show_howto_info)
+        help_menu.add_command(label="Documentation", command=lambda: self.open_documentation())
         menubar.add_cascade(label="Help", menu=help_menu)
 
         self.config(menu=menubar)
@@ -6186,7 +6184,7 @@ def _run_execution_self_tests():
         def disconnect(self): pass
     
     def enable_log_cb(msg):
-        if "Warning: enable mode failed" in msg:
+        if "Enable mode failed" in msg:
             mock_enable_conn.logged = True
 
     mock_enable_conn = MockConnEnable()
