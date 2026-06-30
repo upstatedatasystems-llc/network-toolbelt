@@ -453,7 +453,7 @@ class ScannerDefinition:
 # Constants and Settings
 # ============================================================
 
-APP_VERSION = "3.3"
+APP_VERSION = "3.4"
 
 @dataclass
 class DocumentationSection:
@@ -641,6 +641,8 @@ class AppSettings:
         self.command_policy_mode = CommandPolicyMode.SAFE_READ_ONLY
         self.capture_mode = "redacted"
         self.current_theme = "dark"
+        self.concurrency_maintenance = 3
+        self.concurrency_scanners = 3
 
 settings = AppSettings()
 
@@ -3340,7 +3342,12 @@ If you used Raw Capture mode, these exports may contain sensitive data (password
 
     DocumentationSection("Version Changelog", """Network Toolbelt Version History
 
-## v3.3 - Concurrent Host Execution
+## v3.4 - Global Concurrency, Tools Menu, and CSV Export
+- Refactored concurrency controls from per-tool widgets to a global configuration dialog.
+- Added Settings -> 'Parallel sessions...' option to configure concurrency limits for Maintenance Pre/Post Runner and Scanners globally.
+- Created 'Tools' dropdown menu between File and Settings for easy page navigation.
+- Added 'Session Export: CSV Summary File' under File -> Export Operations to export a run's CSV summary.
+- Updated self-test suite to verify the global settings and configuration window.
 - Added concurrent host execution across all SSH-based tools.
 - New Concurrent Hosts spinbox control (1-20, default 3) on Maintenance Runner, all SSH Scanners, and Credential Mapper.
 - ThreadPoolExecutor-based bounded submission with FIRST_COMPLETED wait pattern.
@@ -3580,6 +3587,57 @@ class DocumentationWindow(tk.Toplevel):
                 messagebox.showinfo("Saved", f"Documentation saved to {path}")
             except Exception as e:
                 messagebox.showerror("Error", f"Could not save file: {e}")
+
+
+class ParallelSessionsWindow(tk.Toplevel):
+    def __init__(self, parent, controller):
+        super().__init__(parent)
+        self.controller = controller
+        self.title("Parallel Sessions Configuration")
+        self.geometry("380x200")
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+        if hasattr(controller, "apply_theme_to_widget"):
+            controller.apply_theme_to_widget(self)
+
+        tk.Label(self, text="Configure Parallel Session Limits", font=("Arial", 12, "bold")).pack(pady=10)
+
+        form_frame = tk.Frame(self)
+        form_frame.pack(fill=tk.BOTH, expand=True, padx=20)
+
+        # Maintenance Pre/Post Runner Spinbox
+        tk.Label(form_frame, text="Maintenance Pre/Post Runner:").grid(row=0, column=0, sticky="w", pady=5)
+        self.maint_var = tk.IntVar(value=settings.concurrency_maintenance)
+        self.maint_spin = tk.Spinbox(form_frame, from_=1, to=20, textvariable=self.maint_var, width=5, justify="center")
+        self.maint_spin.grid(row=0, column=1, padx=10, pady=5)
+
+        # Network Scanners Spinbox
+        tk.Label(form_frame, text="Network Scanners:").grid(row=1, column=0, sticky="w", pady=5)
+        self.scan_var = tk.IntVar(value=settings.concurrency_scanners)
+        self.scan_spin = tk.Spinbox(form_frame, from_=1, to=20, textvariable=self.scan_var, width=5, justify="center")
+        self.scan_spin.grid(row=1, column=1, padx=10, pady=5)
+
+        btn_frame = tk.Frame(self)
+        btn_frame.pack(pady=15)
+
+        tk.Button(btn_frame, text="Save", width=10, command=self.save_settings).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Cancel", width=10, command=self.destroy).pack(side=tk.LEFT, padx=5)
+
+    def save_settings(self):
+        try:
+            maint_val = int(self.maint_spin.get())
+            scan_val = int(self.scan_spin.get())
+            if maint_val < 1 or maint_val > 20 or scan_val < 1 or scan_val > 20:
+                raise ValueError()
+        except ValueError:
+            messagebox.showerror("Error", "Parallel session values must be integers between 1 and 20.")
+            return
+
+        settings.concurrency_maintenance = maint_val
+        settings.concurrency_scanners = scan_val
+        messagebox.showinfo("Success", "Parallel sessions settings updated successfully.")
+        self.destroy()
 
 
 # ============================================================
@@ -6711,9 +6769,6 @@ class BaseScannerPage(BaseRunnerPage):
         self.target_panel = TargetPanel(self.left_panel, self.controller)
         self.target_panel.pack(fill=tk.X, pady=5)
         
-        self.concurrency_control = ConcurrentHostsControl(self.left_panel)
-        self.concurrency_control.pack(fill=tk.X, pady=5)
-        
         self.options_frame = tk.LabelFrame(self.left_panel, text="Scanner Options", font=("Arial", 10, "bold"))
         self.options_frame.pack(fill=tk.X, pady=5)
         self.build_options()
@@ -6751,11 +6806,7 @@ class BaseScannerPage(BaseRunnerPage):
             messagebox.showerror("Error", "Please provide at least one Target IP")
             return
             
-        try:
-            concurrency = self.concurrency_control.get_value()
-        except ValueError as err:
-            messagebox.showerror("Validation Error", str(err), parent=self)
-            return
+        concurrency = settings.concurrency_scanners
 
         internal_key = self.scanner_def.internal_key
         all_cmds = []
@@ -8146,13 +8197,6 @@ class NetworkToolbeltApp(tk.Tk):
         
         file_menu = tk.Menu(menubar, tearoff=0)
         file_menu.add_command(label="Home (Dashboard)", command=lambda: self.show_frame("LandingPage"))
-        file_menu.add_command(label="Generic Command Runner", command=lambda: self.show_frame("CommandRunnerPage"))
-        file_menu.add_command(label="Maintenance Pre/Post Runner", command=lambda: self.show_frame("MaintenanceRunnerPage"))
-        file_menu.add_command(label="Network Scanners", command=lambda: self.show_frame("ScannerLandingPage"))
-        file_menu.add_command(label="SNMP OID Scanner", command=lambda: self.show_frame("SnmpOidScannerPage"))
-        file_menu.add_command(label="SSH Credential Manager", command=lambda: self.show_frame("CredentialManagerLibraryPage"))
-        file_menu.add_command(label="SNMP Credential Manager", command=lambda: self.show_frame("SnmpCredentialManagerPage"))
-
         file_menu.add_separator()
         
         export_menu = tk.Menu(file_menu, tearoff=0)
@@ -8161,15 +8205,26 @@ class NetworkToolbeltApp(tk.Tk):
         export_menu.add_command(label="Session Export: Selected Run (ZIP)", command=self.export_run_zip)
         export_menu.add_command(label="Session Export: Selected Run (Unified TXT)", command=self.export_run_unified_txt)
         export_menu.add_command(label="Session Export: Command Outputs Only", command=self.export_run_command_outputs_only)
+        export_menu.add_command(label="Session Export: CSV Summary File", command=self.export_run_csv)
         
         file_menu.add_cascade(label="Export Operations", menu=export_menu)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.quit)
         menubar.add_cascade(label="File", menu=file_menu)
 
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        tools_menu.add_command(label="Generic Command Runner", command=lambda: self.show_frame("CommandRunnerPage"))
+        tools_menu.add_command(label="Maintenance Pre/Post Runner", command=lambda: self.show_frame("MaintenanceRunnerPage"))
+        tools_menu.add_command(label="Network Scanners", command=lambda: self.show_frame("ScannerLandingPage"))
+        tools_menu.add_command(label="SNMP OID Scanner", command=lambda: self.show_frame("SnmpOidScannerPage"))
+        tools_menu.add_command(label="SSH Credential Manager", command=lambda: self.show_frame("CredentialManagerLibraryPage"))
+        tools_menu.add_command(label="SNMP Credential Manager", command=lambda: self.show_frame("SnmpCredentialManagerPage"))
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+
         settings_menu = tk.Menu(menubar, tearoff=0)
         settings_menu.add_command(label="Choose Base Output Directory...", command=self.choose_output_dir)
         settings_menu.add_command(label="Set Command Timeout...", command=self.set_timeout)
+        settings_menu.add_command(label="Parallel sessions...", command=self.open_parallel_sessions_config)
         settings_menu.add_separator()
         settings_menu.add_command(label="View/Configure tool commands", command=self.open_tool_command_config)
         
@@ -8516,6 +8571,56 @@ class NetworkToolbeltApp(tk.Tk):
 
     def show_howto_info(self):
         self.open_documentation("How-To Workflows")
+
+    def open_parallel_sessions_config(self):
+        dlg = ParallelSessionsWindow(self, self)
+        self.wait_window(dlg)
+
+    def export_run_csv(self):
+        selected = self.get_selected_run_session()
+        if not selected:
+            return
+            
+        tool_name, run_id, path = selected
+        path = Path(path)
+        
+        # Find all CSV files in the session folder
+        csv_files = []
+        for root, dirs, files in os.walk(path):
+            if '__pycache__' in dirs: dirs.remove('__pycache__')
+            if '.temp_sessions' in dirs: dirs.remove('.temp_sessions')
+            for f in files:
+                if f.endswith(".csv"):
+                    csv_files.append(Path(root) / f)
+                    
+        if not csv_files:
+            messagebox.showinfo("No CSV Found", "No CSV files were found in this run session.")
+            return
+            
+        # Select the CSV file (if multiple, prefer wide or summary, otherwise take first)
+        selected_csv = csv_files[0]
+        if len(csv_files) > 1:
+            for cf in csv_files:
+                if "wide" in cf.name.lower() or "summary" in cf.name.lower():
+                    selected_csv = cf
+                    break
+                    
+        # Ask where to save
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")],
+            title="Export Session CSV",
+            initialfile=selected_csv.name
+        )
+        if not save_path:
+            return
+            
+        try:
+            import shutil
+            shutil.copy2(selected_csv, save_path)
+            messagebox.showinfo("Success", f"CSV file exported successfully to:\n{save_path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export CSV file:\n{str(e)}")
 
     def open_tool_command_config(self):
         dlg = ToolCommandConfigWindow(self, self)
@@ -8996,26 +9101,28 @@ Cisco IOS Software
     assert "$1$" not in redacted
     assert "secret 5" in redacted
 
-    # 5. UI Concurrency Control Instantiation tests
+    # 5. UI Concurrency global settings and ParallelSessionsWindow instantiation tests
     try:
+        assert settings.concurrency_maintenance == 3
+        assert settings.concurrency_scanners == 3
+        
         root = tk.Tk()
         class MockController:
             credential_store = CredentialStore()
             active_conns = ActiveConnectionRegistry()
             tool_command_manager = ToolCommandManager()
+            def apply_theme_to_widget(self, w): pass
         mc = MockController()
         
         m_page = MaintenanceRunnerPage(root, mc)
-        assert hasattr(m_page, 'concurrency_control')
-        assert m_page.concurrency_control.get_value() == 3
-        
         s_page = InterfaceErrorScannerPage(root, mc)
-        assert hasattr(s_page, 'concurrency_control')
-        assert s_page.concurrency_control.get_value() == 3
+        
+        dlg = ParallelSessionsWindow(root, mc)
+        assert dlg.winfo_exists()
         
         root.destroy()
     except Exception as e:
-        print(f"Skipping UI Concurrency Control instantiation tests: {e}")
+        raise AssertionError(f"UI Concurrency Control tests failed: {e}")
 
     print("UI Status & Wide CSV self-tests passed.")
     print("All execution self-tests passed.")

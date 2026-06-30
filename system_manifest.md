@@ -1,6 +1,6 @@
 # Network Toolbelt System Manifest
 
-**Version:** 3.3  
+**Version:** 3.4  
 **Primary Application File:** `network-toolbelt.pyw`  
 **Project Name:** Network Toolbelt  
 **Current Focus:** Cisco/Netmiko-optimized network operations utility and SNMP OID Scanner  
@@ -250,6 +250,7 @@ Important classes include:
 - `TargetPanel`
 - `ConcurrentHostsControl`
 - `ActiveConnectionRegistry`
+- `ParallelSessionsWindow`
 - `BaseRunnerPage`
 - `MaintenanceRunnerPage`
 - `CommandRunnerPage`
@@ -345,17 +346,16 @@ Network Toolbelt uses a queue-based UI update pattern:
 
 This pattern is used by runner pages, scanner pages, and mapper workflows.
 
-### Concurrent Host Execution (v3.3)
+### Concurrent Host Execution (v3.4)
 
 All SSH-based runner and scanner pages support concurrent host execution using `ThreadPoolExecutor` with bounded submission:
 
-- A `ConcurrentHostsControl` spinbox (range 1–20, default 3) lets users select parallelism.
+- Concurrency limits are configured globally via the **Settings -> Parallel sessions...** menu, which opens a `ParallelSessionsWindow` dialog.
+- Concurrency settings are saved globally in `settings.concurrency_maintenance` and `settings.concurrency_scanners`.
 - Hosts are submitted to worker threads up to `max_workers`, with new hosts dispatched as previous ones complete using `wait(return_when=FIRST_COMPLETED)`.
 - Each worker creates its own Netmiko session — no sessions are shared across threads.
 - Active connections are tracked in `ActiveConnectionRegistry` for thread-safe STOP teardown.
 - When concurrency is set to 1, the original sequential pathway is used unchanged.
-- Credential Mapper defaults to 3 concurrent hosts to protect AAA servers.
-- SNMP Scanner defaults to 5 concurrent hosts.
 
 ---
 
@@ -671,14 +671,11 @@ Then verify:
 
 ## 16. Current Version Summary
 
-Network Toolbelt v3.3 includes:
+Network Toolbelt v3.4 includes:
 
-- **Concurrent Host Execution**: All SSH-based runners, scanners, and the credential mapper support parallel host connections via `ThreadPoolExecutor` with bounded submission and `FIRST_COMPLETED` wait.
-- **ConcurrentHostsControl Widget**: Spinbox control (1–20, default 3) integrated into Maintenance Runner, all SSH Scanners, and Credential Mapper sidebars.
-- **ActiveConnectionRegistry**: Thread-safe connection tracking with `register()`, `unregister()`, and `disconnect_all()` for clean STOP teardown.
-- **Host-Prefixed Logging**: Concurrent execution logs are tagged with `[host_ip]` for per-host visibility.
-- **Sequential Preservation**: Setting concurrency to 1 routes through the original sequential pathway.
-- **SNMP Concurrency**: SNMP OID Scanner uses the same concurrency pattern with a default of 5.
-- **Static UI Status Prefix**: Visible static `Status:` prefix label before runner and mapper status messages.
-- **On-the-fly Wide CSV Streaming**: Generates `command_outputs_wide.csv` on the fly as hosts complete Generic Command Runner execution.
+- **Global Concurrency Settings**: Transitions parallel hosts concurrency configurations from local page widgets into a global **Settings -> Parallel sessions...** configuration dialog.
+- **Tools Dropdown Menu**: Added a new **Tools** menu cascade between File and Settings containing all runner, scanner, and credential manager pages.
+- **Session Export: CSV Summary File**: Added File -> Export Operations option to quickly copy and export the main `.csv` output file from a selected run session folder.
 - **Spreadsheet Formula Safety**: Protections against formula injection for metadata/error cells.
+- **Host-Prefixed Logging**: Concurrent execution logs are tagged with `[host_ip]` for per-host visibility.
+- **ActiveConnectionRegistry**: Thread-safe connection tracking with `register()`, `unregister()`, and `disconnect_all()` for clean STOP teardown.

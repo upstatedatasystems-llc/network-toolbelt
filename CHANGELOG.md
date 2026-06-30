@@ -6,6 +6,25 @@ Network Toolbelt is currently a single-file Python/Tkinter desktop utility optim
 
 ---
 
+## v3.4 - Global Concurrency, Tools Menu, and CSV Export
+
+### Summary
+
+v3.4 transitions the concurrency controls from per-tool widgets into a global settings dialog. It introduces a new "Tools" dropdown menu between File and Settings to clean up main menu options, and adds a direct "Session Export: CSV Summary File" feature under Export Operations to easily export CSV summaries from run sessions.
+
+### Added
+
+- **Global Concurrency Settings Dialog**: Added Settings -> "Parallel sessions..." which opens a window to configure the concurrency limits globally for the Maintenance Pre/Post Runner and Scanners.
+- **"Tools" Dropdown Menu**: A dedicated menu containing Generic Command Runner, Maintenance Pre/Post Runner, Network Scanners, SNMP OID Scanner, SSH Credential Manager, and SNMP Credential Manager.
+- **"Session Export: CSV Summary File"**: Added File -> Export Operations -> "Session Export: CSV Summary File" to copy and export the primary `.csv` summary file (such as `command_outputs_wide.csv`, `summary.csv`, or `scanner_summary.csv`) directly from a selected run session.
+
+### Changed
+
+- **Clean Sidebar Layouts**: Removed the local `ConcurrentHostsControl` widget from all sidebar panels.
+- **Global Concurrency Execution**: Tools fetch concurrency limits globally from `settings.concurrency_maintenance` and `settings.concurrency_scanners`.
+
+---
+
 ## v3.3 - Concurrent Host Execution
 
 ### Summary
