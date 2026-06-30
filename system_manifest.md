@@ -1,6 +1,6 @@
 # Network Toolbelt System Manifest
 
-**Version:** 3.4  
+**Version:** 3.31  
 **Primary Application File:** `network-toolbelt.pyw`  
 **Project Name:** Network Toolbelt  
 **Current Focus:** Cisco/Netmiko-optimized network operations utility and SNMP OID Scanner  
@@ -346,7 +346,7 @@ Network Toolbelt uses a queue-based UI update pattern:
 
 This pattern is used by runner pages, scanner pages, and mapper workflows.
 
-### Concurrent Host Execution (v3.4)
+### Concurrent Host Execution (v3.31)
 
 All SSH-based runner and scanner pages support concurrent host execution using `ThreadPoolExecutor` with bounded submission:
 
@@ -671,7 +671,7 @@ Then verify:
 
 ## 16. Current Version Summary
 
-Network Toolbelt v3.4 includes:
+Network Toolbelt v3.31 includes:
 
 - **Global Concurrency Settings**: Transitions parallel hosts concurrency configurations from local page widgets into a global **Settings -> Parallel sessions...** configuration dialog.
 - **Tools Dropdown Menu**: Added a new **Tools** menu cascade between File and Settings containing all runner, scanner, and credential manager pages.

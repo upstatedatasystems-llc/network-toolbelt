@@ -6,11 +6,11 @@ Network Toolbelt is currently a single-file Python/Tkinter desktop utility optim
 
 ---
 
-## v3.4 - Global Concurrency, Tools Menu, and CSV Export
+## v3.31 - Global Concurrency, Tools Menu, and CSV Export
 
 ### Summary
 
-v3.4 transitions the concurrency controls from per-tool widgets into a global settings dialog. It introduces a new "Tools" dropdown menu between File and Settings to clean up main menu options, and adds a direct "Session Export: CSV Summary File" feature under Export Operations to easily export CSV summaries from run sessions.
+v3.31 transitions the concurrency controls from per-tool widgets into a global settings dialog. It introduces a new "Tools" dropdown menu between File and Settings to clean up main menu options, and adds a direct "Session Export: CSV Summary File" feature under Export Operations to easily export CSV summaries from run sessions.
 
 ### Added
 
