@@ -1,6 +1,6 @@
 # Network Toolbelt System Manifest
 
-**Version:** 3.31  
+**Version:** 3.32  
 **Primary Application File:** `network-toolbelt.pyw`  
 **Project Name:** Network Toolbelt  
 **Current Focus:** Cisco/Netmiko-optimized network operations utility and SNMP OID Scanner  
@@ -346,12 +346,12 @@ Network Toolbelt uses a queue-based UI update pattern:
 
 This pattern is used by runner pages, scanner pages, and mapper workflows.
 
-### Concurrent Host Execution (v3.31)
+### Concurrent Host Execution (v3.32)
 
-All SSH-based runner and scanner pages support concurrent host execution using `ThreadPoolExecutor` with bounded submission:
+All major tools support concurrent host execution using `ThreadPoolExecutor` with bounded submission:
 
 - Concurrency limits are configured globally via the **Settings -> Parallel sessions...** menu, which opens a `ParallelSessionsWindow` dialog.
-- Concurrency settings are saved globally in `settings.concurrency_maintenance` and `settings.concurrency_scanners`.
+- Concurrency settings are saved globally in `settings.concurrency_maintenance`, `settings.concurrency_scanners`, `settings.concurrency_command`, and `settings.concurrency_mapper`.
 - Hosts are submitted to worker threads up to `max_workers`, with new hosts dispatched as previous ones complete using `wait(return_when=FIRST_COMPLETED)`.
 - Each worker creates its own Netmiko session — no sessions are shared across threads.
 - Active connections are tracked in `ActiveConnectionRegistry` for thread-safe STOP teardown.
@@ -671,8 +671,9 @@ Then verify:
 
 ## 16. Current Version Summary
 
-Network Toolbelt v3.31 includes:
+Network Toolbelt v3.32 includes:
 
+- **Comprehensive Parallel Sessions**: Concurrency configurations and execution flows are active globally across all four main engines: Maintenance Pre/Post Runner, Network Scanners, Generic Command Runner, and Credential Mapper.
 - **Global Concurrency Settings**: Transitions parallel hosts concurrency configurations from local page widgets into a global **Settings -> Parallel sessions...** configuration dialog.
 - **Tools Dropdown Menu**: Added a new **Tools** menu cascade between File and Settings containing all runner, scanner, and credential manager pages.
 - **Session Export: CSV Summary File**: Added File -> Export Operations option to quickly copy and export the main `.csv` output file from a selected run session folder.

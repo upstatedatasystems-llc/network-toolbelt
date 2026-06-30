@@ -453,7 +453,7 @@ class ScannerDefinition:
 # Constants and Settings
 # ============================================================
 
-APP_VERSION = "3.31"
+APP_VERSION = "3.32"
 
 @dataclass
 class DocumentationSection:
@@ -643,6 +643,8 @@ class AppSettings:
         self.current_theme = "dark"
         self.concurrency_maintenance = 3
         self.concurrency_scanners = 3
+        self.concurrency_command = 3
+        self.concurrency_mapper = 3
 
 settings = AppSettings()
 
@@ -3342,6 +3344,12 @@ If you used Raw Capture mode, these exports may contain sensitive data (password
 
     DocumentationSection("Version Changelog", """Network Toolbelt Version History
 
+## v3.32 - Comprehensive Parallel Execution
+- Extended parallel sessions support to the Generic Command Runner and the Credential Mapper.
+- Configured their limits globally inside the Settings -> Parallel sessions... window (concurrency limits 1 to 20, default 3).
+- Implemented ThreadPoolExecutor bounded orchestrator loops to handle concurrent connections for Command Runner and Credential Mapper.
+- All execution self-tests updated and passing.
+
 ## v3.31 - Global Concurrency, Tools Menu, and CSV Export
 - Refactored concurrency controls from per-tool widgets to a global configuration dialog.
 - Added Settings -> 'Parallel sessions...' option to configure concurrency limits for Maintenance Pre/Post Runner and Scanners globally.
@@ -3594,7 +3602,7 @@ class ParallelSessionsWindow(tk.Toplevel):
         super().__init__(parent)
         self.controller = controller
         self.title("Parallel Sessions Configuration")
-        self.geometry("380x200")
+        self.geometry("380x280")
         self.transient(parent)
         self.grab_set()
         self.resizable(False, False)
@@ -3618,6 +3626,18 @@ class ParallelSessionsWindow(tk.Toplevel):
         self.scan_spin = tk.Spinbox(form_frame, from_=1, to=20, textvariable=self.scan_var, width=5, justify="center")
         self.scan_spin.grid(row=1, column=1, padx=10, pady=5)
 
+        # Generic Command Runner Spinbox
+        tk.Label(form_frame, text="Generic Command Runner:").grid(row=2, column=0, sticky="w", pady=5)
+        self.cmd_var = tk.IntVar(value=settings.concurrency_command)
+        self.cmd_spin = tk.Spinbox(form_frame, from_=1, to=20, textvariable=self.cmd_var, width=5, justify="center")
+        self.cmd_spin.grid(row=2, column=1, padx=10, pady=5)
+
+        # Credential Mapper Spinbox
+        tk.Label(form_frame, text="Credential Mapper:").grid(row=3, column=0, sticky="w", pady=5)
+        self.map_var = tk.IntVar(value=settings.concurrency_mapper)
+        self.map_spin = tk.Spinbox(form_frame, from_=1, to=20, textvariable=self.map_var, width=5, justify="center")
+        self.map_spin.grid(row=3, column=1, padx=10, pady=5)
+
         btn_frame = tk.Frame(self)
         btn_frame.pack(pady=15)
 
@@ -3628,7 +3648,9 @@ class ParallelSessionsWindow(tk.Toplevel):
         try:
             maint_val = int(self.maint_spin.get())
             scan_val = int(self.scan_spin.get())
-            if maint_val < 1 or maint_val > 20 or scan_val < 1 or scan_val > 20:
+            cmd_val = int(self.cmd_spin.get())
+            map_val = int(self.map_spin.get())
+            if any(v < 1 or v > 20 for v in (maint_val, scan_val, cmd_val, map_val)):
                 raise ValueError()
         except ValueError:
             messagebox.showerror("Error", "Parallel session values must be integers between 1 and 20.")
@@ -3636,6 +3658,8 @@ class ParallelSessionsWindow(tk.Toplevel):
 
         settings.concurrency_maintenance = maint_val
         settings.concurrency_scanners = scan_val
+        settings.concurrency_command = cmd_val
+        settings.concurrency_mapper = map_val
         messagebox.showinfo("Success", "Parallel sessions settings updated successfully.")
         self.destroy()
 
@@ -6084,199 +6108,432 @@ class CommandRunnerPage(BaseRunnerPage):
             completed_hosts = set()
             total_hosts = len(targets)
             
-            for idx, host in enumerate(targets, 1):
-                host_start_time = time.time()
-                
-                if self.stop_event.is_set():
-                    break
+            concurrency = settings.concurrency_command
+            
+            if concurrency == 1:
+                for idx, host in enumerate(targets, 1):
+                    host_start_time = time.time()
                     
-                self.set_host_status(host, idx, total_hosts, "Connecting")
-                self.set_progress((idx - 1) / total_hosts * 100)
-                safe_host = FilenameSafety.safe_host_label(host)
-                self.enqueue("LOG_EXEC", f"\n▶ Starting host [{idx}/{len(targets)}] {host}")
-                self.active_conn = None
-                
-                temp_dir = SecureTempSessionLogManager.ensure_secure_temp_session_dir(settings.base_output_dir, run_id)
-                temp_session_log_path = SecureTempSessionLogManager.create_secure_session_log_path(temp_dir, safe_host)
-                temp_session_log = str(temp_session_log_path)
-                tail_stop_event = threading.Event()
-                tail_t = threading.Thread(target=self.sync_tail, args=(temp_session_log, tail_stop_event), daemon=True)
-                tail_t.start()
-                
-                host_had_diagnostics = False
-                cmd_results = {}
-
-                def log_cb(msg):
-                    self.enqueue("LOG_EXEC", msg)
-                conn_result = ConnectionManager.connect_with_mapped_or_global_credentials(host, platform_choice, temp_session_log, self.controller.credential_store, getattr(self.controller, 'target_credential_store', None), log_cb, self.stop_event, getattr(self, 'fallback_to_all_credentials_for_run', False), run_platform_probe=False)
-                
-                if conn_result.status == ConnectionStatus.SUCCESS:
-                    self.active_conn = conn_result.connection
-                    self.set_host_status(host, idx, total_hosts, "Connected")
-                else:
-                    host_had_diagnostics = True
-                    self.set_host_status(host, idx, total_hosts, "Connection failed", "moving to next target")
+                    if self.stop_event.is_set():
+                        break
+                        
+                    self.set_host_status(host, idx, total_hosts, "Connecting")
+                    self.set_progress((idx - 1) / total_hosts * 100)
+                    safe_host = FilenameSafety.safe_host_label(host)
+                    self.enqueue("LOG_EXEC", f"\n▶ Starting host [{idx}/{len(targets)}] {host}")
+                    self.active_conn = None
                     
+                    temp_dir = SecureTempSessionLogManager.ensure_secure_temp_session_dir(settings.base_output_dir, run_id)
+                    temp_session_log_path = SecureTempSessionLogManager.create_secure_session_log_path(temp_dir, safe_host)
+                    temp_session_log = str(temp_session_log_path)
+                    tail_stop_event = threading.Event()
+                    tail_t = threading.Thread(target=self.sync_tail, args=(temp_session_log, tail_stop_event), daemon=True)
+                    tail_t.start()
+                    
+                    host_had_diagnostics = False
+                    cmd_results = {}
+    
+                    def log_cb(msg):
+                        self.enqueue("LOG_EXEC", msg)
+                    conn_result = ConnectionManager.connect_with_mapped_or_global_credentials(host, platform_choice, temp_session_log, self.controller.credential_store, getattr(self.controller, 'target_credential_store', None), log_cb, self.stop_event, getattr(self, 'fallback_to_all_credentials_for_run', False), run_platform_probe=False)
+                    
+                    if conn_result.status == ConnectionStatus.SUCCESS:
+                        self.active_conn = conn_result.connection
+                        self.set_host_status(host, idx, total_hosts, "Connected")
+                    else:
+                        host_had_diagnostics = True
+                        self.set_host_status(host, idx, total_hosts, "Connection failed", "moving to next target")
+                        
+                        if wide_writer:
+                            try:
+                                wide_writer.write_row(
+                                    host=host,
+                                    status="failed",
+                                    cred_label="None",
+                                    platform="Unknown",
+                                    elapsed_seconds=round(time.time() - host_start_time, 2),
+                                    error=conn_result.error_message or "Connection failed",
+                                    cmd_results={c_idx: "ERROR: connection failed" for c_idx in range(len(commands))}
+                                )
+                            except Exception as csv_err:
+                                self.enqueue("LOG_EXEC", f"Warning: Failed to write wide CSV row: {str(csv_err)}")
+                        completed_hosts.add(host)
+                        
+                        tail_stop_event.set()
+                        tail_t.join(1)
+                        if settings.capture_mode == "redacted":
+                            redactor.redact_file(Path(temp_session_log), log_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
+                        else:
+                            Path(temp_session_log).rename(log_dir / f"{safe_host}_{run_ts}_session_RAW.log")
+                        SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
+                        continue
+    
+                    self.enqueue("LOG_EXEC", "  Generic Runner platform probe skipped.")
+                    context = DeviceSessionContext(
+                        host=host,
+                        platform_choice=platform_choice,
+                        logical_platform=conn_result.logical_platform,
+                        device_type=conn_result.netmiko_device_type,
+                        temp_session_log=temp_session_log,
+                        conn=self.active_conn,
+                        run_platform_probe=False,
+                        _reconnect_credential=conn_result._reconnect_credential
+                    )
+                    if not conn_result.session_prepped:
+                        ConnectionManager.prepare_session(context.conn, context.logical_platform, context.device_type, log_cb)
+    
+                    output_log = [f"===== Session started: {datetime.now()} =====\nHost: {host}\nCapture Mode: {settings.capture_mode.upper()}\n\n"]
+                    has_errors = False
+                    
+                    for cmd_idx, cmd in enumerate(commands, 1):
+                        if self.stop_event.is_set():
+                            cmd_results[cmd_idx - 1] = "SKIPPED"
+                            continue
+                        self.enqueue("LOG_EXEC", f"  -> {cmd}")
+                        self.set_host_status(host, idx, total_hosts, "Running commands", f"command {cmd_idx}/{len(commands)}")
+                        
+                        exec_res = ConnectionManager.execute_command_with_recovery(context, cmd, log_callback=log_cb)
+                        self.active_conn = context.conn # Update conn in case of reconnect
+                        
+                        if exec_res.status == CommandStatus.COMMAND_TIMEOUT or exec_res.slow_command or exec_res.retry_reason or exec_res.reconnect_performed or exec_res.abort_host or ConnectionManager.is_transport_error(exec_res.error_message, exec_res.output) or ConnectionManager.is_malformed_echo(cmd, exec_res.output):
+                            host_had_diagnostics = True
+                        
+                        if exec_res.slow_command:
+                            self.set_host_status(host, idx, total_hosts, "Slow command", f"'{cmd}' running > {settings.slow_command_threshold}s")
+                            
+                        diag_hdr = ConnectionManager.format_diagnostic_header(exec_res)
+                            
+                        if exec_res.status == CommandStatus.COMMAND_TIMEOUT:
+                            self.set_host_status(host, idx, total_hosts, "Command timeout", f"moving to next command")
+                            self.enqueue("LOG_EXEC", f"  ✗ Command timed out: {cmd}")
+                            output_log.append(f"##### {cmd} #####\n{diag_hdr}\nCOMMAND TIMEOUT\n\n")
+                            cmd_results[cmd_idx - 1] = "ERROR: timeout"
+                            has_errors = True
+                        elif exec_res.status != CommandStatus.SUCCESS and exec_res.status != CommandStatus.COMMAND_UNSUPPORTED:
+                            self.enqueue("LOG_EXEC", f"  ✗ Error running {cmd}: {exec_res.error_message}")
+                            output_log.append(f"##### {cmd} #####\n{diag_hdr}\nERROR: {exec_res.error_message}\n\n")
+                            cmd_results[cmd_idx - 1] = f"ERROR: {exec_res.error_message or 'command failed'}"
+                            has_errors = True
+                        else:
+                            cmd_out = exec_res.output
+                            if settings.capture_mode == "redacted":
+                                cmd_out = redactor.redact_text(cmd_out)
+                            output_log.append(f"##### {cmd} #####\n{diag_hdr}\n{cmd_out}\n\n")
+                            if exec_res.status == CommandStatus.COMMAND_UNSUPPORTED:
+                                self.enqueue("LOG_EXEC", f"  ! Unsupported command: {cmd}")
+                                cmd_results[cmd_idx - 1] = "ERROR: command failed"
+                            else:
+                                cmd_results[cmd_idx - 1] = cmd_out
+                                
+                        if exec_res.abort_host:
+                            self.set_host_status(host, idx, total_hosts, "Host aborted", "transport/reconnect failure")
+                            self.enqueue("LOG_EXEC", f"  ✗ Host aborted due to transport/reconnect failure.")
+                            for rem_idx in range(cmd_idx, len(commands)):
+                                cmd_results[rem_idx] = "SKIPPED"
+                            has_errors = True
+                            break
+    
+                    if not self.stop_event.is_set():
+                        fname = f"{safe_host}_{datetime.now().strftime('%H%M%S')}{'_RAW' if settings.capture_mode == 'raw' else ''}.txt"
+                        (log_dir / fname).write_text("".join(output_log), encoding="utf-8")
+                        self.set_progress(idx / total_hosts * 100)
+                        self.enqueue("LOG_EXEC", "  ✓ completed")
+                        self.set_host_status(host, idx, total_hosts, "Success" if not has_errors else "Completed with errors", "moving to next target")
+    
+                    try: self.active_conn.disconnect()
+                    except Exception: pass
+                    self.active_conn = None
+                    
+                    tail_stop_event.set()
+                    tail_t.join(1)
+                    
+                    if settings.save_session_logs == "never" or (settings.save_session_logs == "errors_only" and not (has_errors or host_had_diagnostics) and conn_result.status == ConnectionStatus.SUCCESS):
+                        SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
+                    else:
+                        if settings.capture_mode == "redacted":
+                            redactor.redact_file(Path(temp_session_log), log_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
+                            SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
+                        else:
+                            Path(temp_session_log).rename(log_dir / f"{safe_host}_{run_ts}_session_RAW.log")
+    
+                    # Determine platform
+                    platform = conn_result.logical_platform.name if conn_result.logical_platform else (conn_result.netmiko_device_type or "Unknown")
+                    
+                    # Determine credential label
+                    cred_label = "None"
+                    if getattr(self.controller, 'target_credential_store', None):
+                        m = self.controller.target_credential_store.get_mapping(host)
+                        if m and m.status == "MAPPED":
+                            cred_label = m.credential_label
+                    if cred_label == "None" and conn_result._reconnect_credential:
+                        for r in self.controller.credential_store.records:
+                            if r.username == conn_result._reconnect_credential.get("username") and \
+                               r.password == conn_result._reconnect_credential.get("password") and \
+                               r.secret == conn_result._reconnect_credential.get("secret"):
+                                cred_label = r.label
+                                break
+                                
+                    # Determine host overall status
+                    if self.stop_event.is_set():
+                        host_status = "stopped"
+                    elif has_errors:
+                        host_status = "partial"
+                    else:
+                        host_status = "success"
+                        
+                    error_str = conn_result.error_message or ""
+                    if not error_str and has_errors:
+                        for c_idx in range(len(commands)):
+                            val = cmd_results.get(c_idx, "")
+                            if val.startswith("ERROR:"):
+                                error_str = val
+                                break
+                                
+                    # Write row to wide CSV
                     if wide_writer:
                         try:
                             wide_writer.write_row(
                                 host=host,
-                                status="failed",
-                                cred_label="None",
-                                platform="Unknown",
+                                status=host_status,
+                                cred_label=cred_label,
+                                platform=platform,
                                 elapsed_seconds=round(time.time() - host_start_time, 2),
-                                error=conn_result.error_message or "Connection failed",
-                                cmd_results={c_idx: "ERROR: connection failed" for c_idx in range(len(commands))}
+                                error=error_str,
+                                cmd_results=cmd_results
                             )
                         except Exception as csv_err:
                             self.enqueue("LOG_EXEC", f"Warning: Failed to write wide CSV row: {str(csv_err)}")
                     completed_hosts.add(host)
+            else:
+                def worker_task(host, idx, task_key):
+                    host_start_time = time.time()
+                    safe_host = FilenameSafety.safe_host_label(host)
+                    temp_dir = SecureTempSessionLogManager.ensure_secure_temp_session_dir(settings.base_output_dir, run_id)
+                    temp_session_log_path = SecureTempSessionLogManager.create_secure_session_log_path(temp_dir, safe_host)
+                    temp_session_log = str(temp_session_log_path)
                     
-                    tail_stop_event.set()
-                    tail_t.join(1)
-                    if settings.capture_mode == "redacted":
-                        redactor.redact_file(Path(temp_session_log), log_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
-                    else:
-                        Path(temp_session_log).rename(log_dir / f"{safe_host}_{run_ts}_session_RAW.log")
-                    SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
-                    continue
-
-                self.enqueue("LOG_EXEC", "  Generic Runner platform probe skipped.")
-                context = DeviceSessionContext(
-                    host=host,
-                    platform_choice=platform_choice,
-                    logical_platform=conn_result.logical_platform,
-                    device_type=conn_result.netmiko_device_type,
-                    temp_session_log=temp_session_log,
-                    conn=self.active_conn,
-                    run_platform_probe=False,
-                    _reconnect_credential=conn_result._reconnect_credential
-                )
-                if not conn_result.session_prepped:
-                    ConnectionManager.prepare_session(context.conn, context.logical_platform, context.device_type, log_cb)
-
-                output_log = [f"===== Session started: {datetime.now()} =====\nHost: {host}\nCapture Mode: {settings.capture_mode.upper()}\n\n"]
-                has_errors = False
-                
-                for cmd_idx, cmd in enumerate(commands, 1):
-                    if self.stop_event.is_set():
-                        cmd_results[cmd_idx - 1] = "SKIPPED"
-                        continue
-                    self.enqueue("LOG_EXEC", f"  -> {cmd}")
-                    self.set_host_status(host, idx, total_hosts, "Running commands", f"command {cmd_idx}/{len(commands)}")
+                    tail_stop_event = threading.Event()
+                    tail_t = threading.Thread(target=self.sync_tail, args=(temp_session_log, tail_stop_event), daemon=True)
+                    tail_t.start()
                     
-                    exec_res = ConnectionManager.execute_command_with_recovery(context, cmd, log_callback=log_cb)
-                    self.active_conn = context.conn # Update conn in case of reconnect
+                    host_had_diagnostics = False
+                    cmd_results = {}
+                    conn_result = None
+                    error_msg = ""
+                    platform_detected = "Unknown"
+                    has_errors = False
                     
-                    if exec_res.status == CommandStatus.COMMAND_TIMEOUT or exec_res.slow_command or exec_res.retry_reason or exec_res.reconnect_performed or exec_res.abort_host or ConnectionManager.is_transport_error(exec_res.error_message, exec_res.output) or ConnectionManager.is_malformed_echo(cmd, exec_res.output):
-                        host_had_diagnostics = True
-                    
-                    if exec_res.slow_command:
-                        self.set_host_status(host, idx, total_hosts, "Slow command", f"'{cmd}' running > {settings.slow_command_threshold}s")
+                    def log_cb(msg):
+                        self.enqueue("LOG_EXEC", f"[{host}] {msg}")
                         
-                    diag_hdr = ConnectionManager.format_diagnostic_header(exec_res)
-                        
-                    if exec_res.status == CommandStatus.COMMAND_TIMEOUT:
-                        self.set_host_status(host, idx, total_hosts, "Command timeout", f"moving to next command")
-                        self.enqueue("LOG_EXEC", f"  ✗ Command timed out: {cmd}")
-                        output_log.append(f"##### {cmd} #####\n{diag_hdr}\nCOMMAND TIMEOUT\n\n")
-                        cmd_results[cmd_idx - 1] = "ERROR: timeout"
-                        has_errors = True
-                    elif exec_res.status != CommandStatus.SUCCESS and exec_res.status != CommandStatus.COMMAND_UNSUPPORTED:
-                        self.enqueue("LOG_EXEC", f"  ✗ Error running {cmd}: {exec_res.error_message}")
-                        output_log.append(f"##### {cmd} #####\n{diag_hdr}\nERROR: {exec_res.error_message}\n\n")
-                        cmd_results[cmd_idx - 1] = f"ERROR: {exec_res.error_message or 'command failed'}"
-                        has_errors = True
-                    else:
-                        cmd_out = exec_res.output
-                        if settings.capture_mode == "redacted":
-                            cmd_out = redactor.redact_text(cmd_out)
-                        output_log.append(f"##### {cmd} #####\n{diag_hdr}\n{cmd_out}\n\n")
-                        if exec_res.status == CommandStatus.COMMAND_UNSUPPORTED:
-                            self.enqueue("LOG_EXEC", f"  ! Unsupported command: {cmd}")
-                            cmd_results[cmd_idx - 1] = "ERROR: command failed"
-                        else:
-                            cmd_results[cmd_idx - 1] = cmd_out
-                            
-                    if exec_res.abort_host:
-                        self.set_host_status(host, idx, total_hosts, "Host aborted", "transport/reconnect failure")
-                        self.enqueue("LOG_EXEC", f"  ✗ Host aborted due to transport/reconnect failure.")
-                        for rem_idx in range(cmd_idx, len(commands)):
-                            cmd_results[rem_idx] = "SKIPPED"
-                        has_errors = True
-                        break
-
-                if not self.stop_event.is_set():
-                    fname = f"{safe_host}_{datetime.now().strftime('%H%M%S')}{'_RAW' if settings.capture_mode == 'raw' else ''}.txt"
-                    (log_dir / fname).write_text("".join(output_log), encoding="utf-8")
-                    self.set_progress(idx / total_hosts * 100)
-                    self.enqueue("LOG_EXEC", "  ✓ completed")
-                    self.set_host_status(host, idx, total_hosts, "Success" if not has_errors else "Completed with errors", "moving to next target")
-
-                try: self.active_conn.disconnect()
-                except Exception: pass
-                self.active_conn = None
-                
-                tail_stop_event.set()
-                tail_t.join(1)
-                
-                if settings.save_session_logs == "never" or (settings.save_session_logs == "errors_only" and not (has_errors or host_had_diagnostics) and conn_result.status == ConnectionStatus.SUCCESS):
-                    SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
-                else:
-                    if settings.capture_mode == "redacted":
-                        redactor.redact_file(Path(temp_session_log), log_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
-                        SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
-                    else:
-                        Path(temp_session_log).rename(log_dir / f"{safe_host}_{run_ts}_session_RAW.log")
-
-                # Determine platform
-                platform = conn_result.logical_platform.name if conn_result.logical_platform else (conn_result.netmiko_device_type or "Unknown")
-                
-                # Determine credential label
-                cred_label = "None"
-                if getattr(self.controller, 'target_credential_store', None):
-                    m = self.controller.target_credential_store.get_mapping(host)
-                    if m and m.status == "MAPPED":
-                        cred_label = m.credential_label
-                if cred_label == "None" and conn_result._reconnect_credential:
-                    for r in self.controller.credential_store.records:
-                        if r.username == conn_result._reconnect_credential.get("username") and \
-                           r.password == conn_result._reconnect_credential.get("password") and \
-                           r.secret == conn_result._reconnect_credential.get("secret"):
-                            cred_label = r.label
-                            break
-                            
-                # Determine host overall status
-                if self.stop_event.is_set():
-                    host_status = "stopped"
-                elif has_errors:
-                    host_status = "partial"
-                else:
-                    host_status = "success"
+                    self.set_host_status(host, idx, total_hosts, "Connecting")
                     
-                error_str = conn_result.error_message or ""
-                if not error_str and has_errors:
-                    for c_idx in range(len(commands)):
-                        val = cmd_results.get(c_idx, "")
-                        if val.startswith("ERROR:"):
-                            error_str = val
-                            break
-                            
-                # Write row to wide CSV
-                if wide_writer:
                     try:
-                        wide_writer.write_row(
-                            host=host,
-                            status=host_status,
-                            cred_label=cred_label,
-                            platform=platform,
-                            elapsed_seconds=round(time.time() - host_start_time, 2),
-                            error=error_str,
-                            cmd_results=cmd_results
+                        conn_result = ConnectionManager.connect_with_mapped_or_global_credentials(
+                            host, platform_choice, temp_session_log, self.controller.credential_store,
+                            getattr(self.controller, 'target_credential_store', None), log_cb, self.stop_event,
+                            getattr(self, 'fallback_to_all_credentials_for_run', False), run_platform_probe=False
                         )
-                    except Exception as csv_err:
-                        self.enqueue("LOG_EXEC", f"Warning: Failed to write wide CSV row: {str(csv_err)}")
-                completed_hosts.add(host)
+                        
+                        if conn_result.status == ConnectionStatus.SUCCESS:
+                            self.active_conns.register(task_key, conn_result.connection)
+                            self.set_host_status(host, idx, total_hosts, "Connected")
+                            
+                            context = DeviceSessionContext(
+                                host=host,
+                                platform_choice=platform_choice,
+                                logical_platform=conn_result.logical_platform,
+                                device_type=conn_result.netmiko_device_type,
+                                temp_session_log=temp_session_log,
+                                conn=conn_result.connection,
+                                run_platform_probe=False,
+                                _reconnect_credential=conn_result._reconnect_credential
+                            )
+                            if not conn_result.session_prepped:
+                                ConnectionManager.prepare_session(context.conn, context.logical_platform, context.device_type, log_cb)
+                                
+                            platform_detected = context.logical_platform.name if context.logical_platform else (context.device_type or "Unknown")
+                            
+                            output_log = [f"===== Session started: {datetime.now()} =====\nHost: {host}\nCapture Mode: {settings.capture_mode.upper()}\n\n"]
+                            
+                            for cmd_idx, cmd in enumerate(commands, 1):
+                                if self.stop_event.is_set():
+                                    cmd_results[cmd_idx - 1] = "SKIPPED"
+                                    continue
+                                    
+                                self.enqueue("LOG_EXEC", f"[{host}] Running: {cmd}")
+                                self.set_host_status(host, idx, total_hosts, "Running commands", f"command {cmd_idx}/{len(commands)}")
+                                
+                                exec_res = ConnectionManager.execute_command_with_recovery(context, cmd, log_callback=log_cb)
+                                
+                                if exec_res.status == CommandStatus.COMMAND_TIMEOUT or exec_res.slow_command or exec_res.retry_reason or exec_res.reconnect_performed or exec_res.abort_host or ConnectionManager.is_transport_error(exec_res.error_message, exec_res.output) or ConnectionManager.is_malformed_echo(cmd, exec_res.output):
+                                    host_had_diagnostics = True
+                                    
+                                if exec_res.slow_command:
+                                    self.set_host_status(host, idx, total_hosts, "Slow command", f"'{cmd}' running > {settings.slow_command_threshold}s")
+                                    
+                                diag_hdr = ConnectionManager.format_diagnostic_header(exec_res)
+                                
+                                if exec_res.status == CommandStatus.COMMAND_TIMEOUT:
+                                    self.set_host_status(host, idx, total_hosts, "Command timeout", f"moving to next command")
+                                    self.enqueue("LOG_EXEC", f"[{host}] ✗ Command timed out: {cmd}")
+                                    output_log.append(f"##### {cmd} #####\n{diag_hdr}\nCOMMAND TIMEOUT\n\n")
+                                    cmd_results[cmd_idx - 1] = "ERROR: timeout"
+                                    has_errors = True
+                                elif exec_res.status != CommandStatus.SUCCESS and exec_res.status != CommandStatus.COMMAND_UNSUPPORTED:
+                                    self.enqueue("LOG_EXEC", f"[{host}] ✗ Error running {cmd}: {exec_res.error_message}")
+                                    output_log.append(f"##### {cmd} #####\n{diag_hdr}\nERROR: {exec_res.error_message}\n\n")
+                                    cmd_results[cmd_idx - 1] = f"ERROR: {exec_res.error_message or 'command failed'}"
+                                    has_errors = True
+                                else:
+                                    cmd_out = exec_res.output
+                                    if settings.capture_mode == "redacted":
+                                        cmd_out = redactor.redact_text(cmd_out)
+                                    output_log.append(f"##### {cmd} #####\n{diag_hdr}\n{cmd_out}\n\n")
+                                    if exec_res.status == CommandStatus.COMMAND_UNSUPPORTED:
+                                        self.enqueue("LOG_EXEC", f"[{host}] ! Unsupported command: {cmd}")
+                                        cmd_results[cmd_idx - 1] = "ERROR: command failed"
+                                    else:
+                                        cmd_results[cmd_idx - 1] = cmd_out
+                                        
+                                if exec_res.abort_host:
+                                    self.set_host_status(host, idx, total_hosts, "Host aborted", "transport/reconnect failure")
+                                    self.enqueue("LOG_EXEC", f"[{host}] ✗ Host aborted due to transport/reconnect failure.")
+                                    for rem_idx in range(cmd_idx, len(commands)):
+                                        cmd_results[rem_idx] = "SKIPPED"
+                                    has_errors = True
+                                    break
+                                    
+                            if not self.stop_event.is_set():
+                                fname = f"{safe_host}_{datetime.now().strftime('%H%M%S')}{'_RAW' if settings.capture_mode == 'raw' else ''}.txt"
+                                (log_dir / fname).write_text("".join(output_log), encoding="utf-8")
+                                self.enqueue("LOG_EXEC", f"[{host}] ✓ completed")
+                                self.set_host_status(host, idx, total_hosts, "Success" if not has_errors else "Completed with errors")
+                                
+                            status_str = "success" if not has_errors else "partial"
+                        else:
+                            host_had_diagnostics = True
+                            error_msg = conn_result.error_message or "Connection failed"
+                            self.set_host_status(host, idx, total_hosts, "Connection failed")
+                            cmd_results = {c_idx: "ERROR: connection failed" for c_idx in range(len(commands))}
+                            status_str = "failed"
+                    except Exception as ex:
+                        host_had_diagnostics = True
+                        error_msg = str(ex)
+                        self.set_host_status(host, idx, total_hosts, "Error", error_msg)
+                        cmd_results = {c_idx: f"ERROR: exception: {error_msg}" for c_idx in range(len(commands))}
+                        status_str = "failed"
+                    finally:
+                        self.active_conns.unregister(task_key)
+                        if conn_result and conn_result.status == ConnectionStatus.SUCCESS:
+                            try: conn_result.connection.disconnect()
+                            except: pass
+                            
+                        tail_stop_event.set()
+                        tail_t.join(1)
+                        
+                        if conn_result and conn_result.status == ConnectionStatus.SUCCESS:
+                            if settings.save_session_logs == "never" or (settings.save_session_logs == "errors_only" and not (has_errors or host_had_diagnostics)):
+                                SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
+                            else:
+                                if settings.capture_mode == "redacted":
+                                    redactor.redact_file(Path(temp_session_log), log_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
+                                    SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
+                                else:
+                                    Path(temp_session_log).rename(log_dir / f"{safe_host}_{run_ts}_session_RAW.log")
+                        else:
+                            if settings.save_session_logs != "never":
+                                if settings.capture_mode == "redacted":
+                                    redactor.redact_file(Path(temp_session_log), log_dir / f"{safe_host}_{run_ts}_session_REDACTED.log")
+                                else:
+                                    Path(temp_session_log).rename(log_dir / f"{safe_host}_{run_ts}_session_RAW.log")
+                            SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
+                            
+                    cred_label = "None"
+                    if getattr(self.controller, 'target_credential_store', None):
+                        m = self.controller.target_credential_store.get_mapping(host)
+                        if m and m.status == "MAPPED":
+                            cred_label = m.credential_label
+                    if cred_label == "None" and conn_result and conn_result._reconnect_credential:
+                        for r in self.controller.credential_store.records:
+                            if r.username == conn_result._reconnect_credential.get("username") and \
+                               r.password == conn_result._reconnect_credential.get("password") and \
+                               r.secret == conn_result._reconnect_credential.get("secret"):
+                                cred_label = r.label
+                                break
+                                
+                    error_str = error_msg
+                    if not error_str and has_errors:
+                        for c_idx in range(len(commands)):
+                            val = cmd_results.get(c_idx, "")
+                            if val.startswith("ERROR:"):
+                                error_str = val
+                                break
+                                
+                    return {
+                        "host": host,
+                        "status": "stopped" if self.stop_event.is_set() else status_str,
+                        "cred_label": cred_label,
+                        "platform": platform_detected,
+                        "elapsed_seconds": round(time.time() - host_start_time, 2),
+                        "error": error_str,
+                        "cmd_results": cmd_results
+                    }
+ 
+                completed_count = 0
+                active_count = 0
+                targets_to_submit = list(enumerate(targets, 1))
+                active_futures = set()
+                
+                with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                    while len(active_futures) < concurrency and targets_to_submit:
+                        idx, host = targets_to_submit.pop(0)
+                        task_key = f"{host.lower()}::{run_id}::{idx}"
+                        active_count += 1
+                        self.set_host_status(host, idx, total_hosts, "Pending")
+                        self.set_status(format_concurrent_status(completed_count, total_hosts, active_count, self.stop_event.is_set()))
+                        
+                        f = executor.submit(worker_task, host, idx, task_key)
+                        active_futures.add(f)
+                        
+                    while active_futures:
+                        done, not_done = wait(active_futures, return_when=FIRST_COMPLETED)
+                        for f in done:
+                            active_futures.remove(f)
+                            active_count -= 1
+                            completed_count += 1
+                            
+                            try:
+                                res = f.result()
+                                if wide_writer:
+                                    try:
+                                        wide_writer.write_row(
+                                            host=res["host"],
+                                            status=res["status"],
+                                            cred_label=res["cred_label"],
+                                            platform=res["platform"],
+                                            elapsed_seconds=res["elapsed_seconds"],
+                                            error=res["error"],
+                                            cmd_results=res["cmd_results"]
+                                        )
+                                    except Exception as csv_err:
+                                        self.enqueue("LOG_EXEC", f"Warning: Failed to write wide CSV row: {str(csv_err)}")
+                                completed_hosts.add(res["host"])
+                            except Exception as fut_err:
+                                self.enqueue("LOG_EXEC", f"Worker future encountered exception: {str(fut_err)}")
+                                
+                            self.set_status(format_concurrent_status(completed_count, total_hosts, active_count, self.stop_event.is_set()))
+                            self.set_progress(completed_count / total_hosts * 100)
+                            
+                        if not self.stop_event.is_set():
+                            while len(active_futures) < concurrency and targets_to_submit:
+                                idx, host = targets_to_submit.pop(0)
+                                task_key = f"{host.lower()}::{run_id}::{idx}"
+                                active_count += 1
+                                self.set_host_status(host, idx, total_hosts, "Pending")
+                                f = executor.submit(worker_task, host, idx, task_key)
+                                active_futures.add(f)
+                                self.set_status(format_concurrent_status(completed_count, total_hosts, active_count, self.stop_event.is_set()))
 
             # Write rows for any remaining/skipped hosts
             if wide_writer:
@@ -7785,146 +8042,316 @@ class CredentialMappingRunner:
         progress_cb = ui_callbacks.get("progress_cb", lambda idx, total, host=None: None)
         
         total = len(targets)
-        for idx, host in enumerate(targets):
-            if stop_event.is_set():
-                # Mark remaining as STOPPED if they aren't mapped
-                for remaining_host in targets[idx:]:
-                    m = mapping_store.get_mapping(remaining_host)
-                    if m and m.status == "MAPPED":
-                        continue
-                    if not m:
-                        m = TargetCredentialMapping(host=remaining_host, safe_host=FilenameSafety.safe_host_label(remaining_host))
-                    m.status = "STOPPED"
-                    mapping_store.upsert_mapping(remaining_host, m)
-                    status_cb(m.host, m.status, m.credential_label, m.username, m.detected_platform, m.last_tested, m.error_message)
-                log_cb("\n[Mapping Stopped by User]")
-                break
-                
-            progress_cb(idx, total, host)
-            log_cb(f"\nMapping {host} ...")
-            
-            mapping = mapping_store.get_mapping(host)
-            if not mapping:
-                mapping = TargetCredentialMapping(host=host, safe_host=FilenameSafety.safe_host_label(host))
-                
-            if mapping.status == "MAPPED" and not retest_mapped:
-                if only_unmapped_or_stale:
-                    log_cb(f"  Skipping {host} (Already mapped)")
-                    # Do NOT change status to SKIPPED, leave it as MAPPED
-                    status_cb(mapping.host, mapping.status, mapping.credential_label, mapping.username, mapping.detected_platform, mapping.last_tested, mapping.error_message)
-                    continue
-                else:
-                    pass # user wants to test it anyway
+        concurrency = settings.concurrency_mapper
+
+        if concurrency == 1:
+            for idx, host in enumerate(targets):
+                if stop_event.is_set():
+                    # Mark remaining as STOPPED if they aren't mapped
+                    for remaining_host in targets[idx:]:
+                        m = mapping_store.get_mapping(remaining_host)
+                        if m and m.status == "MAPPED":
+                            continue
+                        if not m:
+                            m = TargetCredentialMapping(host=remaining_host, safe_host=FilenameSafety.safe_host_label(remaining_host))
+                        m.status = "STOPPED"
+                        mapping_store.upsert_mapping(remaining_host, m)
+                        status_cb(m.host, m.status, m.credential_label, m.username, m.detected_platform, m.last_tested, m.error_message)
+                    log_cb("\n[Mapping Stopped by User]")
+                    break
                     
-            mapping.status = "MAPPING"
-            mapping.last_tested = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            status_cb(mapping.host, mapping.status, mapping.credential_label, mapping.username, mapping.detected_platform, mapping.last_tested, mapping.error_message)
-            
-            # Temporary session log
-            settings.base_output_dir.mkdir(parents=True, exist_ok=True)
-            temp_dir = SecureTempSessionLogManager.ensure_secure_temp_session_dir(settings.base_output_dir, "mapping")
-            temp_session_log_path = SecureTempSessionLogManager.create_secure_session_log_path(temp_dir, f"{mapping.safe_host}_{idx}")
-            temp_session_log = str(temp_session_log_path)
-            
-            # Try to connect
-            log_callback_for_connect = lambda msg: log_cb("  " + msg)
-            
-            sess_log_cb = ui_callbacks.get("sess_log_cb", lambda m: None)
-            tail_stop_event = threading.Event()
-            def tail_file(filepath, stop_evt):
-                import time
-                try:
-                    buf_redactor = LineBufferedRedactor(redactor.redact_text)
-                    with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-                        while not stop_evt.is_set():
-                            chunk = f.read(1024)
+                progress_cb(idx, total, host)
+                log_cb(f"\nMapping {host} ...")
+                
+                mapping = mapping_store.get_mapping(host)
+                if not mapping:
+                    mapping = TargetCredentialMapping(host=host, safe_host=FilenameSafety.safe_host_label(host))
+                    
+                if mapping.status == "MAPPED" and not retest_mapped:
+                    if only_unmapped_or_stale:
+                        log_cb(f"  Skipping {host} (Already mapped)")
+                        status_cb(mapping.host, mapping.status, mapping.credential_label, mapping.username, mapping.detected_platform, mapping.last_tested, mapping.error_message)
+                        continue
+                        
+                mapping.status = "MAPPING"
+                mapping.last_tested = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                status_cb(mapping.host, mapping.status, mapping.credential_label, mapping.username, mapping.detected_platform, mapping.last_tested, mapping.error_message)
+                
+                settings.base_output_dir.mkdir(parents=True, exist_ok=True)
+                temp_dir = SecureTempSessionLogManager.ensure_secure_temp_session_dir(settings.base_output_dir, "mapping")
+                temp_session_log_path = SecureTempSessionLogManager.create_secure_session_log_path(temp_dir, f"{mapping.safe_host}_{idx}")
+                temp_session_log = str(temp_session_log_path)
+                
+                log_callback_for_connect = lambda msg: log_cb("  " + msg)
+                sess_log_cb = ui_callbacks.get("sess_log_cb", lambda m: None)
+                tail_stop_event = threading.Event()
+                def tail_file(filepath, stop_evt):
+                    import time
+                    try:
+                        buf_redactor = LineBufferedRedactor(redactor.redact_text)
+                        with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+                            while not stop_evt.is_set():
+                                chunk = f.read(1024)
+                                if chunk:
+                                    out = buf_redactor.feed(chunk) if capture_mode == "redacted" else chunk
+                                    if out: sess_log_cb(out)
+                                else:
+                                    time.sleep(0.1)
+                            chunk = f.read()
                             if chunk:
                                 out = buf_redactor.feed(chunk) if capture_mode == "redacted" else chunk
                                 if out: sess_log_cb(out)
-                            else:
-                                time.sleep(0.1)
-                        chunk = f.read()
-                        if chunk:
-                            out = buf_redactor.feed(chunk) if capture_mode == "redacted" else chunk
+                            out = buf_redactor.flush() if capture_mode == "redacted" else ""
                             if out: sess_log_cb(out)
-                        out = buf_redactor.flush() if capture_mode == "redacted" else ""
-                        if out: sess_log_cb(out)
-                except Exception:
-                    pass
-                            
-            tail_t = threading.Thread(target=tail_file, args=(temp_session_log, tail_stop_event), daemon=True)
-            tail_t.start()
-            
-            creds_to_try = credential_store.records
-            if not creds_to_try:
-                log_cb("  Error: No credentials loaded.")
-                mapping.status = "FAILED"
-                mapping.error_message = "No credentials loaded"
+                    except Exception:
+                        pass
+                                
+                tail_t = threading.Thread(target=tail_file, args=(temp_session_log, tail_stop_event), daemon=True)
+                tail_t.start()
+                
+                creds_to_try = credential_store.records
+                if not creds_to_try:
+                    log_cb("  Error: No credentials loaded.")
+                    mapping.status = "FAILED"
+                    mapping.error_message = "No credentials loaded"
+                    mapping_store.upsert_mapping(host, mapping)
+                    status_cb(mapping.host, mapping.status, mapping.credential_label, mapping.username, mapping.detected_platform, mapping.last_tested, mapping.error_message)
+                    tail_stop_event.set()
+                    tail_t.join(1.0)
+                    SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
+                    continue
+                    
+                success = False
+                for i, cred_record in enumerate(creds_to_try, 1):
+                    if stop_event.is_set():
+                        break
+                        
+                    log_cb(f"  Trying credential set {i}/{len(creds_to_try)}: user={cred_record.username} ...")
+                    cred_dict = {"username": cred_record.username, "password": cred_record.password, "secret": cred_record.secret}
+                    res = ConnectionManager.connect(host, cred_dict, platform_choice, temp_session_log, run_platform_probe)
+                    
+                    history_record = {
+                        "set_number": i,
+                        "username": cred_record.username,
+                        "status": res.status.name,
+                        "error_category": res.error_message,
+                        "success": res.status == ConnectionStatus.SUCCESS
+                    }
+                    mapping.attempt_history.append(history_record)
+                    
+                    if res.status == ConnectionStatus.SUCCESS:
+                        log_cb(f"  ✓ Credential set {i} succeeded for user {cred_record.username}")
+                        log_cb(f"  Mapped {host} -> {cred_record.label} / {cred_record.username}")
+                        
+                        mapping.credential_id = cred_record.id
+                        mapping.credential_label = cred_record.label
+                        mapping.username = cred_record.username
+                        mapping.status = "MAPPED"
+                        mapping.connection_status = "SUCCESS"
+                        mapping.detected_platform = res.logical_platform.name if res.logical_platform else "UNKNOWN"
+                        mapping.netmiko_device_type = res.netmiko_device_type
+                        mapping.error_message = ""
+                        success = True
+                        
+                        try: res.connection.disconnect()
+                        except: pass
+                        break
+                    else:
+                        log_cb(f"  → Credential set {i} failed for user {cred_record.username}: {res.status.name}")
+                        
+                if stop_event.is_set() and not success:
+                    mapping.status = "STOPPED"
+                    mapping.error_message = "Mapping stopped by user"
+                elif not success:
+                    mapping.status = "FAILED"
+                    mapping.error_message = "All credentials failed"
+                    log_cb(f"  ✗ {host} mapping failed.")
+                    
                 mapping_store.upsert_mapping(host, mapping)
                 status_cb(mapping.host, mapping.status, mapping.credential_label, mapping.username, mapping.detected_platform, mapping.last_tested, mapping.error_message)
+                
                 tail_stop_event.set()
                 tail_t.join(1.0)
                 SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
-                continue
                 
-            success = False
-            for i, cred_record in enumerate(creds_to_try, 1):
-                if stop_event.is_set():
-                    break
-                    
-                log_cb(f"  Trying credential set {i}/{len(creds_to_try)}: user={cred_record.username} ...")
-                cred_dict = {"username": cred_record.username, "password": cred_record.password, "secret": cred_record.secret}
-                res = ConnectionManager.connect(host, cred_dict, platform_choice, temp_session_log, run_platform_probe)
+            progress_cb(total, total, None)
+            if not stop_event.is_set():
+                log_cb("\n[Mapping Session Complete]")
+        else:
+            def worker_task(host, idx):
+                log_cb(f"\nMapping {host} ...")
+                mapping = mapping_store.get_mapping(host)
+                if not mapping:
+                    mapping = TargetCredentialMapping(host=host, safe_host=FilenameSafety.safe_host_label(host))
                 
-                history_record = {
-                    "set_number": i,
-                    "username": cred_record.username,
-                    "status": res.status.name,
-                    "error_category": res.error_message,
-                    "success": res.status == ConnectionStatus.SUCCESS
-                }
-                mapping.attempt_history.append(history_record)
+                mapping.status = "MAPPING"
+                mapping.last_tested = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                status_cb(mapping.host, mapping.status, mapping.credential_label, mapping.username, mapping.detected_platform, mapping.last_tested, mapping.error_message)
                 
-                if res.status == ConnectionStatus.SUCCESS:
-                    # Mapped successfully
-                    log_cb(f"  ✓ Credential set {i} succeeded for user {cred_record.username}")
-                    log_cb(f"  Mapped {host} -> {cred_record.label} / {cred_record.username}")
-                    
-                    mapping.credential_id = cred_record.id
-                    mapping.credential_label = cred_record.label
-                    mapping.username = cred_record.username
-                    mapping.status = "MAPPED"
-                    mapping.connection_status = "SUCCESS"
-                    mapping.detected_platform = res.logical_platform.name if res.logical_platform else "UNKNOWN"
-                    mapping.netmiko_device_type = res.netmiko_device_type
-                    mapping.error_message = ""
-                    success = True
-                    
-                    try: res.connection.disconnect()
-                    except: pass
-                    break
-                else:
-                    log_cb(f"  → Credential set {i} failed for user {cred_record.username}: {res.status.name}")
-                    
-            if stop_event.is_set() and not success:
-                mapping.status = "STOPPED"
-                mapping.error_message = "Mapping stopped by user"
-            elif not success:
-                mapping.status = "FAILED"
-                mapping.error_message = "All credentials failed"
-                log_cb(f"  ✗ {host} mapping failed.")
+                settings.base_output_dir.mkdir(parents=True, exist_ok=True)
+                temp_dir = SecureTempSessionLogManager.ensure_secure_temp_session_dir(settings.base_output_dir, "mapping")
+                temp_session_log_path = SecureTempSessionLogManager.create_secure_session_log_path(temp_dir, f"{mapping.safe_host}_{idx}")
+                temp_session_log = str(temp_session_log_path)
                 
-            mapping_store.upsert_mapping(host, mapping)
-            status_cb(mapping.host, mapping.status, mapping.credential_label, mapping.username, mapping.detected_platform, mapping.last_tested, mapping.error_message)
+                sess_log_cb = ui_callbacks.get("sess_log_cb", lambda m: None)
+                tail_stop_event = threading.Event()
+                def tail_file(filepath, stop_evt):
+                    import time
+                    try:
+                        buf_redactor = LineBufferedRedactor(redactor.redact_text)
+                        with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+                            while not stop_evt.is_set():
+                                chunk = f.read(1024)
+                                if chunk:
+                                    out = buf_redactor.feed(chunk) if capture_mode == "redacted" else chunk
+                                    if out: sess_log_cb(out)
+                                else:
+                                    time.sleep(0.1)
+                            chunk = f.read()
+                            if chunk:
+                                out = buf_redactor.feed(chunk) if capture_mode == "redacted" else chunk
+                                if out: sess_log_cb(out)
+                            out = buf_redactor.flush() if capture_mode == "redacted" else ""
+                            if out: sess_log_cb(out)
+                    except Exception:
+                        pass
+                                
+                tail_t = threading.Thread(target=tail_file, args=(temp_session_log, tail_stop_event), daemon=True)
+                tail_t.start()
+                
+                creds_to_try = credential_store.records
+                if not creds_to_try:
+                    log_cb(f"  [{host}] Error: No credentials loaded.")
+                    mapping.status = "FAILED"
+                    mapping.error_message = "No credentials loaded"
+                    mapping_store.upsert_mapping(host, mapping)
+                    status_cb(mapping.host, mapping.status, mapping.credential_label, mapping.username, mapping.detected_platform, mapping.last_tested, mapping.error_message)
+                    tail_stop_event.set()
+                    tail_t.join(1.0)
+                    SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
+                    return
+                    
+                success = False
+                for i, cred_record in enumerate(creds_to_try, 1):
+                    if stop_event.is_set():
+                        break
+                        
+                    log_cb(f"  [{host}] Trying credential set {i}/{len(creds_to_try)}: user={cred_record.username} ...")
+                    cred_dict = {"username": cred_record.username, "password": cred_record.password, "secret": cred_record.secret}
+                    res = ConnectionManager.connect(host, cred_dict, platform_choice, temp_session_log, run_platform_probe)
+                    
+                    history_record = {
+                        "set_number": i,
+                        "username": cred_record.username,
+                        "status": res.status.name,
+                        "error_category": res.error_message,
+                        "success": res.status == ConnectionStatus.SUCCESS
+                    }
+                    mapping.attempt_history.append(history_record)
+                    
+                    if res.status == ConnectionStatus.SUCCESS:
+                        log_cb(f"  [{host}] ✓ Credential set {i} succeeded for user {cred_record.username}")
+                        log_cb(f"  [{host}] Mapped -> {cred_record.label} / {cred_record.username}")
+                        
+                        mapping.credential_id = cred_record.id
+                        mapping.credential_label = cred_record.label
+                        mapping.username = cred_record.username
+                        mapping.status = "MAPPED"
+                        mapping.connection_status = "SUCCESS"
+                        mapping.detected_platform = res.logical_platform.name if res.logical_platform else "UNKNOWN"
+                        mapping.netmiko_device_type = res.netmiko_device_type
+                        mapping.error_message = ""
+                        success = True
+                        
+                        try: res.connection.disconnect()
+                        except: pass
+                        break
+                    else:
+                        log_cb(f"  [{host}] → Credential set {i} failed for user {cred_record.username}: {res.status.name}")
+                        
+                if stop_event.is_set() and not success:
+                    mapping.status = "STOPPED"
+                    mapping.error_message = "Mapping stopped by user"
+                elif not success:
+                    mapping.status = "FAILED"
+                    mapping.error_message = "All credentials failed"
+                    log_cb(f"  [{host}] ✗ mapping failed.")
+                    
+                mapping_store.upsert_mapping(host, mapping)
+                status_cb(mapping.host, mapping.status, mapping.credential_label, mapping.username, mapping.detected_platform, mapping.last_tested, mapping.error_message)
+                
+                tail_stop_event.set()
+                tail_t.join(1.0)
+                SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
+
+            completed_count = 0
+            active_count = 0
+            targets_to_submit = list(enumerate(targets, 1))
+            active_futures = set()
+            completed_hosts = set()
             
-            # Clean up temp session log
-            tail_stop_event.set()
-            tail_t.join(1.0)
-            SecureTempSessionLogManager.cleanup_secure_session_log(Path(temp_session_log))
-            
-        progress_cb(total, total, None)
-        if not stop_event.is_set():
-            log_cb("\n[Mapping Session Complete]")
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                while len(active_futures) < concurrency and targets_to_submit:
+                    idx, host = targets_to_submit.pop(0)
+                    mapping = mapping_store.get_mapping(host)
+                    if mapping and mapping.status == "MAPPED" and not retest_mapped and only_unmapped_or_stale:
+                        log_cb(f"  Skipping {host} (Already mapped)")
+                        status_cb(mapping.host, mapping.status, mapping.credential_label, mapping.username, mapping.detected_platform, mapping.last_tested, mapping.error_message)
+                        completed_hosts.add(host)
+                        completed_count += 1
+                        progress_cb(completed_count, total, host)
+                        continue
+                    
+                    active_count += 1
+                    progress_cb(completed_count, total, host)
+                    f = executor.submit(worker_task, host, idx)
+                    active_futures.add(f)
+                    
+                while active_futures:
+                    done, not_done = wait(active_futures, return_when=FIRST_COMPLETED)
+                    for f in done:
+                        active_futures.remove(f)
+                        active_count -= 1
+                        completed_count += 1
+                        
+                        try:
+                            f.result()
+                        except Exception as fut_err:
+                            log_cb(f"Mapping task error: {fut_err}")
+                            
+                        progress_cb(completed_count, total, None)
+                        
+                    if not stop_event.is_set():
+                        while len(active_futures) < concurrency and targets_to_submit:
+                            idx, host = targets_to_submit.pop(0)
+                            mapping = mapping_store.get_mapping(host)
+                            if mapping and mapping.status == "MAPPED" and not retest_mapped and only_unmapped_or_stale:
+                                log_cb(f"  Skipping {host} (Already mapped)")
+                                status_cb(mapping.host, mapping.status, mapping.credential_label, mapping.username, mapping.detected_platform, mapping.last_tested, mapping.error_message)
+                                completed_hosts.add(host)
+                                completed_count += 1
+                                progress_cb(completed_count, total, host)
+                                continue
+                                
+                            active_count += 1
+                            progress_cb(completed_count, total, host)
+                            f = executor.submit(worker_task, host, idx)
+                            active_futures.add(f)
+
+            if stop_event.is_set():
+                for idx, host in enumerate(targets):
+                    m = mapping_store.get_mapping(host)
+                    if m and m.status in ("MAPPED", "MAPPING"):
+                        continue
+                    if not m:
+                        m = TargetCredentialMapping(host=host, safe_host=FilenameSafety.safe_host_label(host))
+                    m.status = "STOPPED"
+                    mapping_store.upsert_mapping(host, m)
+                    status_cb(m.host, m.status, m.credential_label, m.username, m.detected_platform, m.last_tested, m.error_message)
+                log_cb("\n[Mapping Stopped by User]")
+            else:
+                progress_cb(total, total, None)
+                log_cb("\n[Mapping Session Complete]")
 
 
 # Legacy TargetCredentialMapperPage removed - functionality combined into CredentialManagerLibraryPage
@@ -9105,6 +9532,8 @@ Cisco IOS Software
     try:
         assert settings.concurrency_maintenance == 3
         assert settings.concurrency_scanners == 3
+        assert settings.concurrency_command == 3
+        assert settings.concurrency_mapper == 3
         
         root = tk.Tk()
         class MockController:

@@ -6,6 +6,24 @@ Network Toolbelt is currently a single-file Python/Tkinter desktop utility optim
 
 ---
 
+## v3.32 - Comprehensive Parallel Execution
+
+### Summary
+
+v3.32 expands the global parallel sessions configuration to cover all primary network execution mechanisms, including the **Generic Command Runner** and the **Credential Mapper**. Users can configure limits for all four major network execution engines inside the global settings configuration dialog.
+
+### Added
+
+- **Generic Command Runner Parallelization**: Integrated a concurrent ThreadPoolExecutor execution flow matching the bounded execution pattern.
+- **Credential Mapper Parallelization**: Added parallel credential mapping capability allowing multiple target hosts to be checked concurrently.
+- **Extended Settings Dialog**: Added configuration fields to global Settings -> "Parallel sessions..." for Generic Command Runner and Credential Mapper (1-20 limits, default 3).
+
+### Changed
+
+- **Self-tests Updates**: Updated and expanded self-test validation suites to cover the new concurrency settings.
+
+---
+
 ## v3.31 - Global Concurrency, Tools Menu, and CSV Export
 
 ### Summary
