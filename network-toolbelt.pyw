@@ -15,6 +15,7 @@ from pathlib import Path
 from enum import Enum, auto
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 import tkinter as tk
 from tkinter import messagebox, filedialog, simpledialog, ttk
