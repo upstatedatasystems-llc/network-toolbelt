@@ -453,7 +453,7 @@ class ScannerDefinition:
 # Constants and Settings
 # ============================================================
 
-APP_VERSION = "3.4"
+APP_VERSION = "3.31"
 
 @dataclass
 class DocumentationSection:
@@ -3342,7 +3342,7 @@ If you used Raw Capture mode, these exports may contain sensitive data (password
 
     DocumentationSection("Version Changelog", """Network Toolbelt Version History
 
-## v3.4 - Global Concurrency, Tools Menu, and CSV Export
+## v3.31 - Global Concurrency, Tools Menu, and CSV Export
 - Refactored concurrency controls from per-tool widgets to a global configuration dialog.
 - Added Settings -> 'Parallel sessions...' option to configure concurrency limits for Maintenance Pre/Post Runner and Scanners globally.
 - Created 'Tools' dropdown menu between File and Settings for easy page navigation.
