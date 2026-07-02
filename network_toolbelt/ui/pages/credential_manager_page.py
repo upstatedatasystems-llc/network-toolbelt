@@ -107,7 +107,7 @@ class CredentialManagerLibraryPage(QWidget):
         left_layout.addWidget(form_box)
 
         # Mapping Group
-        mapping_box = QGroupBox("Target IP & Platform Mapping")
+        mapping_box = QGroupBox("Target IP && Platform Mapping")
         mapping_layout = QVBoxLayout(mapping_box)
 
         mapping_layout.addWidget(QLabel("Targets (IP/Hostname):"))
