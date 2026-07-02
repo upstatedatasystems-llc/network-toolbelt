@@ -4,10 +4,10 @@ from PyInstaller.utils.hooks import collect_submodules
 block_cipher = None
 
 a = Analysis(
-    ['network-toolbelt.pyw'],
+    ['network_toolbelt/main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('network_toolbelt/ui/styles/app.qss', 'network_toolbelt/ui/styles')],
     hiddenimports=collect_submodules('pysnmp') + collect_submodules('pyasn1') + collect_submodules('cryptography'),
     hookspath=[],
     hooksconfig={},
