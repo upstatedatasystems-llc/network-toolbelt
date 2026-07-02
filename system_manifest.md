@@ -1,14 +1,14 @@
 # Network Toolbelt System Manifest
 
-**Version:** 3.32  
-**Primary Application File:** `network-toolbelt.pyw`  
+**Version:** 4.0.0-alpha1  
+**Primary Application Entrypoint:** `network_toolbelt/main.py` (legacy fallback `network-toolbelt.pyw`)  
 **Project Name:** Network Toolbelt  
 **Current Focus:** Cisco/Netmiko-optimized network operations utility and SNMP OID Scanner  
 **Long-Term Direction:** Broader multi-vendor network operations toolkit  
 **Target Runtime:** Python 3.14.2 or compatible Python 3.x  
-**GUI Framework:** Tkinter  
+**GUI Framework:** PySide6 (with legacy fallback in Tkinter)  
 **Network Automation Libraries:** Netmiko, PySNMP, Cryptography  
-**Deployment Model:** Single-file desktop utility  
+**Deployment Model:** Modular Python package and standalone desktop utility  
 
 ---
 
