@@ -23,10 +23,19 @@ from network_toolbelt.ui.pages.base_runner_page import BaseRunnerPage
 from network_toolbelt.ui.pages.command_runner_page import CommandRunnerPage
 from network_toolbelt.ui.pages.credential_manager_page import CredentialManagerLibraryPage
 from network_toolbelt.ui.pages.landing_page import LandingPage
+from network_toolbelt.ui.pages.maintenance_runner_page import MaintenanceRunnerPage
+from network_toolbelt.ui.pages.scanner_landing_page import ScannerLandingPage
+from network_toolbelt.ui.pages.scanner_pages import (
+    BgpRoutesScannerPage,
+    DeviceInventoryScannerPage,
+    InterfaceErrorScannerPage,
+    LogScannerPage,
+    OpticsScannerPage,
+    PortChannelScannerPage,
+    RoutingNeighborScannerPage,
+)
 from network_toolbelt.ui.pages.stub_page import (
     DocumentationStubPage,
-    MaintenanceRunnerStubPage,
-    ScannerLandingStubPage,
     SnmpCredentialManagerStubPage,
     SnmpOidScannerStubPage,
 )
@@ -60,8 +69,15 @@ class MainWindow(QMainWindow):
             ("LandingPage", LandingPage),
             ("CredentialManagerLibraryPage", CredentialManagerLibraryPage),
             ("CommandRunnerPage", CommandRunnerPage),
-            ("MaintenanceRunnerPage", MaintenanceRunnerStubPage),
-            ("ScannerLandingPage", ScannerLandingStubPage),
+            ("MaintenanceRunnerPage", MaintenanceRunnerPage),
+            ("ScannerLandingPage", ScannerLandingPage),
+            ("InterfaceErrorScannerPage", InterfaceErrorScannerPage),
+            ("PortChannelScannerPage", PortChannelScannerPage),
+            ("RoutingNeighborScannerPage", RoutingNeighborScannerPage),
+            ("LogScannerPage", LogScannerPage),
+            ("DeviceInventoryScannerPage", DeviceInventoryScannerPage),
+            ("OpticsScannerPage", OpticsScannerPage),
+            ("BgpRoutesScannerPage", BgpRoutesScannerPage),
             ("SnmpCredentialManagerPage", SnmpCredentialManagerStubPage),
             ("SnmpOidScannerPage", SnmpOidScannerStubPage),
             ("DocumentationPage", DocumentationStubPage),

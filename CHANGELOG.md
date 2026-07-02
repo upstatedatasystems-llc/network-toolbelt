@@ -6,6 +6,22 @@ Network Toolbelt is currently a modular desktop utility (migrating to PySide6). 
 
 ---
 
+## v4.0.0-alpha2 - PySide6 UI Migration (Milestones 2 & 3)
+
+### Summary
+
+v4.0.0-alpha2 completes Milestones 2 & 3 of the Network Toolbelt PySide6 UI migration. This adds full PySide6 support for the **Maintenance Pre/Post Runner** and the **Network Scanner Suite** (Interface Errors, Port-Channel / LACP, Routing Neighbors, Logs, Device Inventory, Optics, and BGP/Route Summary).
+
+### Added
+
+- **Maintenance Pre/Post Runner (`MaintenanceRunnerPage`)**: Full PySide6 implementation supporting pre-check snapshot capture, post-check snapshot capture, compare engine execution, and report output generation.
+- **Maintenance Core Module (`network_toolbelt/core/maintenance.py`)**: Extracted snapshot builder, output parsers (interfaces, logs, routes), interface/log/routing analyzers, and compare engine.
+- **Network Scanner Suite (`network_toolbelt/ui/pages/scanner_pages.py`)**: PySide6 runner pages for all 7 network scanners built on a common `BaseScannerPage` foundation.
+- **Scanner Landing Page (`network_toolbelt/ui/pages/scanner_landing_page.py`)**: Modern dashboard grid for selecting and navigating to scanner tools.
+- **Scanners Core Module (`network_toolbelt/core/scanners.py`)**: Extracted scanner definitions, scanner run configs, host result models, scanner engine, and report summary generators.
+
+---
+
 ## v4.0.0-alpha1 - PySide6 UI Migration (Milestone 1)
 
 ### Summary
