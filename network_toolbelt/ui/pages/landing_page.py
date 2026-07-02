@@ -43,8 +43,8 @@ class LandingPage(QWidget):
         tools_layout.addStretch()
         cards_layout.addWidget(tools_box)
 
-        # Session & Help Column
-        session_box = QGroupBox("Session & Help")
+        # Session && Help Column
+        session_box = QGroupBox("Session && Help")
         session_layout = QVBoxLayout(session_box)
 
         self.cred_status_lbl = QLabel("Credentials loaded: 0")
@@ -52,13 +52,13 @@ class LandingPage(QWidget):
         self.cred_status_lbl.setStyleSheet("font-size: 13px; margin-top: 10px; margin-bottom: 10px;")
         session_layout.addWidget(self.cred_status_lbl)
 
-        cred_btn = QPushButton("Credential Manager & Library")
+        cred_btn = QPushButton("Credential Manager && Library")
         cred_btn.setMinimumHeight(45)
         cred_btn.setStyleSheet("font-size: 14px; font-weight: bold;")
         cred_btn.clicked.connect(lambda: self.controller.show_frame("CredentialManagerLibraryPage"))
         session_layout.addWidget(cred_btn)
 
-        help_btn = QPushButton("Help & Documentation")
+        help_btn = QPushButton("Help && Documentation")
         help_btn.setMinimumHeight(45)
         help_btn.setStyleSheet("font-size: 14px; font-weight: bold;")
         help_btn.clicked.connect(lambda: self.controller.open_documentation())

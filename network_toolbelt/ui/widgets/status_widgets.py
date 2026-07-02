@@ -24,7 +24,7 @@ class CredentialStatusPanel(QGroupBox):
         self.status_lbl = QLabel("Credentials loaded: 0")
         layout.addWidget(self.status_lbl)
 
-        btn = QPushButton("Manage Credentials & Library")
+        btn = QPushButton("Manage Credentials && Library")
         btn.clicked.connect(self.open_manager)
         layout.addWidget(btn)
 
