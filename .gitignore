@@ -5,9 +5,10 @@ __pycache__/
 toolbelt-output/
 scratch/
 
-# Ignore specific common junk and output
-__pycache__/
-*.pyc
-.DS_Store
-toolbelt-output/
-scratch/
+# Python Virtual Environment
+.venv/
+venv/
+
+# PyInstaller Build/Dist Outputs
+build/
+dist/
