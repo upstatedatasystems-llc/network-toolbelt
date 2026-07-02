@@ -1,0 +1,106 @@
+/* Basic QSS Stylesheet for Network Toolbelt PySide6 UI */
+
+QMainWindow, QWidget {
+    background-color: #2b2b2b;
+    color: #ffffff;
+    font-family: "Segoe UI", Arial, sans-serif;
+    font-size: 10pt;
+}
+
+QGroupBox {
+    border: 1px solid #4a4a4a;
+    border-radius: 4px;
+    margin-top: 10px;
+    font-weight: bold;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    padding: 0 5px;
+    color: #64b5f6;
+}
+
+QPushButton {
+    background-color: #3c3f41;
+    color: #ffffff;
+    border: 1px solid #555555;
+    border-radius: 4px;
+    padding: 6px 14px;
+    min-height: 20px;
+}
+
+QPushButton:hover {
+    background-color: #4e5254;
+    border-color: #777777;
+}
+
+QPushButton:pressed {
+    background-color: #2d2f31;
+}
+
+QPushButton:disabled {
+    background-color: #242424;
+    color: #666666;
+    border-color: #333333;
+}
+
+QLineEdit, QTextEdit, QPlainTextEdit, QComboBox {
+    background-color: #1e1e1e;
+    color: #ffffff;
+    border: 1px solid #4a4a4a;
+    border-radius: 3px;
+    padding: 4px;
+}
+
+QPlainTextEdit {
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: 9.5pt;
+}
+
+QTableWidget, QTreeWidget {
+    background-color: #1e1e1e;
+    color: #ffffff;
+    gridline-color: #3c3f41;
+    border: 1px solid #4a4a4a;
+}
+
+QHeaderView::section {
+    background-color: #3c3f41;
+    color: #ffffff;
+    padding: 4px;
+    border: 1px solid #2b2b2b;
+    font-weight: bold;
+}
+
+QProgressBar {
+    border: 1px solid #4a4a4a;
+    border-radius: 3px;
+    text-align: center;
+    background-color: #1e1e1e;
+}
+
+QProgressBar::chunk {
+    background-color: #1e88e5;
+    width: 10px;
+}
+
+QSplitter::handle {
+    background-color: #4a4a4a;
+}
+
+QTabWidget::pane {
+    border: 1px solid #4a4a4a;
+}
+
+QTabBar::tab {
+    background-color: #3c3f41;
+    color: #ffffff;
+    padding: 6px 12px;
+    border: 1px solid #4a4a4a;
+}
+
+QTabBar::tab:selected {
+    background-color: #1e88e5;
+    font-weight: bold;
+}

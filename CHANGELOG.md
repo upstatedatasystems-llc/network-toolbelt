@@ -2,7 +2,30 @@
 
 All notable changes to Network Toolbelt are documented here.
 
-Network Toolbelt is currently a single-file Python/Tkinter desktop utility optimized for Cisco/Netmiko-based network operations. Earlier version numbers were reconstructed from project history and implementation milestones, so entries before v2.8 should be treated as summarized release history rather than formal tagged releases.
+Network Toolbelt is currently a modular desktop utility (migrating to PySide6). Earlier version numbers were reconstructed from project history and implementation milestones, so entries before v2.8 should be treated as summarized release history rather than formal tagged releases.
+
+---
+
+## v4.0.0-alpha1 - PySide6 UI Migration (Milestone 1)
+
+### Summary
+
+v4.0.0-alpha1 completes Milestone 1 of the Network Toolbelt UI migration from Tkinter to PySide6. The application is restructured as a modular Python package while preserving the legacy Tkinter app as a fallback.
+
+### Added
+
+- **PySide6 Application Framework**: Restructured the app into a package `network_toolbelt` with a modern modular layout.
+- **UI Event Bridge**: Introduced a thread-safe QObject signal bridge (`UIEventBridge`) for routing log, status, progress, and UI state events from worker threads to the main Qt thread.
+- **PySide6 Pages**:
+  - `LandingPage`: Dashboard home page showing session mapping status.
+  - `CredentialManagerLibraryPage`: Complete manager page for volatile credentials and SSH target mappings.
+  - `CommandRunnerPage`: Generic Command Runner vertical slice supporting policy execution and live logging.
+  - **Tool Stubs**: Temporary placeholder pages for deferred components.
+- **Dark Theme Styling**: Basic dark/light styling via QSS stylesheet.
+
+### Changed
+
+- **Package Migration**: Extracted core configuration, credential mapping, redaction rules, and netmiko device connection management into modular package files.
 
 ---
 
